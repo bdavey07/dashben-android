@@ -1,0 +1,8 @@
+{
+  "appId": "ca.bendavey.pkm",
+  "appName": "DashBen",
+  "webDir": "www",
+  "server": {
+    "androidScheme": "https"
+  }
+}

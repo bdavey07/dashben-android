@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">DashBen</string>
+    <string name="title_activity_main">DashBen</string>
+    <string name="package_name">ca.bendavey.pkm</string>
+    <string name="custom_url_scheme">ca.bendavey.pkm</string>
+</resources>

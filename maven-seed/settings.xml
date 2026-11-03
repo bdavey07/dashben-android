@@ -1,0 +1,9 @@
+<settings>
+  <proxies>
+    <proxy>
+      <id>egress</id><active>true</active><protocol>http</protocol>
+      <host>hatch-egress-proxy</host><port>3128</port>
+      <nonProxyHosts>localhost|127.0.0.1</nonProxyHosts>
+    </proxy>
+  </proxies>
+</settings>

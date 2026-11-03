@@ -1,0 +1,13 @@
+// Injects the Maven pre-seeded local repo (populated by maven-seed/) into
+// buildscript + project repositories. Used with --offline so Gradle never
+// touches its broken network path. See plan.md M5 toolchain notes.
+allprojects {
+    buildscript {
+        repositories {
+            maven { url = uri('/home/hatch/.m2-repo') }
+        }
+    }
+    repositories {
+        maven { url = uri('/home/hatch/.m2-repo') }
+    }
+}
