@@ -75,8 +75,11 @@ export function parseRecurrence(value) {
 }
 
 // Port of the server's nextRecurrenceDue (db.ts): the first occurrence
-// strictly after the anchor due date that is also in the future, so
-// overdue instances roll forward past missed occurrences. Monthly
+// strictly after the anchor due date that is not in the past, so
+// overdue instances roll forward TO today when today matches the
+// pattern (Ben, Nov 4, 2026: checking off an overdue daily item spawns
+// today's instance, not tomorrow's); on-time completion still lands on
+// the next future occurrence. Monthly
 // steps from the original anchor with day clamping, so a 31st task
 // lands on the 28th in February and back on the 31st in March.
 export function nextRecurrenceDue(rule, anchorDue, today) {
@@ -86,7 +89,7 @@ export function nextRecurrenceDue(rule, anchorDue, today) {
     let k = 1;
     while (k <= 100000) {
       const cand = addDaysISO(anchor, k * rule.interval);
-      if (cand > today) return pastEnd(cand) ? null : cand;
+      if (cand >= today) return pastEnd(cand) ? null : cand;
       k++;
     }
     return null;
@@ -96,7 +99,7 @@ export function nextRecurrenceDue(rule, anchorDue, today) {
     let k = 1;
     while (k <= 1200) {
       const cand = addMonthsClamped(anchor, k * rule.interval, dom);
-      if (cand > today) return pastEnd(cand) ? null : cand;
+      if (cand >= today) return pastEnd(cand) ? null : cand;
       if (pastEnd(cand)) return null;
       k++;
     }
@@ -114,7 +117,7 @@ export function nextRecurrenceDue(rule, anchorDue, today) {
     return null;
   };
   let cand = nextWeeklyAfter(anchor);
-  while (cand !== null && cand <= today) cand = nextWeeklyAfter(cand);
+  while (cand !== null && cand < today) cand = nextWeeklyAfter(cand);
   if (cand === null) return null;
   return pastEnd(cand) ? null : cand;
 }
@@ -304,11 +307,46 @@ export class LocalStore {
     return this.updateProps(table, id, { subtasks: JSON.stringify(list) });
   }
 
+  addAttachment(ownerType, ownerId, mime, data, name = null) {
+    const ts = new Date().toISOString();
+    const row = { id: newId(), owner_type: ownerType, owner_id: ownerId, mime, data, name, created_at: ts, updated_at: ts, archived: 0 };
+    this.engine.localWrite("attachments", row, { baseUpdatedAt: null });
+    return row;
+  }
+
+  attachmentsFor(ownerType, ownerId) {
+    return this.db.prepare("SELECT * FROM attachments WHERE owner_type=? AND owner_id=? AND archived=0 ORDER BY created_at").all(ownerType, ownerId);
+  }
+
+  copyAttachments(fromType, fromId, toType, toId) {
+    for (const a of this.attachmentsFor(fromType, fromId)) this.addAttachment(toType, toId, a.mime, a.data, a.name ?? null);
+  }
+
+  archiveAttachment(id) {
+    return this.archiveObject("attachments", id);
+  }
+
+  reassignAttachments(fromType, fromId, toType, toId) {
+    for (const a of this.attachmentsFor(fromType, fromId)) {
+      const ts = new Date().toISOString();
+      this.engine.localWrite("attachments", { ...a, owner_type: toType, owner_id: toId, updated_at: ts }, { baseUpdatedAt: a.updated_at });
+    }
+  }
+
   archiveObject(table, id) {
     const row = this.getRow(table, id);
     if (!row) throw new Error(`No ${table} row with id ${id}.`);
     const ts = new Date().toISOString();
     const next = { ...row, archived: 1, updated_at: ts };
+    this.engine.localWrite(table, next, { baseUpdatedAt: row.updated_at });
+    return next;
+  }
+
+  unarchiveObject(table, id) {
+    const row = this.getRow(table, id);
+    if (!row) throw new Error(`No ${table} row with id ${id}.`);
+    const ts = new Date().toISOString();
+    const next = { ...row, archived: 0, updated_at: ts };
     this.engine.localWrite(table, next, { baseUpdatedAt: row.updated_at });
     return next;
   }
@@ -535,6 +573,17 @@ export class LocalStore {
   }
 
   // --- ui_prefs and field values ---
+
+  getGroupOrder(key) {
+    const raw = this.getRow("ui_prefs", `group_order:${key}`)?.value;
+    if (!raw) return [];
+    try { const v = JSON.parse(raw); return Array.isArray(v) ? v : []; } catch { return []; }
+  }
+
+  setGroupOrder(key, values) {
+    const ts = new Date().toISOString();
+    this.engine.localWrite("ui_prefs", { key: `group_order:${key}`, value: JSON.stringify(values), updated_at: ts }, { baseUpdatedAt: this.getRow("ui_prefs", `group_order:${key}`)?.updated_at ?? null });
+  }
 
   setTabPrefs(prefs) {
     const ts = new Date().toISOString();

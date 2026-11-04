@@ -10,6 +10,7 @@ import { HttpTransport } from "./transport.mjs";
 const $ = (sel, el = document) => el.querySelector(sel);
 const $$ = (sel, el = document) => [...el.querySelectorAll(sel)];
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+function ymdAdd(ymd, n) { const t = new Date(ymd + "T12:00:00"); t.setDate(t.getDate() + n); return t.toISOString().slice(0, 10); }
 const todayToronto = () => new Intl.DateTimeFormat("en-CA", { timeZone: "America/Toronto", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
 
 // --- Shell (Capacitor) native bridges ---
@@ -50,12 +51,87 @@ const bytesToB64 = (bytes) => {
   return btoa(out);
 };
 const b64ToBytes = (b64) => Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+// Export hook (stamp 2026-11-04j, shell only): the shared exportDb()
+// calls this when present, so the backup lands in Documents instead of
+// a blob download (which the WebView cannot perform).
+window.__dashbenExportDb = async (name, bytes) => {
+  await withTimeout(NativeFS.writeFile({ path: name, data: bytesToB64(bytes), directory: "DOCUMENTS" }), 10000, "fs.exportWrite");
+};
+// --- Due reminders (stamp 2026-11-04r, shell only) ---
+// Local notifications at 9 a.m. on each task's due day, plus one
+// morning digest while anything is overdue. Recomputed at boot and
+// after every sync (via window.__dashbenAfterSync). On by default;
+// Management > Sync turns them off (ui_prefs "reminders" = "off").
+const NativeNotify = safePlugin("LocalNotifications");
+let remindersBusy = false;
+function remindersOn() { return state.store?.getRow("ui_prefs", "reminders")?.value !== "off"; }
+function setRemindersPref(on) {
+  const ts = new Date().toISOString();
+  state.engine.localWrite("ui_prefs", { key: "reminders", value: on ? "on" : "off", updated_at: ts }, { baseUpdatedAt: state.store.getRow("ui_prefs", "reminders")?.updated_at ?? null });
+}
+function reminderIdFor(taskId) { let h = 7; for (let i = 0; i < taskId.length; i++) h = ((h * 31) + taskId.charCodeAt(i)) | 0; return (Math.abs(h) % 1900000000) + 1; }
+async function cancelAllReminders() {
+  if (!NativeNotify) return;
+  try {
+    const pending = await withTimeout(NativeNotify.getPending(), 5000, "notify.pending");
+    if (pending?.notifications?.length) await withTimeout(NativeNotify.cancel({ notifications: pending.notifications.map((n) => ({ id: n.id })) }), 5000, "notify.cancel");
+  } catch { /* best-effort */ }
+}
+async function scheduleReminders() {
+  if (remindersBusy || !state.store || !NativeNotify) return;
+  remindersBusy = true;
+  try {
+    if (!remindersOn()) return;
+    const perm = await withTimeout(NativeNotify.checkPermissions(), 5000, "notify.check").catch(() => null);
+    if (!perm || perm.display !== "granted") return;
+    const today = todayToronto();
+    const d = new Date(today + "T12:00:00");
+    d.setDate(d.getDate() + 1);
+    const tomorrow = d.toISOString().slice(0, 10);
+    const now = new Date();
+    const at9 = (dateStr) => new Date(dateStr + "T09:00:00");
+    const due = openTasks().filter((t) => t.due_date && t.due_date <= tomorrow);
+    const notes = [];
+    const overdue = due.filter((t) => t.due_date < today);
+    if (overdue.length) {
+      let when = at9(today);
+      if (when <= now) when = at9(tomorrow);
+      notes.push({ id: 1900000001, title: "DashBen \u2014 overdue", body: `${overdue.length} overdue task${overdue.length === 1 ? "" : "s"}. First up: ${overdue[0].title}`, schedule: { at: when, allowWhileIdle: true }, extra: { taskId: overdue[0].id } });
+    }
+    for (const t of due) {
+      if (t.due_date < today) continue;
+      const when = at9(t.due_date);
+      if (when <= now) continue;
+      notes.push({ id: reminderIdFor(t.id), title: "Due today", body: t.title, schedule: { at: when, allowWhileIdle: true }, extra: { taskId: t.id } });
+    }
+    await cancelAllReminders();
+    if (notes.length) await withTimeout(NativeNotify.schedule({ notifications: notes.slice(0, 24) }), 8000, "notify.schedule");
+  } catch { /* reminders are best-effort */ } finally { remindersBusy = false; }
+}
+async function initReminders() {
+  if (!NativeNotify) return;
+  window.__dashbenAfterSync = () => { void scheduleReminders(); };
+  try {
+    await NativeNotify.addListener("localNotificationActionPerformed", (ev) => {
+      const id = ev?.notification?.extra?.taskId;
+      if (id && state.store?.getRow("tasks", id)) { state.itemView = null; state.tab = "tasks"; saveTab(); render(); openTaskPopup(id); }
+    });
+  } catch { /* listener is a nicety */ }
+  try {
+    if (remindersOn()) {
+      const perm = await withTimeout(NativeNotify.checkPermissions(), 5000, "notify.check").catch(() => null);
+      if (perm && perm.display === "prompt") await withTimeout(NativeNotify.requestPermissions(), 8000, "notify.request").catch(() => null);
+    }
+  } catch { /* permission is best-effort */ }
+  await scheduleReminders();
+}
+
 
 const SCHEMA_URL = "./schema.sql";
 const state = {
   db: null, engine: null, store: null, transport: null,
   base: "https://pkm.ben-cloud.net", token: "",
-  tab: "dashboard", dailyDate: null, weather: null, weatherTried: false, itemView: null,
+  tab: "dashboard", dailyDate: null, weather: null, weatherTried: false, weatherDay: null, itemView: null,
   lastSync: null, lastError: null, booted: false,
 };
 
@@ -168,12 +244,22 @@ async function loadSecureToken() {
 }
 
 // --- Sync ---
+// Swap only the sync button's text span so its icon survives (the
+// collapsed sidebar shows the icon alone; a textContent rewrite used
+// to destroy the svg on the first sync).
+function syncBtnLabel(txt) {
+  const b = $("#sync-btn");
+  if (!b) return;
+  const span = b.querySelector?.("span");
+  if (span) span.textContent = txt;
+  else b.textContent = txt;
+}
 async function doSync() {
   if (state.syncing) return;
   state.syncing = true;
   const btn = $("#sync-btn");
   btn.disabled = true;
-  btn.textContent = "Syncing…";
+  syncBtnLabel("Syncing…");
   try {
     if (!state.booted) {
       await state.engine.firstSync(state.transport);
@@ -189,9 +275,11 @@ async function doSync() {
   }
   state.syncing = false;
   btn.disabled = false;
-  btn.textContent = "Sync now";
+  syncBtnLabel("Sync now");
   render();
   saveBytes();
+  if (typeof window !== "undefined") window.__dashbenAfterSync?.();
+  loadFamilyCalendar();
 }
 
 // Full re-download: pushes any pending local edits first (so they
@@ -224,11 +312,37 @@ async function captureSharedText() {
   try {
     const r = await withTimeout(NativeShare.getSharedText(), 5000, "share.get");
     const text = (r && r.text ? String(r.text) : "").trim();
-    if (!text) return;
-    state.store.captureInbox({ title: "", body: text });
+    if (text) {
+      if (routeCapture(text) === "inbox") state.store.captureInbox({ title: "", body: text });
+      render();
+      saveBytes();
+    }
+  } catch { /* no share pending */ }
+  await captureSharedImage();
+}
+
+// Shared photos (stamp 2026-11-04s, shell only): the Java plugin
+// copies a shared image into the app files dir; read it back through
+// the Filesystem bridge, downscale it, and file it in the Inbox with
+// the photo attached. The temp file is removed afterwards.
+async function captureSharedImage() {
+  if (!NativeShare || !NativeFS || !state.store) return;
+  let file = "";
+  try {
+    const r = await withTimeout(NativeShare.getSharedImage(), 5000, "share.image");
+    file = (r && r.file) ? String(r.file) : "";
+    if (!file) return;
+    const rd = await withTimeout(NativeFS.readFile({ path: file, directory: "DATA" }), 20000, "fs.readShared");
+    const b64 = rd && typeof rd.data === "string" ? rd.data : "";
+    if (!b64) return;
+    const att = await dataToAttachment(b64, "image/jpeg");
+    const item = state.store.captureInbox({ title: "", body: "Photo" });
+    state.store.addAttachment("inbox_items", item.id, att.mime, att.data, att.name ?? null);
+    state.searchDirty = true;
     render();
     saveBytes();
-  } catch { /* no share pending */ }
+  } catch { /* no image share pending */ }
+  if (file) { try { await NativeFS.deleteFile({ path: file, directory: "DATA" }); } catch {} }
 }
 
 function statusLine() {
@@ -271,14 +385,34 @@ function forwardLinks(fromType, fromId) {
 
 // --- Popups (P1: production opens object detail in popups) ---
 function openPopup(title, inner, openRef) {
+  // Editor popups get their Save and close button in the header,
+  // beside Open and Close (stamp 2026-11-04u): it submits the
+  // popup's form from outside via the form= attribute.
+  const formTag = /<form[^>]*popup-form[^>]*>/.exec(inner)?.[0] ?? "";
+  const formId = /id="([^"]+)"/.exec(formTag)?.[1] ?? "";
+  const saveBtn = formId ? `<button type="submit" form="${formId}" class="primary-btn">Save and close</button>` : "";
   $("#popup-root").innerHTML = `<div class="popup-backdrop">
     <div class="popup-card" role="dialog" aria-label="${esc(title)}">
-      <div class="popup-head"><h3>${esc(title)}</h3><div class="popup-head-actions">${openRef ? `<button data-open-page="${openRef}">Open</button>` : ""}<button data-close-popup>Close</button></div></div>
+      <div class="popup-head"><h3>${esc(title)}</h3><div class="popup-head-actions">${saveBtn}${openRef ? `<button data-pin-toggle="${openRef}" class="ghost-btn">${isPinned(openRef) ? "Unpin" : "Pin"}</button><button data-open-page="${openRef}" class="ghost-btn">Open</button>` : ""}<button data-close-popup class="ghost-btn">Close</button></div></div>
       ${inner}
     </div>
   </div>`;
   bindPopupForms();
   bindExtraPopupForms();
+}
+// Clicking the backdrop saves (stamp 2026-11-04aj): an editor
+// popup submits its form exactly like Save and close; a create
+// popup submits only when its title is filled, so a stray click
+// cannot create an untitled item; anything else just closes.
+function savePopupAndClose() {
+  const root = $("#popup-root");
+  const form = root?.querySelector?.("form.popup-form") || root?.querySelector?.("form[data-create-person-popup], form[data-create-reading-popup]");
+  if (!form || typeof form.requestSubmit !== "function") { closePopup(); return; }
+  if (!form.classList.contains("popup-form")) {
+    const title = form.querySelector('input[name="title"]');
+    if (title && !title.value.trim()) { closePopup(); return; }
+  }
+  form.requestSubmit();
 }
 function closePopup() {
   $("#popup-root").innerHTML = "";
@@ -305,15 +439,237 @@ function tagsForm(table, id) {
 
 // Body field without its own form or save button, for popups merged
 // into a single save (all popups now use this; the old bodyForm is gone).
+
+// --- Markdown body editor (stamp 2026-11-04af) ---
+// Every body field is a Markdown editor: a formatting toolbar,
+// Ctrl/Cmd+B / I / K shortcuts, list continuation on Enter, Tab to
+// indent, auto-grow, and a Preview toggle that renders the Markdown
+// (checklist boxes in the preview tick the source lines). Bodies are
+// still stored as plain Markdown — nothing about the data changes.
+function mdEditorHtml(body, rows = 5, placeholder = "") {
+  return `<div class="md-editor"><div class="md-toolbar" role="toolbar" aria-label="Formatting"><button type="button" data-md="bold" title="Bold (Ctrl+B)"><b>B</b></button><button type="button" data-md="italic" title="Italic (Ctrl+I)"><i>I</i></button><button type="button" data-md="strike" title="Strikethrough"><s>S</s></button><button type="button" data-md="h2" title="Heading">H2</button><button type="button" data-md="h3" title="Subheading">H3</button><button type="button" data-md="ul" title="Bullet list">\u2022 List</button><button type="button" data-md="ol" title="Numbered list">1. List</button><button type="button" data-md="check" title="Checklist">\u2611 Task</button><button type="button" data-md="quote" title="Quote">\u275d</button><button type="button" data-md="code" title="Code">&lt;/&gt;</button><button type="button" data-md="link" title="Link (Ctrl+K)">Link</button><button type="button" data-md="hr" title="Divider">\u2015</button><span class="md-spacer"></span><button type="button" data-md="preview" class="ghost-btn" title="Toggle preview">Preview</button></div><textarea name="body" rows="${rows}"${placeholder ? ` placeholder="${esc(placeholder)}"` : ""}>${esc(body ?? "")}</textarea><div class="md-preview" hidden></div></div>`;
+}
+
+function mdWrap(text, s, e, before, after) {
+  if (s === e) {
+    let a = s; while (a > 0 && /\S/.test(text[a - 1])) a--;
+    let b = e; while (b < text.length && /\S/.test(text[b])) b++;
+    s = a; e = b;
+  }
+  const sel = text.slice(s, e);
+  if (text.slice(s - before.length, s) === before && text.slice(e, e + after.length) === after) {
+    return { text: text.slice(0, s - before.length) + sel + text.slice(e + after.length), selStart: s - before.length, selEnd: e - before.length };
+  }
+  return { text: text.slice(0, s) + before + sel + after + text.slice(e), selStart: s + before.length, selEnd: e + before.length };
+}
+
+function mdLink(text, s, e) {
+  if (s === e) {
+    let a = s; while (a > 0 && /\S/.test(text[a - 1])) a--;
+    let b = e; while (b < text.length && /\S/.test(text[b])) b++;
+    s = a; e = b;
+  }
+  const sel = text.slice(s, e);
+  if (/^https?:\/\/\S+$/.test(sel)) {
+    const out = text.slice(0, s) + `[link text](${sel})` + text.slice(e);
+    return { text: out, selStart: s + 1, selEnd: s + 10 };
+  }
+  const out = text.slice(0, s) + `[${sel}](https://)` + text.slice(e);
+  return { text: out, selStart: s + sel.length + 3, selEnd: s + sel.length + 11 };
+}
+
+const MD_MARKER_RE = /^#{1,6}\s+|^>\s?|^[-*]\s+(\[[ xX]\]\s+)?|^\d+\.\s+/;
+function mdPrefixLines(text, s, e, prefixFor, detectRe) {
+  const start = text.lastIndexOf("\n", s - 1) + 1;
+  let end = text.indexOf("\n", e);
+  if (end === -1) end = text.length;
+  const block = text.slice(start, end);
+  const lines = block.split("\n");
+  const allHave = lines.every((l) => detectRe.test(l));
+  const out = lines.map((l, i) => allHave ? l.replace(detectRe, "") : prefixFor(i) + l.replace(MD_MARKER_RE, "")).join("\n");
+  return { text: text.slice(0, start) + out + text.slice(end), selStart: start, selEnd: start + out.length };
+}
+
+function mdApply(ta, action) {
+  const s = ta.selectionStart, e = ta.selectionEnd, text = ta.value;
+  let r = null;
+  if (action === "bold") r = mdWrap(text, s, e, "**", "**");
+  else if (action === "italic") r = mdWrap(text, s, e, "*", "*");
+  else if (action === "strike") r = mdWrap(text, s, e, "~~", "~~");
+  else if (action === "code") r = text.slice(s, e).includes("\n")
+    ? { text: text.slice(0, s) + "```\n" + text.slice(s, e) + "\n```" + text.slice(e), selStart: s + 4, selEnd: e + 4 }
+    : mdWrap(text, s, e, "`", "`");
+  else if (action === "link") r = mdLink(text, s, e);
+  else if (action === "h2") r = mdPrefixLines(text, s, e, () => "## ", /^#{1,6}\s+/);
+  else if (action === "h3") r = mdPrefixLines(text, s, e, () => "### ", /^#{1,6}\s+/);
+  else if (action === "ul") r = mdPrefixLines(text, s, e, () => "- ", /^[-*]\s+/);
+  else if (action === "ol") r = mdPrefixLines(text, s, e, (i) => `${i + 1}. `, /^\d+\.\s+/);
+  else if (action === "check") r = mdPrefixLines(text, s, e, () => "- [ ] ", /^[-*]\s+\[[ xX]\]\s+/);
+  else if (action === "quote") r = mdPrefixLines(text, s, e, () => "> ", /^>\s?/);
+  else if (action === "hr") r = { text: text.slice(0, s) + "\n\n---\n" + text.slice(e), selStart: s + 5, selEnd: s + 5 };
+  if (!r) return;
+  ta.value = r.text;
+  ta.focus();
+  try { ta.setSelectionRange(r.selStart, r.selEnd); } catch {}
+  ta.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+// Enter inside a list line continues the list (or exits it when the
+// item is empty). Returns true when it handled the keypress.
+function mdContinueList(ta) {
+  const pos = ta.selectionStart;
+  if (pos !== ta.selectionEnd) return false;
+  const lineStart = ta.value.lastIndexOf("\n", pos - 1) + 1;
+  const line = ta.value.slice(lineStart, pos);
+  const m = /^(\s*)([-*]|\d+\.)\s+(\[[ xX]\]\s+)?(.*)$/.exec(line);
+  if (!m) return false;
+  if (!m[4].trim()) {
+    ta.value = ta.value.slice(0, lineStart) + ta.value.slice(pos);
+    ta.setSelectionRange(lineStart, lineStart);
+    return true;
+  }
+  let marker = m[2];
+  if (/^\d+\.$/.test(marker)) marker = `${parseInt(marker, 10) + 1}.`;
+  const insert = "\n" + m[1] + marker + " " + (m[3] ? "[ ] " : "");
+  ta.value = ta.value.slice(0, pos) + insert + ta.value.slice(pos);
+  ta.setSelectionRange(pos + insert.length, pos + insert.length);
+  ta.dispatchEvent(new Event("input", { bubbles: true }));
+  return true;
+}
+
+function mdInline(escaped) {
+  const codes = [];
+  let t = escaped.replace(/`([^`]+)`/g, (m, c) => { codes.push(c); return `\u0000${codes.length - 1}\u0000`; });
+  t = t.replace(/!\[([^\]]*)\]\((https?:[^)\s]+)\)/g, `<img src="$2" alt="$1">`);
+  t = t.replace(/\[([^\]]+)\]\((https?:[^)\s]+|mailto:[^)\s]+)\)/g, `<a href="$2" target="_blank" rel="noopener">$1</a>`);
+  t = t.replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
+  t = t.replace(/(^|\W)\*([^*\n]+)\*/g, "$1<i>$2</i>");
+  t = t.replace(/~~([^~]+)~~/g, "<s>$1</s>");
+  t = t.replace(/\u0000(\d+)\u0000/g, (m, i) => `<code>${codes[Number(i)]}</code>`);
+  return t;
+}
+
+// Renders the Markdown subset the editor produces: headings, lists
+// (nested, incl. checklists whose boxes carry their source line),
+// quotes, code blocks, pipe tables, rules, paragraphs. Input is
+// escaped first; only http(s)/mailto links become anchors.
+function renderMarkdown(src) {
+  const lines = (src ?? "").split("\n");
+  const out = [];
+  const escLine = (l) => esc(l);
+  let i = 0;
+  const listStack = [];
+  const closeListsTo = (indent) => {
+    while (listStack.length && listStack[listStack.length - 1].indent > indent) { out.push(listStack.pop().type === "ol" ? "</ol>" : "</ul>"); }
+  };
+  const closeAllLists = () => { while (listStack.length) { const l = listStack.pop(); out.push(l.type === "ol" ? "</ol>" : "</ul>"); } };
+  while (i < lines.length) {
+    const raw = lines[i];
+    const line = escLine(raw);
+    if (/^\s*```/.test(raw)) {
+      closeAllLists();
+      const buf = [];
+      i++;
+      while (i < lines.length && !/^\s*```/.test(lines[i])) { buf.push(escLine(lines[i])); i++; }
+      i++;
+      out.push(`<pre><code>${buf.join("\n")}</code></pre>`);
+      continue;
+    }
+    const h = /^(#{1,6})\s+(.*)$/.exec(raw);
+    if (h) { closeAllLists(); out.push(`<h${h[1].length + 2}>${mdInline(escLine(h[2]))}</h${h[1].length + 2}>`); i++; continue; }
+    if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(raw)) { closeAllLists(); out.push("<hr>"); i++; continue; }
+    if (/^\|.*\|$/.test(raw.trim()) && i + 1 < lines.length && /^\|?[\s:|-]+\|?$/.test(lines[i + 1].trim()) && lines[i + 1].includes("-")) {
+      closeAllLists();
+      const cells = (r) => r.trim().replace(/^\||\|$/g, "").split("|").map((c) => c.trim());
+      const head = cells(raw);
+      i += 2;
+      const rows = [];
+      while (i < lines.length && /^\|.*\|$/.test(lines[i].trim())) { rows.push(cells(lines[i])); i++; }
+      out.push(`<table><thead><tr>${head.map((c) => `<th>${mdInline(escLine(c))}</th>`).join("")}</tr></thead><tbody>${rows.map((r) => `<tr>${r.map((c) => `<td>${mdInline(escLine(c))}</td>`).join("")}</tr>`).join("")}</tbody></table>`);
+      continue;
+    }
+    if (/^>\s?/.test(raw)) {
+      closeAllLists();
+      const buf = [];
+      while (i < lines.length && /^>\s?/.test(lines[i])) { buf.push(mdInline(escLine(lines[i].replace(/^>\s?/, "")))); i++; }
+      out.push(`<blockquote>${buf.join("<br>")}</blockquote>`);
+      continue;
+    }
+    const li = /^(\s*)([-*]|\d+\.)\s+(.*)$/.exec(raw);
+    if (li) {
+      const indent = li[1].length;
+      const type = /^\d/.test(li[2]) ? "ol" : "ul";
+      if (!listStack.length || indent > listStack[listStack.length - 1].indent) { listStack.push({ indent, type }); out.push(type === "ol" ? "<ol>" : "<ul>"); }
+      else { closeListsTo(indent); if (!listStack.length || listStack[listStack.length - 1].indent !== indent) { listStack.push({ indent, type }); out.push(type === "ol" ? "<ol>" : "<ul>"); } }
+      const check = /^\[([ xX])\]\s+(.*)$/.exec(li[3]);
+      if (check) out.push(`<li class="md-check"><label><input type="checkbox" data-md-line="${i}" ${check[1].toLowerCase() === "x" ? "checked" : ""}> ${mdInline(escLine(check[2]))}</label></li>`);
+      else out.push(`<li>${mdInline(escLine(li[3]))}</li>`);
+      i++;
+      continue;
+    }
+    if (!raw.trim()) { closeAllLists(); i++; continue; }
+    closeAllLists();
+    const buf = [mdInline(line)];
+    i++;
+    while (i < lines.length && lines[i].trim() && !/^(#{1,6}\s|\s*```|>\s?|(\s*)([-*]|\d+\.)\s+)/.test(lines[i]) && !/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(lines[i])) { buf.push(mdInline(escLine(lines[i]))); i++; }
+    out.push(`<p>${buf.join("<br>")}</p>`);
+  }
+  closeAllLists();
+  return out.join("\n");
+}
+
+function bindMdEditors(root) {
+  $$(".md-editor", root).forEach((ed) => {
+    const ta = ed.querySelector("textarea");
+    const preview = ed.querySelector(".md-preview");
+    if (!ta || !preview) return;
+    const renderPreview = () => { preview.innerHTML = renderMarkdown(ta.value); };
+    const grow = () => { if (ta.offsetParent !== null) { ta.style.height = "auto"; ta.style.height = Math.min(Math.max(ta.scrollHeight + 2, 96), 520) + "px"; } };
+    ed.querySelector(".md-toolbar")?.addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-md]");
+      if (!btn) return;
+      e.preventDefault();
+      if (btn.dataset.md === "preview") {
+        const show = preview.hidden;
+        preview.hidden = !show;
+        ta.hidden = show;
+        btn.classList.toggle("active", show);
+        if (show) renderPreview();
+        return;
+      }
+      mdApply(ta, btn.dataset.md);
+      grow();
+      if (!preview.hidden) renderPreview();
+    });
+    ta.addEventListener("keydown", (e) => {
+      const mod = e.ctrlKey || e.metaKey;
+      if (mod && !e.shiftKey && e.key.toLowerCase() === "b") { e.preventDefault(); mdApply(ta, "bold"); }
+      else if (mod && !e.shiftKey && e.key.toLowerCase() === "i") { e.preventDefault(); mdApply(ta, "italic"); }
+      else if (mod && !e.shiftKey && e.key.toLowerCase() === "k") { e.preventDefault(); mdApply(ta, "link"); }
+      else if (e.key === "Enter") { if (mdContinueList(ta)) { e.preventDefault(); grow(); } }
+      else if (e.key === "Tab") { e.preventDefault(); const p = ta.selectionStart; ta.value = ta.value.slice(0, p) + "  " + ta.value.slice(ta.selectionEnd); ta.setSelectionRange(p + 2, p + 2); }
+    });
+    ta.addEventListener("input", grow);
+    preview.addEventListener("change", (e) => {
+      const cb = e.target.closest("input[data-md-line]");
+      if (!cb) return;
+      const idx = parseInt(cb.dataset.mdLine, 10);
+      const ls = ta.value.split("\n");
+      if (ls[idx]) { ls[idx] = ls[idx].replace(/\[[ xX]\]/, cb.checked ? "[x]" : "[ ]"); ta.value = ls.join("\n"); renderPreview(); }
+    });
+    grow();
+  });
+}
+
 function bodyFieldHtml(table, id, body, version) {
-  return `<textarea name="body" rows="5">${esc(body ?? "")}</textarea><span class="muted"> v${version}</span>`;
+  return `${mdEditorHtml(body, 5)}<span class="muted"> v${version}</span>`;
 }
 function subtaskBlock(table, id, subtasksJson) {
   let subs = [];
   try { subs = JSON.parse(subtasksJson ?? "[]"); } catch { subs = []; }
   return `<h4>Subtasks</h4>
     <div data-sub-list>
-      ${subs.map((s) => `<div class="row" data-sub-row="${s.id}"><input type="checkbox" ${s.done ? "checked" : ""}><span data-sub-text>${esc(s.text)}</span></div>`).join("") || "<p class='muted'>No subtasks.</p>"}
+      ${subs.map((s) => `<div class="row" data-sub-row="${s.id}" draggable="true"><span class="sub-grip" aria-hidden="true">⠿</span><input type="checkbox" ${s.done ? "checked" : ""}><span data-sub-text>${esc(s.text)}</span><button type="button" data-sub-del aria-label="Delete subtask">×</button></div>`).join("") || "<p class='muted'>No subtasks.</p>"}
     </div>
     <div class="inline-add"><input data-sub-new placeholder="New subtask"><button type="button" data-add-sub-btn>Add</button></div>`;
 }
@@ -339,7 +695,7 @@ function recurrenceForm(row) {
       </div>
       <div data-rec-weekdays ${freq !== "weekly" ? "hidden" : ""}>Weekdays: ${["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((d, i) => `<label><input type="checkbox" name="wd" value="${i}" ${weekdays.includes(i) ? "checked" : ""}>${d}</label>`).join(" ")}</div>
     </div>
-    ${rule ? `<p class="muted">${esc(recurrenceSummary(rule))} <button type="button" data-skip="${row.id}">Skip occurrence</button> <button type="button" data-stop="${row.id}">Stop recurring</button></p>` : ""}`;
+    ${rule ? `<p class="muted">${esc(recurrenceSummary(rule))}</p><p><button type="button" data-skip="${row.id}">Skip occurrence</button> <button type="button" data-stop="${row.id}">Stop recurring</button></p>` : ""}`;
 }
 function linksBlock(fromType, fromId) {
   const links = [...forwardLinks(fromType, fromId), ...backlinks(fromType, fromId)];
@@ -350,21 +706,35 @@ function linksBlock(fromType, fromId) {
     seen.add(k);
     return true;
   });
+  // One searchable picker across every linkable type — no type select
+  // first (Ben, Nov 4, 2026). Excludes the item itself and anything
+  // already linked; the hidden value carries "type:id".
+  const LINK_LABELS = { tasks: "Task", notes: "Note", people: "Person", reading_items: "Reading", projects: "Project" };
+  const candidates = [];
+  for (const t of Object.keys(LINK_LABELS)) {
+    for (const r of allRows(t)) {
+      if (t === fromType && r.id === fromId) continue;
+      if (seen.has(`${t}:${r.id}`)) continue;
+      candidates.push({ type: t, id: r.id, title: r.title ?? "" });
+    }
+  }
+  candidates.sort((a, b) => a.title.localeCompare(b.title));
   return `<h4>Links</h4>
     ${uniq.map((l) => `<div class="row"><span class="badge">${esc(l.type)}</span><span class="row-title" data-open="${l.type}:${l.id}">${esc(l.row.title)}</span><button data-remove-link="${fromType}:${fromId}:${l.type}:${l.id}">Remove</button></div>`).join("") || "<p class='muted'>No links.</p>"}
     <form data-add-link="${fromType}:${fromId}" class="form inline inline-add">
-      <select name="linkType">${["tasks", "notes", "people", "reading_items", "projects"].map((t) => `<option value="${t}">${t}</option>`).join("")}</select>
-      <select name="linkId"></select>
+      <div class="cf-combo" data-combo>
+        <input type="text" data-combo-input placeholder="Search all items to link…" autocomplete="off">
+        <input type="hidden" name="linkTarget" data-combo-value value="">
+        <div class="cf-combo-list" data-combo-list hidden>
+          ${candidates.map((c) => `<button type="button" data-combo-id="${c.type}:${c.id}" data-combo-title="${esc(`${c.title} (${LINK_LABELS[c.type]})`)}">${esc(c.title)} <span class="badge">${c.type}</span></button>`).join("")}
+          <p data-combo-empty hidden style="padding:8px 12px" class="muted">No matches.</p>
+        </div>
+      </div>
       <button>Add link</button>
     </form>`;
 }
-function refreshLinkOptions(form) {
-  const type = form.querySelector("[name=linkType]").value;
-  const sel = form.querySelector("[name=linkId]");
-  sel.innerHTML = allRows(type).map((r) => `<option value="${r.id}">${esc(r.title)}</option>`).join("");
-}
 
-function openTaskPopup(id) {
+function taskEditorHtml(id, forPage) {
   const t = state.store.getRow("tasks", id);
   if (!t) return;
   const parentId = state.store.getTaskParent(id);
@@ -383,8 +753,9 @@ function openTaskPopup(id) {
     }
   }
   const linkOptions = allRows("tasks").filter((x) => x.id !== id && !childIds.has(x.id) && !descendantIds.has(x.id));
-  openPopup(t.title, `
-    <form data-edit-task="${t.id}" id="task-save-form" class="form popup-form">
+  const fid = forPage ? "task-save-form-page" : "task-save-form";
+  return `
+    <form data-edit-task="${t.id}" id="${fid}" class="form popup-form">
       <div class="cf-field"><label class="cf-label">Title</label><input name="title" value="${esc(t.title)}" required></div>
       <div class="cf-row"><div class="cf-field"><label class="cf-label">Due</label><input type="date" name="due" value="${t.due_date ?? ""}"></div>
       <div class="cf-field"><label class="cf-label">Priority</label>${selectHtml("priority", vocabValues("tasks", "priority"), t.priority)}</div></div>
@@ -419,14 +790,21 @@ function openTaskPopup(id) {
     </div>` : ""}
     ${parent ? `<p class="muted">Parent: <span class="row-title" data-open="tasks:${parent.id}">${esc(parent.title)}</span></p>` : ""}
     ${linksBlock("tasks", id)}
-    <p class="popup-actions"><button type="submit" form="task-save-form" class="primary-btn">Save</button><button type="submit" form="task-save-form">Save and close</button><button data-archive-task="${t.id}">Archive task</button><button data-close-popup>Close</button></p>`, `tasks:${t.id}`);
+    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Save</button><button type="submit" form="${fid}" class="primary-btn">Save and close</button><button data-duplicate-task="${t.id}" class="ghost-btn">Duplicate</button><button data-archive-task="${t.id}" class="danger-btn">Archive task</button><button data-close-popup class="ghost-btn">Close</button></p>`}`;
 }
 
-function openNotePopup(id) {
+function openTaskPopup(id) {
+  const __row = state.store.getRow("tasks", id);
+  if (__row) openPopup(__row.title, taskEditorHtml(id, false), `tasks:${id}`);
+}
+
+function noteEditorHtml(id, forPage) {
   const n = state.store.getRow("notes", id);
   if (!n) return;
-  openPopup(n.title, `
-    <form data-edit-note="${n.id}" id="note-save-form" class="form popup-form">
+  const fid = forPage ? "note-save-form-page" : "note-save-form";
+  return `
+    <form data-edit-note="${n.id}" id="${fid}" class="form popup-form">
+      ${attachmentsHtml("notes", n.id)}
       <div class="cf-field"><label class="cf-label">Title</label><input name="title" value="${esc(n.title)}" required></div>
       <div class="cf-field"><label class="cf-label">Type</label><select name="type"><option value="">—</option>${vocabOptions("notes", "type", n.type).map((v) => `<option value="${esc(v)}" ${v === n.type ? "selected" : ""}>${esc(v)}</option>`).join("")}<option value="__new__">New type…</option></select><div style="margin-top:8px"><input name="typeNew" placeholder="New type" hidden></div></div>
       <div class="cf-field"><label class="cf-label">Date</label><input type="date" name="date" value="${n.date ?? ""}"></div>
@@ -434,32 +812,44 @@ function openNotePopup(id) {
       <h4>Body</h4>${bodyFieldHtml("notes", id, n.body_markdown, n.body_version)}
     </form>
     ${linksBlock("notes", id)}
-    <p class="popup-actions"><button type="submit" form="note-save-form" class="primary-btn">Save</button><button type="submit" form="note-save-form">Save and close</button><button data-archive-note="${n.id}">Archive note</button><button data-close-popup>Close</button></p>`, `notes:${n.id}`);
+    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Save</button><button type="submit" form="${fid}" class="primary-btn">Save and close</button><button data-duplicate-note="${n.id}" class="ghost-btn">Duplicate</button><button data-archive-note="${n.id}" class="danger-btn">Archive note</button><button data-close-popup class="ghost-btn">Close</button></p>`}`;
 }
 
-function openPersonPopup(id) {
+function openNotePopup(id) {
+  const __row = state.store.getRow("notes", id);
+  if (__row) openPopup(__row.title, noteEditorHtml(id, false), `notes:${id}`);
+}
+
+function personEditorHtml(id, forPage) {
   const p = state.store.getRow("people", id);
   if (!p) return;
   const noteLinks = state.db.prepare("SELECT from_type, from_id FROM relations WHERE to_type='people' AND to_id=? AND relation_name='people'").all(id);
   const items = noteLinks.map((r) => ({ type: r.from_type, row: state.store.getRow(r.from_type, r.from_id) })).filter((x) => x.row);
-  openPopup(p.title, `
-    <form data-edit-person="${p.id}" id="person-save-form" class="form popup-form">
+  const fid = forPage ? "person-save-form-page" : "person-save-form";
+  return `
+    <form data-edit-person="${p.id}" id="${fid}" class="form popup-form">
       <div class="cf-field"><label class="cf-label">Name</label><input name="title" value="${esc(p.title)}" required></div>
       <div class="cf-field"><label class="cf-label">Role</label>${selectHtml("role", vocabOptions("people", "role", p.role), p.role)}<div style="margin-top:8px">${newValueHtml("roleNew", "New role")}</div></div>
       <h4>Body</h4>${bodyFieldHtml("people", id, p.body_markdown, p.body_version)}
     </form>
     ${items.length ? `<h4>Linked items</h4>${items.map((x) => `<div class="row"><span class="badge">${esc(x.type)}</span><span class="row-title" data-open="${x.type}:${x.row.id}">${esc(x.row.title)}</span></div>`).join("")}` : ""}
     ${linksBlock("people", id)}
-    <p class="popup-actions"><button type="submit" form="person-save-form" class="primary-btn">Save</button><button type="submit" form="person-save-form">Save and close</button><button data-archive-person="${p.id}">Archive person</button><button data-close-popup>Close</button></p>`, `people:${p.id}`);
+    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Save</button><button type="submit" form="${fid}" class="primary-btn">Save and close</button><button data-archive-person="${p.id}" class="danger-btn">Archive person</button><button data-close-popup class="ghost-btn">Close</button></p>`}`;
 }
 
-function openProjectPopup(id) {
+function openPersonPopup(id) {
+  const __row = state.store.getRow("people", id);
+  if (__row) openPopup(__row.title, personEditorHtml(id, false), `people:${id}`);
+}
+
+function projectEditorHtml(id, forPage) {
   const p = state.store.getRow("projects", id);
   if (!p) return;
   const related = new Set(state.store.listRelatedTodos(id));
   const tasks = allRows("tasks");
-  openPopup(p.title, `
-    <form data-edit-project="${p.id}" id="project-save-form" class="form popup-form">
+  const fid = forPage ? "project-save-form-page" : "project-save-form";
+  return `
+    <form data-edit-project="${p.id}" id="${fid}" class="form popup-form">
       <div class="cf-field"><label class="cf-label">Name</label><input name="title" value="${esc(p.title)}" required></div>
       <div class="cf-field"><label class="cf-label">Category</label><select name="category"><option value="">—</option>${vocabOptions("projects", "category", p.category).map((v) => `<option value="${esc(v)}" ${v === p.category ? "selected" : ""}>${esc(v)}</option>`).join("")}<option value="__new__">New category…</option></select><div style="margin-top:8px"><input name="categoryNew" placeholder="New category" hidden></div></div>
       <div class="cf-field"><label class="cf-label">Status</label>${selectHtml("status", vocabValues("projects", "status"), p.status)}</div>
@@ -473,14 +863,20 @@ function openProjectPopup(id) {
       <div data-todo-selected>${[...related].map((tid) => { const t = tasks.find((x) => x.id === tid); return t ? `<div class="row"><span class="row-title">${esc(t.title)}</span><input type="hidden" name="todo" value="${t.id}"><button type="button" data-todo-remove>✕</button></div>` : ""; }).join("")}</div>
     </form>
     ${linksBlock("projects", id)}
-    <p class="popup-actions"><button type="submit" form="project-save-form" class="primary-btn">Save</button><button type="submit" form="project-save-form">Save and close</button><button data-archive-project="${p.id}">Archive project</button><button data-close-popup>Close</button></p>`, `projects:${p.id}`);
+    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Save</button><button type="submit" form="${fid}" class="primary-btn">Save and close</button><button data-archive-project="${p.id}" class="danger-btn">Archive project</button><button data-close-popup class="ghost-btn">Close</button></p>`}`;
 }
 
-function openReadingPopup(id) {
+function openProjectPopup(id) {
+  const __row = state.store.getRow("projects", id);
+  if (__row) openPopup(__row.title, projectEditorHtml(id, false), `projects:${id}`);
+}
+
+function readingEditorHtml(id, forPage) {
   const r = state.store.getRow("reading_items", id);
   if (!r) return;
-  openPopup(r.title, `
-    <form data-edit-reading="${r.id}" id="reading-save-form" class="form popup-form">
+  const fid = forPage ? "reading-save-form-page" : "reading-save-form";
+  return `
+    <form data-edit-reading="${r.id}" id="${fid}" class="form popup-form">
       <div class="cf-field"><label class="cf-label">Title</label><input name="title" value="${esc(r.title)}" required></div>
       <div class="cf-field"><label class="cf-label">URL</label><input name="url" value="${esc(r.url ?? "")}" required></div>
       <div class="cf-field"><label class="cf-label">Status</label>${selectHtml("status", vocabValues("reading_items", "status"), r.status, false)}</div>
@@ -488,18 +884,30 @@ function openReadingPopup(id) {
       <h4>Notes</h4>${bodyFieldHtml("reading_items", id, r.body_markdown, r.body_version)}
     </form>
     ${linksBlock("reading_items", id)}
-    <p class="popup-actions"><button type="submit" form="reading-save-form" class="primary-btn">Save</button><button type="submit" form="reading-save-form">Save and close</button><button data-archive-reading="${r.id}">Archive item</button><button data-close-popup>Close</button></p>`, `reading_items:${r.id}`);
+    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Save</button><button type="submit" form="${fid}" class="primary-btn">Save and close</button><button data-archive-reading="${r.id}" class="danger-btn">Archive item</button><button data-close-popup class="ghost-btn">Close</button></p>`}`;
 }
 
-function openInboxPopup(id) {
+function openReadingPopup(id) {
+  const __row = state.store.getRow("reading_items", id);
+  if (__row) openPopup(__row.title, readingEditorHtml(id, false), `reading_items:${id}`);
+}
+
+function inboxEditorHtml(id, forPage) {
   const item = state.store.getRow("inbox_items", id);
   if (!item) return;
-  openPopup(item.title, `
-    <form data-edit-inbox="${id}" id="inbox-save-form" class="form popup-form">
+  const fid = forPage ? "inbox-save-form-page" : "inbox-save-form";
+  return `
+    <form data-edit-inbox="${id}" id="${fid}" class="form popup-form">
+      ${attachmentsHtml("inbox_items", id)}
       <div class="cf-field"><label class="cf-label">Title</label><input name="title" value="${esc(item.title)}"></div>
       <h4>Body</h4>${bodyFieldHtml("inbox_items", id, item.body_markdown, item.body_version)}
     </form>
-    <p class="popup-actions"><button type="submit" form="inbox-save-form" class="primary-btn">Save</button><button type="submit" form="inbox-save-form">Save and close</button><button data-move-personal="${id}">Move to Personal Notes</button> <button data-archive-inbox="${id}">Archive</button> <button data-close-popup>Close</button></p>`, `inbox_items:${id}`);
+    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Save</button><button type="submit" form="${fid}" class="primary-btn">Save and close</button><button data-move-personal="${id}">Move to Personal Notes</button> <button data-archive-inbox="${id}" class="danger-btn">Archive</button> <button data-close-popup class="ghost-btn">Close</button></p>`}`;
+}
+
+function openInboxPopup(id) {
+  const __row = state.store.getRow("inbox_items", id);
+  if (__row) openPopup(__row.title, inboxEditorHtml(id, false), `inbox_items:${id}`);
 }
 
 function openPopupByRef(type, id) {
@@ -553,89 +961,60 @@ function pageSubtasks(subtasksJson) {
     ${subs.map((x) => `<div class="row"><input type="checkbox" disabled ${x.done ? "checked" : ""}><span>${esc(x.text)}</span></div>`).join("") || "<p class='muted'>No subtasks.</p>"}`;
 }
 function pageActions(view, extra) {
-  return `<div class="page-actions"><button data-page-back>Back</button><button data-page-edit="${viewRef(view)}">Edit</button>${extra || ""}<button data-page-archive="${viewRef(view)}">Archive</button></div>`;
+  return `<div class="page-actions"><button data-page-back class="ghost-btn">Back</button>${extra || ""}${view.type === "tasks" ? `<button data-duplicate-task="${view.id}" class="ghost-btn">Duplicate</button>` : view.type === "notes" ? `<button data-duplicate-note="${view.id}" class="ghost-btn">Duplicate</button>` : ""}<button data-pin-toggle="${viewRef(view)}" class="ghost-btn">${isPinned(viewRef(view)) ? "Unpin" : "Pin"}</button><button data-md-download="${viewRef(view)}" class="ghost-btn">Download .md</button><button data-page-archive="${viewRef(view)}" class="danger-btn">Archive</button></div>`;
 }
 function renderItemPage(view) {
   const { type, id, slug } = view;
   if (type === "tasks") {
     const t = state.store.getRow("tasks", id);
-    if (!t) return `<div class="page-actions"><button data-page-back>Back</button></div><p class="muted">This item no longer exists.</p>`;
+    if (!t) return `<div class="page-actions"><button data-page-back class="ghost-btn">Back</button></div><p class="muted">This item no longer exists.</p>`;
     const parentId = state.store.getTaskParent(id);
     const parent = parentId ? state.store.getRow("tasks", parentId) : null;
     const children = linkedTitles("tasks", id, "sub_tasks", "tasks");
     const { rule } = parseRecurrence(t.recurrence ?? "");
     const meta = [t.due_date ? `Due ${esc(t.due_date)}` : "", t.priority ? `Priority ${esc(t.priority)}` : "", t.project ? `Project ${esc(t.project)}` : ""].filter(Boolean).join(" · ");
     return `${pageActions(view)}
-      <h2>${esc(t.title)}</h2>
-      ${meta ? `<p class="muted">${meta}</p>` : ""}
-      ${parent ? `<p class="muted">Parent: <span class="row-title" data-open-page="tasks:${parent.id}">${esc(parent.title)}</span></p>` : ""}
-      ${rule ? `<p class="muted">Repeats: ${esc(recurrenceSummary(rule))}</p>` : ""}
-      ${pageTags("tasks", id)}
-      ${pageBody(t.body_markdown)}
-      ${pageSubtasks(t.subtasks)}
-      <h4>Linked subtasks</h4>
-      ${children.map((c) => `<div class="row"><span class="row-title" data-open-page="tasks:${c.id}">${esc(c.row.title)}</span></div>`).join("") || "<p class='muted'>No linked subtasks.</p>"}
-      ${pageLinks("tasks", id)}`;
+      <div class="notebook">${taskEditorHtml(id, true)}</div>`;
   }
   if (type === "notes") {
     const n = state.store.getRow("notes", id);
-    if (!n) return `<div class="page-actions"><button data-page-back>Back</button></div><p class="muted">This item no longer exists.</p>`;
+    if (!n) return `<div class="page-actions"><button data-page-back class="ghost-btn">Back</button></div><p class="muted">This item no longer exists.</p>`;
     const meta = [n.type ? `Type ${esc(n.type)}` : "", n.date ? esc(n.date) : ""].filter(Boolean).join(" · ");
     return `${pageActions(view)}
-      <h2>${esc(n.title)}</h2>
-      ${meta ? `<p class="muted">${meta}</p>` : ""}
-      ${pageTags("notes", id)}
-      ${pageBody(n.body_markdown)}
-      ${pageLinks("notes", id)}`;
+      <div class="notebook">${noteEditorHtml(id, true)}</div>`;
   }
   if (type === "people") {
     const p = state.store.getRow("people", id);
-    if (!p) return `<div class="page-actions"><button data-page-back>Back</button></div><p class="muted">This item no longer exists.</p>`;
+    if (!p) return `<div class="page-actions"><button data-page-back class="ghost-btn">Back</button></div><p class="muted">This item no longer exists.</p>`;
     const noteLinks = state.db.prepare("SELECT from_type, from_id FROM relations WHERE to_type='people' AND to_id=? AND relation_name='people'").all(id);
     const items = noteLinks.map((r) => ({ type: r.from_type, row: state.store.getRow(r.from_type, r.from_id) })).filter((x) => x.row);
     return `${pageActions(view)}
-      <h2>${esc(p.title)}</h2>
-      ${p.role ? `<p class="muted">Role ${esc(p.role)}</p>` : ""}
-      ${pageBody(p.body_markdown)}
-      ${items.length ? `<h4>Linked items</h4>${items.map((x) => `<div class="row"><span class="badge">${esc(x.type)}</span><span class="row-title" data-open-page="${x.type}:${x.row.id}">${esc(x.row.title)}</span></div>`).join("")}` : ""}
-      ${pageLinks("people", id)}`;
+      <div class="notebook">${personEditorHtml(id, true)}</div>`;
   }
   if (type === "projects") {
     const p = state.store.getRow("projects", id);
-    if (!p) return `<div class="page-actions"><button data-page-back>Back</button></div><p class="muted">This item no longer exists.</p>`;
+    if (!p) return `<div class="page-actions"><button data-page-back class="ghost-btn">Back</button></div><p class="muted">This item no longer exists.</p>`;
     const related = state.store.listRelatedTodos(id);
     const meta = [p.category ? `Category ${esc(p.category)}` : "", p.status ? `Status ${esc(p.status)}` : ""].filter(Boolean).join(" · ");
     return `${pageActions(view)}
-      <h2>${esc(p.title)}</h2>
-      ${meta ? `<p class="muted">${meta}</p>` : ""}
-      ${pageBody(p.body_markdown)}
-      ${pageSubtasks(p.subtasks)}
-      <h4>Related todos</h4>
-      ${related.map((tid) => { const t = state.store.getRow("tasks", tid); return t ? `<div class="row"><span class="row-title" data-open-page="tasks:${t.id}">${esc(t.title)}</span></div>` : ""; }).join("") || "<p class='muted'>No related todos.</p>"}
-      ${pageLinks("projects", id)}`;
+      <div class="notebook">${projectEditorHtml(id, true)}</div>`;
   }
   if (type === "reading_items") {
     const r = state.store.getRow("reading_items", id);
-    if (!r) return `<div class="page-actions"><button data-page-back>Back</button></div><p class="muted">This item no longer exists.</p>`;
+    if (!r) return `<div class="page-actions"><button data-page-back class="ghost-btn">Back</button></div><p class="muted">This item no longer exists.</p>`;
     return `${pageActions(view)}
-      <h2>${esc(r.title)}</h2>
-      ${r.url ? `<p><a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.url)}</a></p>` : ""}
-      ${r.status ? `<p class="muted">Status ${esc(r.status)}</p>` : ""}
-      <p class="muted">Source: ${esc(r.source ?? "")} · added ${esc(r.added ?? "")}</p>
-      ${pageBody(r.body_markdown)}
-      ${pageLinks("reading_items", id)}`;
+      <div class="notebook">${readingEditorHtml(id, true)}</div>`;
   }
   if (type === "inbox_items") {
     const item = state.store.getRow("inbox_items", id);
-    if (!item) return `<div class="page-actions"><button data-page-back>Back</button></div><p class="muted">This item no longer exists.</p>`;
-    return `<div class="page-actions"><button data-page-back>Back</button><button data-page-edit="${viewRef(view)}">Edit</button><button data-page-move="${id}">Move to Personal Notes</button><button data-page-archive="${viewRef(view)}">Archive</button></div>
-      <h2>${esc(item.title)}</h2>
-      ${pageBody(item.body_markdown)}`;
+    if (!item) return `<div class="page-actions"><button data-page-back class="ghost-btn">Back</button></div><p class="muted">This item no longer exists.</p>`;
+    return `<div class="page-actions"><button data-page-back class="ghost-btn">Back</button><button data-page-move="${id}">Move to Personal Notes</button><button data-md-download="${viewRef(view)}" class="ghost-btn">Download .md</button><button data-page-archive="${viewRef(view)}" class="danger-btn">Archive</button></div>
+      <div class="notebook">${inboxEditorHtml(id, true)}</div>`;
   }
   if (type === "custom") {
     const def = state.store.getRow("custom_object_types", slug);
     const row = state.store.getRow("custom_objects", id);
-    if (!def || !row) return `<div class="page-actions"><button data-page-back>Back</button></div><p class="muted">This item no longer exists.</p>`;
+    if (!def || !row) return `<div class="page-actions"><button data-page-back class="ghost-btn">Back</button></div><p class="muted">This item no longer exists.</p>`;
     const fields = JSON.parse(def.fields_json ?? "[]");
     const vals = JSON.parse(row.fields_json ?? "{}");
     const show = (f) => {
@@ -645,11 +1024,48 @@ function renderItemPage(view) {
       return esc(String(v));
     };
     return `${pageActions(view)}
-      <h2>${esc(row.title)}</h2>
-      ${fields.map((f) => `<p><span class="muted">${esc(f.name)}: </span>${show(f)}</p>`).join("")}
-      ${pageLinks("custom_objects", id)}`;
+      <div class="notebook">${customEditorHtml(slug, id, true)}</div>`;
   }
-  return `<div class="page-actions"><button data-page-back>Back</button></div><p class="muted">Unknown item type.</p>`;
+  return `<div class="page-actions"><button data-page-back class="ghost-btn">Back</button></div><p class="muted">Unknown item type.</p>`;
+}
+
+
+// --- Browser history for item pages + tabs (stamp 2026-11-04h) ---
+// render() calls pushNav() after every paint; it only pushes when the
+// nav key actually changed, so ticks/saves don't spam history. Back /
+// forward fire popstate, which re-derives tab/itemView and re-renders.
+let navGuard = false;
+let navLastKey = null;
+function navKey() { return state.itemView ? `item:${viewRef(state.itemView)}` : `tab:${state.tab}`; }
+function navHash(key) { return `#/${key.replace(":", "/")}`; }
+function pushNav() {
+  if (navGuard || typeof history === "undefined") return;
+  const key = navKey();
+  if (key === navLastKey) return;
+  navLastKey = key;
+  try { history.pushState({ key }, "", navHash(key)); } catch {}
+}
+function initNav() {
+  if (typeof history === "undefined" || typeof window === "undefined") return;
+  try {
+    const m = (location.hash || "").match(/^#\/(item|tab)\/(.+)$/);
+    if (m) {
+      if (m[1] === "item") state.itemView = parsePageRef(decodeURIComponent(m[2]));
+      else if (allTabIds().includes(m[2])) { state.itemView = null; state.tab = m[2]; }
+    }
+    navLastKey = navKey();
+    history.replaceState({ key: navLastKey }, "", navHash(navLastKey));
+    window.addEventListener("popstate", (e) => {
+      const key = e.state?.key;
+      if (!key) return;
+      navGuard = true;
+      navLastKey = key;
+      if (key.startsWith("item:")) state.itemView = parsePageRef(key.slice(5));
+      else if (key.startsWith("tab:")) { state.itemView = null; state.tab = key.slice(4); }
+      render();
+      navGuard = false;
+    });
+  } catch {}
 }
 
 // --- Tab renders ---
@@ -658,7 +1074,17 @@ function render() {
   $("#sync-status").textContent = statusLine();
   $("#net-badge").textContent = navigator.onLine ? "Online" : "Offline";
   renderSidebar();
-  $$(".tab-btn").forEach((b) => b.classList.toggle("active", b.dataset.tab === state.tab));
+  $$(".tab-btn").forEach((b) => {
+    b.classList.toggle("active", b.dataset.tab === state.tab);
+    if (b.dataset.tab === "tasks") {
+      const n = openTasks().filter((t) => t.due_date && t.due_date <= todayToronto()).length;
+      let badge = b.querySelector(".tab-badge");
+      if (n > 0) {
+        if (!badge && typeof document.createElement === "function") { badge = document.createElement("span"); badge.className = "tab-badge"; b.appendChild(badge); }
+        if (badge) badge.textContent = String(n);
+      } else if (badge) badge.remove();
+    }
+  });
   const main = $("#main");
   if (state.itemView) main.innerHTML = renderItemPage(state.itemView);
   else if (state.tab === "dashboard") main.innerHTML = renderDashboard();
@@ -670,27 +1096,326 @@ function render() {
   else if (state.tab === "projects") main.innerHTML = renderProjects();
   else if (state.tab === "search") main.innerHTML = renderSearch();
   else if (state.tab === "daily") main.innerHTML = renderDaily();
+  else if (state.tab === "calendar") main.innerHTML = renderCalendar();
+  else if (state.tab === "review") main.innerHTML = renderReview();
   else if (state.tab === "management") main.innerHTML = renderManagement();
   else if (state.tab.startsWith("custom:")) main.innerHTML = renderCustomTab(state.tab.slice(7));
   bindMainForms();
   bindExtraForms();
+  if (state.itemView) { bindPopupForms($("#main")); bindExtraPopupForms($("#main")); }
+  pushNav();
+}
+
+// --- Family calendar (stamp 2026-11-04ai) ---
+// Read-only view of the family Google calendar, fetched from the
+// Worker's /api/sync/calendar (which reads the calendar's secret
+// iCal address server-side — the calendar itself stays private).
+// Cached in localStorage so the dashboard paints instantly and works
+// offline; refreshed on boot, after syncs, and on demand, with a
+// 15-minute freshness guard so it never hammers the feed.
+const FAM_CACHE_KEY = "pkm-family-cal-v1";
+function famSeed() {
+  if (state.family) return state.family;
+  try {
+    const c = JSON.parse(localStorage.getItem(FAM_CACHE_KEY) || "null");
+    if (c && Array.isArray(c.events)) { state.family = { status: "ok", events: c.events, fetchedAt: c.fetchedAt ?? 0 }; return state.family; }
+  } catch {}
+  state.family = { status: "idle", events: [], fetchedAt: 0 };
+  return state.family;
+}
+async function loadFamilyCalendar(force = false) {
+  const fam = famSeed();
+  const t = state.transport;
+  if (!t || !t.base || !t.token) return;
+  if (!force && fam.status === "ok" && Date.now() - fam.fetchedAt < 15 * 60 * 1000) return;
+  if (fam.loading) return;
+  fam.loading = true;
+  try {
+    const res = await fetch(`${t.base}/api/sync/calendar?days=7`, { headers: { Authorization: `Bearer ${t.token}` } });
+    if (res.status === 501) {
+      state.family = { status: "unconfigured", events: [], fetchedAt: 0 };
+    } else if (!res.ok) {
+      throw new Error(`calendar -> ${res.status}`);
+    } else {
+      const data = await res.json();
+      state.family = { status: "ok", events: data.events ?? [], fetchedAt: Date.now() };
+      try { localStorage.setItem(FAM_CACHE_KEY, JSON.stringify({ fetchedAt: state.family.fetchedAt, events: state.family.events })); } catch {}
+    }
+  } catch {
+    if ((fam.events ?? []).length) { fam.status = "stale"; state.family = fam; }
+    else state.family = { status: "error", events: [], fetchedAt: 0 };
+  }
+  state.family.loading = false;
+  if (state.tab === "dashboard" && !state.itemView) render();
+}
+function torontoYmdOf(iso) {
+  const p = {};
+  for (const part of new Intl.DateTimeFormat("en-CA", { timeZone: "America/Toronto", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date(iso))) {
+    if (part.type !== "literal") p[part.type] = part.value;
+  }
+  return `${p.year}-${p.month}-${p.day}`;
+}
+function famEventDays(e) {
+  if (e.allDay) {
+    const out = [];
+    let d = e.start;
+    while (d < e.end && out.length < 14) { out.push(d); d = ymdAdd(d, 1); }
+    return out.length ? out : [e.start];
+  }
+  const startDay = torontoYmdOf(e.start);
+  const endMs = new Date(e.end).getTime();
+  const endDay = endMs > new Date(e.start).getTime() ? torontoYmdOf(new Date(endMs - 1).toISOString()) : startDay;
+  const out = [startDay];
+  let d = startDay;
+  while (d < endDay && out.length < 14) { d = ymdAdd(d, 1); out.push(d); }
+  return out;
+}
+function famTimeLabel(e) {
+  if (e.allDay) return "All day";
+  const f = (iso) => new Date(iso).toLocaleTimeString("en-CA", { timeZone: "America/Toronto", hour: "numeric", minute: "2-digit" });
+  return `${f(e.start)} – ${f(e.end)}`;
+}
+function familyPanel() {
+  const fam = famSeed();
+  if (fam.status === "idle" || (fam.status === "error" && !(fam.events ?? []).length)) return "";
+  if (fam.status === "unconfigured") {
+    return `<div class="panel"><h3>Family calendar</h3><p class="muted">Not connected yet — add the FAMILY_CAL_ICS_URL secret to the pkm-new Worker (Google Calendar → Family calendar → Settings → “Secret address in iCal format”), deploy, then Refresh.</p><p><button type="button" data-fam-refresh class="ghost-btn">Refresh</button></p></div>`;
+  }
+  const today = todayToronto();
+  const days = [];
+  for (let i = 0; i < 7; i++) days.push(ymdAdd(today, i));
+  const byDay = new Map(days.map((d) => [d, []]));
+  for (const e of fam.events ?? []) for (const d of famEventDays(e)) if (byDay.has(d)) byDay.get(d).push(e);
+  const label = (d, i) => i === 0 ? "Today" : i === 1 ? "Tomorrow" : new Date(d + "T12:00:00").toLocaleDateString("en-CA", { weekday: "long" });
+  const sections = days.map((d, i) => {
+    const list = byDay.get(d);
+    if (!list.length) return "";
+    return `<h4>${label(d, i)}</h4>` + list.map((e) => `<div class="row"><span class="fam-time">${esc(famTimeLabel(e))}</span><span class="row-title">${esc(e.title)}</span>${e.location ? `<span class="muted">${esc(e.location)}</span>` : ""}</div>`).join("");
+  }).join("");
+  const updated = fam.fetchedAt ? ` · updated ${new Date(fam.fetchedAt).toLocaleTimeString("en-CA", { hour: "numeric", minute: "2-digit" })}` : "";
+  return `<div class="panel"><h3>Family calendar <button type="button" data-fam-refresh class="ghost-btn fam-refresh">Refresh</button></h3>${fam.status === "stale" ? `<p class="muted">Couldn't refresh just now — showing the last copy${updated}.</p>` : ""}${sections || "<p class='muted'>Nothing on the family calendar this week.</p>"}</div>`;
 }
 
 function renderDashboard() {
   const conflicts = state.engine.listConflicts();
+  if (focusOn()) {
+    return `<div class="panel focus-bar"><b>Focus mode</b> <span class="muted">Just today \u2014 everything else is hidden.</span><button data-focus-toggle class="ghost-btn">Exit focus</button></div>
+  ${dailyWorkspacePanel()}`;
+  }
   return `${weatherPanel()}
+  ${pinnedPanel()}
   ${dailyWorkspacePanel()}
-  <div class="dash-row">${upcomingPanel()}${inboxPanel()}</div>
+  ${familyPanel()}
+  ${upcomingPanel()}
+  <div class="dash-row${readingQueuePanel() ? "" : " dash-row-single"}">${inboxPanel()}${readingQueuePanel()}</div>
+  <div class="panel"><form data-dash-search class="form"><input name="q" placeholder="Search DashBen…" style="flex:1"><button>Search</button></form></div>
   ${conflicts.length ? `<div class="panel"><h3>Sync conflicts (${conflicts.length}) — server row kept</h3>` + conflicts.map((c) => {
     let srv = null;
     try { srv = c.server_row_json ? JSON.parse(c.server_row_json) : null; } catch {}
     const title = srv?.title ? `: ${esc(srv.title)}` : "";
     return `<p class="conflict">${esc(c.table_name)} ${esc(c.row_id)}${title} <span class="muted">${esc(c.created_at ?? "")}</span> <button data-conflict-dismiss="${c.id}">Dismiss</button></p>`;
   }).join("") + `</div>` : ""}
-  <div class="panel"><form data-dash-search class="form"><input name="q" placeholder="Search DashBen…" style="flex:1"><button>Search</button></form></div>`;
+`;
 }
 
-function taskRow(t) {
+const SUB_CHECKLIST_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 6.5l1.2 1.2L7 5.4"/><path d="M3.5 12.5l1.2 1.2L7 11.4"/><path d="M3.5 18.5l1.2 1.2L7 17.4"/><path d="M11 7h10"/><path d="M11 13h10"/><path d="M11 19h10"/></svg>`;
+const SUB_LINK_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>`;
+
+// --- Idea batch 2 helpers (stamps 2026-11-04w-ae) ---
+// Smart quick-add (w): pull a due date and a priority out of a
+// quick-task title. "Pay rent Fri P1" -> due Friday, P1, "Pay rent".
+function parseQuickTask(raw) {
+  let title = ` ${raw.trim()} `;
+  let priority = null;
+  const pm = /\bP([1-3])\b/i.exec(title);
+  if (pm) { priority = `P${pm[1]}`; title = title.replace(pm[0], " "); }
+  const today = todayToronto();
+  const base = new Date(today + "T12:00:00");
+  const fmt = (d) => d.toISOString().slice(0, 10);
+  const addD = (n) => { const d = new Date(base); d.setDate(d.getDate() + n); return fmt(d); };
+  function monthDay(monStr, dayStr) {
+    const months = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, sept: 8, oct: 9, nov: 10, dec: 11 };
+    const mo = months[monStr.toLowerCase()];
+    let d = new Date(base.getFullYear(), mo, parseInt(dayStr, 10), 12);
+    if (d < base) d = new Date(base.getFullYear() + 1, mo, parseInt(dayStr, 10), 12);
+    return fmt(d);
+  }
+  const patterns = [
+    [/\b(\d{4}-\d{2}-\d{2})\b/, (m) => m[1]],
+    [/\btomorrow\b/i, () => addD(1)],
+    [/\btoday\b/i, () => today],
+    [/\bnext week\b/i, () => addD(7)],
+    [/\b(mon|monday|tue|tues|tuesday|wed|wednesday|thu|thur|thurs|thursday|fri|friday|sat|saturday|sun|sunday)\b/i, (m) => {
+      const want = { mon: 1, monday: 1, tue: 2, tues: 2, tuesday: 2, wed: 3, wednesday: 3, thu: 4, thur: 4, thurs: 4, thursday: 4, fri: 5, friday: 5, sat: 6, saturday: 6, sun: 0, sunday: 0 }[m[1].toLowerCase()];
+      return addD((want - base.getDay() + 7) % 7);
+    }],
+    [/\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})\b/i, (m) => monthDay(m[1], m[2])],
+    [/\b(\d{1,2})\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\b/i, (m) => monthDay(m[2], m[1])],
+  ];
+  let due = null;
+  for (const [re, fn] of patterns) {
+    const m = re.exec(title);
+    if (m) { due = fn(m); title = title.replace(m[0], " "); break; }
+  }
+  title = title.replace(/\s+/g, " ").trim();
+  return { title: title || raw.trim(), due, priority };
+}
+
+// Day progress (y): done-today vs everything due up to today.
+function dayProgressHtml() {
+  const today = todayToronto();
+  const doneToday = allRows("tasks").filter((t) => t.done && !t.archived && (t.updated_at ?? "").slice(0, 10) === today);
+  const openDue = openTasks().filter((t) => t.due_date && t.due_date <= today);
+  const total = doneToday.length + openDue.length;
+  if (!total) return "";
+  const pct = Math.round((doneToday.length / total) * 100);
+  return `<div class="day-progress"><b>${doneToday.length} of ${total} done today</b><div class="progress"><span style="width:${pct}%"></span></div>${doneToday.length ? `<p class="muted done-today">${doneToday.map((t) => `\u2713 ${esc(t.title)}`).join(" \u00b7 ")}</p>` : ""}</div>`;
+}
+
+// Pins (aa): synced ui_prefs list of page refs, shown on the dashboard.
+function getPins() { try { return JSON.parse(state.store.getRow("ui_prefs", "pins")?.value ?? "[]"); } catch { return []; } }
+function setPins(refs) { const ts = new Date().toISOString(); state.engine.localWrite("ui_prefs", { key: "pins", value: JSON.stringify(refs), updated_at: ts }, { baseUpdatedAt: state.store.getRow("ui_prefs", "pins")?.updated_at ?? null }); }
+function isPinned(ref) { return getPins().includes(ref); }
+function togglePin(ref) { const pins = getPins(); const i = pins.indexOf(ref); if (i >= 0) pins.splice(i, 1); else pins.push(ref); setPins(pins); }
+
+// --- Templates (stamp 2026-11-04am) ---
+// Stored in ui_prefs 'templates' (synced); the defaults below are
+// virtual until the list is first written (add/delete in Management).
+const DEFAULT_TEMPLATES = [
+  { id: "tpl-concern", kind: "note", name: "Resident concern", title: "", type: "General Notes", body: "## Contact\nName: \nPhone / email: \n\n## Issue\n\n\n## Follow-up\n- [ ] " },
+  { id: "tpl-meeting", kind: "note", name: "Meeting notes", title: "", type: "General Notes", body: "## Attendees\n\n\n## Notes\n\n\n## Actions\n- [ ] " },
+  { id: "tpl-followup", kind: "task", name: "Follow-up", title: "Follow up: ", project: "General", body: "## Context\n\n\n## Next step\n- [ ] " },
+];
+function getTemplates() {
+  try { const raw = state.store.getRow("ui_prefs", "templates")?.value; if (raw) { const l = JSON.parse(raw); if (Array.isArray(l)) return l; } } catch {}
+  return DEFAULT_TEMPLATES.slice();
+}
+function setTemplates(list) { const ts = new Date().toISOString(); state.engine.localWrite("ui_prefs", { key: "templates", value: JSON.stringify(list), updated_at: ts }, { baseUpdatedAt: state.store.getRow("ui_prefs", "templates")?.updated_at ?? null }); }
+function templateOptionsHtml(kind) { return getTemplates().filter((t) => t.kind === kind).map((t) => `<option value="${t.id}">${esc(t.name)}</option>`).join(""); }
+function applyTemplateToForm(form, id) {
+  const t = getTemplates().find((x) => x.id === id);
+  if (!t) return;
+  const title = form.querySelector("[name=title]");
+  if (title && t.title) title.value = t.title;
+  const body = form.querySelector("[name=body]");
+  if (body) body.value = t.body ?? "";
+  if (t.kind === "task") { const p = form.querySelector("[name=project]"); if (p && t.project) p.value = t.project; }
+  if (t.kind === "note") { const ty = form.querySelector("[name=type]"); if (ty && t.type) ty.value = t.type; }
+  title?.focus();
+}
+
+// --- Reading auto-title (stamp 2026-11-04am) ---
+// The Worker fetches the page server-side (no CORS wall) and returns
+// its <title>/og:title; fills the form's title only when it's empty.
+async function fetchLinkTitle(url) {
+  const t = state.transport;
+  if (!t?.base || !t?.token) return null;
+  try {
+    const res = await fetch(`${t.base}/api/sync/link-title?url=${encodeURIComponent(url)}`, { headers: { Authorization: `Bearer ${t.token}` } });
+    if (!res.ok) return null;
+    const d = await res.json();
+    return d.title || null;
+  } catch { return null; }
+}
+function bindLinkTitle(form) {
+  const url = form.querySelector("[name=url]");
+  const title = form.querySelector("[name=title]");
+  if (!url || !title) return;
+  url.addEventListener("change", async () => {
+    const u = url.value.trim();
+    if (!u || title.value.trim()) return;
+    const got = await fetchLinkTitle(u);
+    if (got && !title.value.trim()) title.value = got;
+  });
+}
+
+// --- Daily-tab day context (stamp 2026-11-04am) ---
+// One-day family-calendar fetch for the date being viewed (the
+// dashboard panel only covers the coming week), cached 15 minutes,
+// plus the day's weather when it's inside the forecast window.
+async function loadDayEvents(ymd) {
+  const cur = state.dayEvents;
+  if (cur?.loading) return;
+  if (cur && cur.ymd === ymd && Date.now() - cur.fetchedAt < 15 * 60 * 1000) return;
+  const t = state.transport;
+  if (!t || !t.base || !t.token) return;
+  state.dayEvents = { ymd, status: "loading", events: cur?.ymd === ymd ? cur.events : [], fetchedAt: cur?.fetchedAt ?? 0, loading: true };
+  try {
+    const res = await fetch(`${t.base}/api/sync/calendar?from=${ymd}&days=1`, { headers: { Authorization: `Bearer ${t.token}` } });
+    if (res.status === 501) state.dayEvents = { ymd, status: "unconfigured", events: [], fetchedAt: Date.now() };
+    else if (!res.ok) throw new Error(`calendar -> ${res.status}`);
+    else { const data = await res.json(); state.dayEvents = { ymd, status: "ok", events: data.events ?? [], fetchedAt: Date.now() }; }
+  } catch { state.dayEvents = { ymd, status: "error", events: [], fetchedAt: Date.now() }; }
+  if (state.tab === "daily" && state.dailyDate === ymd) render();
+}
+function dayContextPanel(ymd) {
+  loadDayEvents(ymd);
+  if (!state.weather && !state.weatherTried) fetchWeather();
+  const de = state.dayEvents;
+  const evs = de && de.ymd === ymd && de.status === "ok" ? de.events : [];
+  let wx = "";
+  const daily = state.weather?.daily;
+  if (daily?.time) {
+    const i = daily.time.indexOf(ymd);
+    if (i >= 0) { const w = weatherIcon(daily.weathercode?.[i] ?? -1); wx = `<p class="cal-ev"><span class="fam-time">${w.icon} ${Math.round(daily.temperature_2m_max[i])}° / ${Math.round(daily.temperature_2m_min[i])}°</span> ${esc(w.condition)}${daily.precipitation_sum?.[i] ? ` · ${daily.precipitation_sum[i]} mm precip` : ""}</p>`; }
+  }
+  if (!evs.length && !wx) return "";
+  return `<div class="panel day-context"><h3>On this day</h3>${wx}${evs.map((e) => `<p class="cal-ev">${e.allDay ? `<span class="fam-time">All day</span>` : `<span class="fam-time">${esc(famTimeLabel(e))}</span>`} ${esc(e.title)}${e.location ? ` <span class="muted">@ ${esc(e.location)}</span>` : ""}</p>`).join("")}</div>`;
+}
+
+function pinnedPanel() {
+  const pins = getPins();
+  if (!pins.length) return "";
+  const rows = [];
+  for (const ref of pins) {
+    const v = parsePageRef(ref);
+    const table = v.type === "custom" ? "custom_objects" : v.type;
+    const row = state.store.getRow(table, v.id);
+    if (!row || row.archived) continue;
+    rows.push(`<div class="row" data-pin-open="${ref}"><span class="pin-type">${esc(tabLabel(table))}</span><span class="row-title">${esc(row.title)}</span></div>`);
+  }
+  return rows.length ? `<div class="panel"><h3>Pinned</h3>${rows.join("")}</div>` : "";
+}
+
+// Focus mode (ac): a local setting, like the collapsed sidebar.
+function focusOn() { try { return !!JSON.parse(localStorage.getItem("pkm-local-settings") || "{}").focusMode; } catch { return false; } }
+function setFocusMode(on) { try { const s = JSON.parse(localStorage.getItem("pkm-local-settings") || "{}"); s.focusMode = on; localStorage.setItem("pkm-local-settings", JSON.stringify(s)); } catch {} }
+
+// Reading queue (ad): oldest not-yet-read items, top of the pile.
+function readingQueuePanel() {
+  const doneWords = ["read", "finished", "done"];
+  const queue = allRows("reading_items").filter((r) => !r.archived && !doneWords.includes((r.status ?? "").trim().toLowerCase())).sort((a, b) => (a.added ?? a.created_at ?? "").localeCompare(b.added ?? b.created_at ?? "")).slice(0, 3);
+  if (!queue.length) return "";
+  return `<div class="panel"><h3>Reading queue</h3>${queue.map((r) => `<div class="row" data-open="reading_items:${r.id}"><span class="row-title">${esc(r.title)}</span><button data-reading-done="${r.id}" class="ghost-btn">Read</button></div>`).join("")}</div>`;
+}
+
+// Duplicate (ab): copies body, subtasks (reset), links, attachments.
+function duplicateTask(id) {
+  const t = state.store.getRow("tasks", id);
+  if (!t) return;
+  const copy = state.store.createTask({ title: `${t.title} copy`, due: t.due_date ?? null, priority: t.priority ?? null, project: t.project ?? null, body: t.body_markdown ?? "" });
+  if (t.place) state.store.updateProps("tasks", copy.id, { place: t.place });
+  try { const subs = JSON.parse(t.subtasks ?? "[]"); if (subs.length) state.store.setSubtasks("tasks", copy.id, subs.map((s) => ({ ...s, done: 0 }))); } catch {}
+  for (const l of forwardLinks("tasks", id)) { try { state.store.addLink("tasks", copy.id, l.type, l.id); } catch {} }
+  closePopup(); state.itemView = null; render(); saveBytes(); openTaskPopup(copy.id);
+}
+function duplicateNote(id) {
+  const n = state.store.getRow("notes", id);
+  if (!n) return;
+  const copy = state.store.createNote({ title: `${n.title} copy`, body: n.body_markdown ?? "", type: n.type ?? "General Notes" });
+  if (copy && n.type && copy.type !== n.type) state.store.updateProps("notes", copy.id, { type: n.type });
+  if (copy) state.store.copyAttachments("notes", id, "notes", copy.id);
+  for (const l of forwardLinks("notes", id)) { try { state.store.addLink("notes", copy.id, l.type, l.id); } catch {} }
+  closePopup(); state.itemView = null; render(); saveBytes(); openNotePopup(copy.id);
+}
+
+// Bulk select (ae): the Tasks view's action bar while selecting.
+function bulkBarHtml() {
+  const n = state.bulkSelected ? state.bulkSelected.size : 0;
+  return `<div class="bulk-bar"><b>${n} selected</b><button data-bulk-action="complete" class="primary-btn">Complete</button><button data-bulk-action="postpone" class="ghost-btn">Postpone +1d</button><button data-bulk-action="archive" class="danger-btn">Archive</button><button data-bulk-action="clear" class="ghost-btn">Clear</button></div>`;
+}
+
+function taskRow(t, opts = {}) {
   const today = todayToronto();
   const overdue = !!t.due_date && t.due_date < today;
   let rec = false;
@@ -698,14 +1423,57 @@ function taskRow(t) {
     const { rule } = parseRecurrence(t.recurrence ?? "");
     rec = !!rule;
   } catch { /* ignore */ }
+  // Subtask indicators (stamp 2026-11-04o): one small icon per kind
+  // present — checklist (done/total), linked (count) — rendered beside
+  // the recurring indicator in the row's right-hand cluster.
+  let subs = [];
+  try { subs = JSON.parse(t.subtasks ?? "[]"); } catch { subs = []; }
+  const subDone = subs.filter((s) => s.done).length;
+  const linkedCount = linkedTitles("tasks", t.id, "sub_tasks", "tasks").length;
+  const subInd = `${subs.length ? `<span class="sub-ind" title="Checklist subtasks: ${subDone} of ${subs.length} done">${SUB_CHECKLIST_ICON}${subDone}/${subs.length}</span>` : ""}${linkedCount ? `<span class="sub-ind" title="${linkedCount} linked subtask${linkedCount === 1 ? "" : "s"}">${SUB_LINK_ICON}${linkedCount}</span>` : ""}`;
   return `<div class="row" data-task="${t.id}">
-    <input type="checkbox" data-tick="${t.id}" ${t.done ? "checked" : ""}>
+    ${opts.bulk ? `<input type="checkbox" data-bulk-select="${t.id}" ${state.bulkSelected && state.bulkSelected.has(t.id) ? "checked" : ""}>` : `<input type="checkbox" data-tick="${t.id}" ${t.done ? "checked" : ""}>`}
     <span class="row-title">${esc(t.title)}</span>
-    ${rec ? `<span class="recur" title="Recurring task">↻</span>` : ""}
-    ${t.project ? `<span class="project-pill">${esc(t.project)}</span>` : ""}
+    ${subInd}${rec ? `<span class="recur" title="Recurring task">↻</span>` : ""}
     ${t.priority ? `<span class="prio">${esc(t.priority)}</span>` : ""}
+    ${t.project ? `<span class="project-pill">${esc(t.project)}</span>` : ""}
+    ${opts.carry ? `<button data-carry-today="${t.id}" class="ghost-btn">→ Today</button>` : ""}
+    ${opts.snooze ? `<button data-snooze-days="1" data-snooze-task="${t.id}" class="ghost-btn">→ Tmrw</button><button data-snooze-days="7" data-snooze-task="${t.id}" class="ghost-btn">→ +1wk</button>` : ""}
     <span class="due${overdue ? " overdue" : ""}">${t.due_date ? t.due_date : "No due date"}</span>
   </div>`;
+}
+
+
+// --- Group ordering (stamp 2026-11-04m) ---
+// Grouped pages (Tasks by project, Notes by type, People by role,
+// Reading by status, Projects by category) take their section order
+// from Management > Group order, stored per grouping in ui_prefs
+// (synced). Synthetic buckets keep their pins: the first/last lists
+// win over the saved order; unsaved values fall back to the field's
+// vocab order, then alphabetical.
+function orderedGroupKeys(keys, prefKey, { first = [], last = [], fallback = [] } = {}) {
+  const pref = state.store ? state.store.getGroupOrder(prefKey) : [];
+  const rest = keys.filter((k) => !first.includes(k) && !last.includes(k));
+  const inPref = pref.filter((v) => rest.includes(v));
+  const remaining = rest.filter((v) => !inPref.includes(v)).sort((a, b) => {
+    const ai = fallback.indexOf(a), bi = fallback.indexOf(b);
+    if (ai !== -1 || bi !== -1) return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi);
+    return a.localeCompare(b);
+  });
+  return [...first.filter((k) => keys.includes(k)), ...inPref, ...remaining, ...last.filter((k) => keys.includes(k))];
+}
+const GROUPINGS = [
+  { key: "tasks.project", label: "Tasks — by project", table: "tasks", field: "project" },
+  { key: "notes.type", label: "Notes — by type", table: "notes", field: "type", exclude: ["Daily Notes"] },
+  { key: "people.role", label: "People — by role", table: "people", field: "role" },
+  { key: "projects.category", label: "Projects — by category", table: "projects", field: "category" },
+  { key: "reading_items.status", label: "Reading — by status", table: "reading_items", field: "status" },
+];
+function groupOrderCandidates(g) {
+  const vals = new Set(vocabValues(g.table, g.field));
+  for (const r of allRows(g.table)) { const v = r[g.field]; if (v) vals.add(v); }
+  for (const x of g.exclude ?? []) vals.delete(x);
+  return orderedGroupKeys([...vals], g.key, { fallback: vocabValues(g.table, g.field) });
 }
 
 function renderTasks() {
@@ -719,16 +1487,15 @@ function renderTasks() {
       groups.get(key).push(t);
     }
     for (const l of groups.values()) l.sort((a, b) => prioRank(a.priority) - prioRank(b.priority) || (a.due_date || "9999-12-31").localeCompare(b.due_date || "9999-12-31") || a.title.localeCompare(b.title));
-    return [...groups.entries()].sort(([a], [b]) => (a === "No project" ? 1 : b === "No project" ? -1 : a.localeCompare(b)));
+    return orderedGroupKeys([...groups.keys()], "tasks.project", { last: ["No project"] }).map((k) => [k, groups.get(k)]);
   };
-  const head = `<div style="display:flex;justify-content:flex-end;align-items:center"><button data-new-task class="primary-btn">New task</button></div>`;
-  const toggle = `<div class="form"><button data-tasks-filter="open" class="toggle-btn ${filter === "open" ? "active" : ""}">Open</button><button data-tasks-filter="done" class="toggle-btn ${filter === "done" ? "active" : ""}">Done</button></div>`;
+  const head = `<div class="tasks-head"><div class="toggle-group"><button data-tasks-filter="open" class="toggle-btn ${filter === "open" ? "active" : ""}">Open</button><button data-tasks-filter="done" class="toggle-btn ${filter === "done" ? "active" : ""}">Done</button></div><button data-bulk-toggle class="ghost-btn">${state.bulkMode ? "Done selecting" : "Select"}</button><button data-new-task class="primary-btn">New task</button></div>`;
   if (filter === "done") {
     const done = doneTasks();
-    return `${head}${toggle}${done.map(taskRow).join("") || "<p class='muted'>Nothing done yet.</p>"}`;
+    return `${head}${done.map(taskRow).join("") || "<p class='muted'>Nothing done yet.</p>"}`;
   }
   const groupOrder = groupList(openTasks());
-  return `${head}${toggle}${groupOrder.map(([g, list]) => `<details class="group" open><summary>${esc(g)} (${list.length})</summary>${list.map(taskRow).join("")}</details>`).join("") || "<p class='muted'>No open tasks.</p>"}`;
+  return `${head}${state.bulkMode ? bulkBarHtml() : ""}${groupOrder.map(([g, list]) => `<details class="group" open><summary>${esc(g)} (${list.length})</summary>${list.map((t) => taskRow(t, { bulk: !!state.bulkMode })).join("")}</details>`).join("") || "<p class='muted'>No open tasks.</p>"}`;
 }
 
 function openTaskCreatePopup() {
@@ -737,6 +1504,7 @@ function openTaskCreatePopup() {
   openPopup("New task", `
     <form data-create-task-popup class="form popup-form">
       <div class="cf-field"><label class="cf-label">Name</label><input name="title" required></div>
+      <div class="cf-field"><label class="cf-label">Template</label><select data-template-pick><option value="">— Start blank —</option>${templateOptionsHtml("task")}</select></div>
       <div class="cf-row"><div class="cf-field"><label class="cf-label">Due date</label><input type="date" name="due"></div>
       <div class="cf-field"><label class="cf-label">Priority</label><select name="priority"><option value="">— No priority —</option>${vocabValues("tasks", "priority").map((p) => `<option>${p}</option>`).join("")}</select></div></div>
       <div class="cf-field"><label class="cf-label">Project</label>
@@ -760,7 +1528,7 @@ function openTaskCreatePopup() {
         </div>
         <div data-weekdays hidden>Weekdays: ${["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((d, i) => `<label><input type="checkbox" name="wd" value="${i}" ${i >= 1 && i <= 5 ? "checked" : ""}>${d}</label>`).join(" ")}</div>
       </div>
-      <div class="cf-field"><label class="cf-label">Details</label><textarea name="body" rows="3" placeholder="Details (optional)"></textarea></div>
+      <div class="cf-field"><label class="cf-label">Details</label>${mdEditorHtml("", 3, "Details (optional)")}</div>
       <button class="accent-btn">Create task</button>
     </form>`);
 }
@@ -772,7 +1540,7 @@ function renderNotes() {
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(n);
   }
-  const ordered = [...groups.entries()].sort(([a], [b]) => (a === "Daily notes" ? -1 : b === "Daily notes" ? 1 : a === "No type" ? 1 : b === "No type" ? -1 : a.localeCompare(b)));
+  const ordered = orderedGroupKeys([...groups.keys()], "notes.type", { first: ["Daily notes"], last: ["No type"] }).map((k) => [k, groups.get(k)]);
   const noteRow = (n) => `<div class="row" data-note="${n.id}"><span class="row-title">${esc(n.title)}</span><span class="muted">${esc(n.type ?? "")} ${n.date ?? ""}</span></div>`;
   return `<div style="display:flex;justify-content:flex-end;align-items:center"><button data-new-note class="primary-btn">New note</button></div>
   ${ordered.map(([g, list]) => `<details class="group" ${g === "Daily notes" ? "" : "open"}><summary>${esc(g)} (${list.length})</summary>${list.map(noteRow).join("")}</details>`).join("") || "<p class='muted'>No notes.</p>"}`;
@@ -783,6 +1551,7 @@ function openNoteCreatePopup() {
   openPopup("New note", `
     <form data-create-note-popup class="form popup-form">
       <div class="cf-field"><label class="cf-label">Name</label><input name="title" required></div>
+      <div class="cf-field"><label class="cf-label">Template</label><select data-template-pick><option value="">— Start blank —</option>${templateOptionsHtml("note")}</select></div>
       <div class="cf-field"><label class="cf-label">Type</label>
         <select name="type">${vocabValues("notes", "type").map((t) => `<option ${t === "General Notes" ? "selected" : ""}>${t}</option>`).join("")}<option value="__new__">New type…</option></select>
         <input name="typeNew" placeholder="New type name" hidden style="margin-top:8px"></div>
@@ -797,7 +1566,7 @@ function openNoteCreatePopup() {
           </div>
         </div></div>
       <div class="cf-field"><label class="cf-label">Date</label><input type="date" name="date"></div>
-      <div class="cf-field"><label class="cf-label">Body</label><textarea name="body" rows="4" placeholder="Body (optional)"></textarea></div>
+      <div class="cf-field"><label class="cf-label">Body</label>${mdEditorHtml("", 4, "Body (optional)")}</div>
       <button class="primary-btn">Create note</button>
     </form>`);
 }
@@ -829,13 +1598,186 @@ function openProjectCreatePopup() {
         <input name="categoryNew" placeholder="New category name" hidden style="margin-top:8px"></div>
       <div class="cf-field"><label class="cf-label">Status</label>
         <select name="status"><option value="">— No status —</option>${vocabValues("projects", "status").map((st) => `<option>${st}</option>`).join("")}</select></div>
-      <div class="cf-field"><label class="cf-label">Description</label><textarea name="body" rows="4" placeholder="Description (optional)"></textarea></div>
+      <div class="cf-field"><label class="cf-label">Description</label>${mdEditorHtml("", 4, "Description (optional)")}</div>
       <button class="primary-btn">Create project</button>
     </form>`);
 }
+// --- Smart capture routing (stamp 2026-11-04ao) ---
+// A bare URL files straight to Reading (title auto-fetched); a
+// "task:" prefix makes a task (quick-add parsing applies); anything
+// else stays an inbox capture. Returns what it did.
+function routeCapture(text) {
+  const t = (text || "").trim();
+  if (!t) return "inbox";
+  if (/^https?:\/\/\S+$/i.test(t)) {
+    const item = state.store.createReading({ title: t, url: t });
+    showToast("<span>Filed to Reading</span>");
+    fetchLinkTitle(t).then((title) => {
+      if (!title) return;
+      const cur = state.store.getRow("reading_items", item.id);
+      if (cur && cur.title === t) { state.store.updateProps("reading_items", item.id, { title }); render(); saveBytes(); }
+    });
+    return "reading";
+  }
+  const m = t.match(/^task:\s*(.+)$/is);
+  if (m) {
+    const p = parseQuickTask(m[1]);
+    state.store.createTask({ title: p.title, due: p.due ?? todayToronto(), priority: p.priority, project: "General" });
+    showToast("<span>Task created</span>");
+    return "task";
+  }
+  return "inbox";
+}
+
+// --- Weekly review (stamp 2026-11-04ao) ---
+function weekRange(offset) {
+  const today = todayToronto();
+  const dow = new Date(today + "T12:00:00").getDay();
+  const monday = ymdAdd(today, -((dow + 6) % 7) + offset * 7);
+  return { start: monday, end: ymdAdd(monday, 6) };
+}
+async function loadReviewCal(start) {
+  const cur = state.reviewCal;
+  if (cur?.loading) return;
+  if (cur && cur.key === start && Date.now() - cur.fetchedAt < 15 * 60 * 1000) return;
+  const t = state.transport;
+  if (!t || !t.base || !t.token) return;
+  state.reviewCal = { key: start, status: "loading", events: cur?.key === start ? cur.events : [], fetchedAt: cur?.fetchedAt ?? 0, loading: true };
+  try {
+    const res = await fetch(`${t.base}/api/sync/calendar?from=${start}&days=7`, { headers: { Authorization: `Bearer ${t.token}` } });
+    if (res.status === 501) state.reviewCal = { key: start, status: "unconfigured", events: [], fetchedAt: Date.now() };
+    else if (!res.ok) throw new Error(`calendar -> ${res.status}`);
+    else { const data = await res.json(); state.reviewCal = { key: start, status: "ok", events: data.events ?? [], fetchedAt: Date.now() }; }
+  } catch { state.reviewCal = { key: start, status: "error", events: [], fetchedAt: Date.now() }; }
+  if (state.tab === "review") render();
+}
+function renderReview() {
+  const tw = weekRange(0);
+  const nw = weekRange(1);
+  const today = todayToronto();
+  const inW = (iso, w) => { if (!iso) return false; const d = torontoYmdOf(iso); return d >= w.start && d <= w.end; };
+  const doneThis = allRows("tasks").filter((t) => !t.archived && t.done && inW(t.updated_at, tw));
+  const newTasks = allRows("tasks").filter((t) => !t.archived && inW(t.created_at, tw));
+  const newNotes = allRows("notes").filter((t) => !t.archived && inW(t.created_at, tw));
+  const dueNext = allRows("tasks").filter((t) => !t.archived && !t.done && t.due_date && t.due_date >= nw.start && t.due_date <= nw.end).sort((a, b) => a.due_date.localeCompare(b.due_date));
+  const overdue = allRows("tasks").filter((t) => !t.archived && !t.done && t.due_date && t.due_date < today).sort((a, b) => a.due_date.localeCompare(b.due_date));
+  loadReviewCal(nw.start);
+  const rev = state.reviewCal;
+  const revEvents = rev && rev.key === nw.start && rev.status === "ok" ? rev.events : [];
+  const famDays = [];
+  for (let i = 0; i < 7; i++) {
+    const d = ymdAdd(nw.start, i);
+    const evs = revEvents.filter((e) => famEventDays(e).includes(d));
+    if (evs.length) famDays.push(`<h4>${esc(new Date(d + "T12:00:00").toLocaleDateString("en-CA", { weekday: "long", month: "short", day: "numeric" }))}</h4>` + evs.map((e) => `<p class="cal-ev">${e.allDay ? `<span class="fam-time">All day</span>` : `<span class="fam-time">${esc(famTimeLabel(e))}</span>`} ${esc(e.title)}</p>`).join(""));
+  }
+  return `<div class="panel"><h3>Review</h3><p class="muted">This week ${esc(tw.start)} to ${esc(tw.end)} · next week ${esc(nw.start)} to ${esc(nw.end)}</p></div>
+  <div class="panel"><h3>Completed this week (${doneThis.length})</h3>${doneThis.length ? doneThis.map((t) => taskRow(t)).join("") : "<p class='muted'>Nothing completed yet this week.</p>"}</div>
+  <div class="panel"><h3>Overdue (${overdue.length})</h3>${overdue.length ? overdue.slice(0, 10).map((t) => taskRow(t, { carry: true, snooze: true })).join("") : "<p class='muted'>Nothing overdue.</p>"}</div>
+  <div class="panel"><h3>Due next week (${dueNext.length})</h3>${dueNext.length ? dueNext.map((t) => taskRow(t)).join("") : "<p class='muted'>Nothing due next week.</p>"}</div>
+  <div class="panel"><h3>Family next week</h3>${rev?.status === "unconfigured" ? "<p class='muted'>Family calendar isn't connected.</p>" : famDays.length ? famDays.join("") : "<p class='muted'>Nothing on the family calendar next week.</p>"}</div>
+  <div class="panel"><h3>Created this week</h3><p class="muted">${newTasks.length} task(s) · ${newNotes.length} note(s)</p>${newNotes.slice(0, 8).map((n) => `<div class="row" data-open="notes:${n.id}"><span class="row-title">${esc(n.title)}</span></div>`).join("")}</div>`;
+}
+
+// --- Markdown export + download (stamp 2026-11-04ao) ---
+function slugify(s) { return (s || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60) || "untitled"; }
+function mdLinks(type, id) {
+  try {
+    const rows = state.db.prepare(`SELECT from_type, from_id, to_type, to_id FROM relations WHERE (from_type=? AND from_id=?) OR (to_type=? AND to_id=?)`).all(type, id, type, id);
+    const out = [];
+    for (const r of rows) {
+      const mine = r.from_type === type && r.from_id === id;
+      const oType = mine ? r.to_type : r.from_type;
+      const oId = mine ? r.to_id : r.from_id;
+      const row = state.store.getRow(oType, oId);
+      if (row && !row.archived) out.push(`- ${row.title} (${oType})`);
+    }
+    return out;
+  } catch { return []; }
+}
+function objectToMarkdown(type, row) {
+  const lines = [`# ${row.title || "Untitled"}`, ""];
+  const meta = [];
+  if (type === "tasks") { meta.push(`Status: ${row.done ? "Done" : "Open"}`); if (row.due_date) meta.push(`Due: ${row.due_date}`); if (row.priority) meta.push(`Priority: ${row.priority}`); if (row.project) meta.push(`Project: ${row.project}`); if (row.place) meta.push(`Place: ${row.place}`); }
+  if (type === "notes") { if (row.type) meta.push(`Type: ${row.type}`); if (row.date) meta.push(`Date: ${row.date}`); }
+  if (type === "people" && row.role) meta.push(`Role: ${row.role}`);
+  if (type === "projects") { if (row.category) meta.push(`Category: ${row.category}`); if (row.status) meta.push(`Status: ${row.status}`); }
+  if (type === "reading_items") { if (row.status) meta.push(`Status: ${row.status}`); if (row.url) meta.push(`URL: ${row.url}`); if (row.source) meta.push(`Source: ${row.source}`); }
+  try { const tags = state.db.prepare(`SELECT tag FROM object_tags WHERE object_type=? AND object_id=? ORDER BY tag`).all(type, row.id).map((r) => r.tag); if (tags.length) meta.push(`Tags: ${tags.join(", ")}`); } catch {}
+  if (meta.length) lines.push(...meta.map((m) => `- ${m}`), "");
+  if (row.body_markdown) lines.push(row.body_markdown, "");
+  if ((type === "tasks" || type === "projects") && row.subtasks) {
+    try { const subs = JSON.parse(row.subtasks); if (Array.isArray(subs) && subs.length) lines.push("## Subtasks", "", ...subs.map((s) => `- [${s.done ? "x" : " "}] ${s.title}`), ""); } catch {}
+  }
+  const links = mdLinks(type, row.id);
+  if (links.length) lines.push("## Links", "", ...links, "");
+  const atts = state.store.attachmentsFor(type, row.id);
+  if (atts.length) lines.push("## Attachments", "", ...atts.map((a) => `- ${a.name || a.mime}`), "");
+  lines.push(`_Exported from DashBen · ${todayToronto()}_`);
+  return lines.join("\n");
+}
+function crc32(bytes) {
+  let table = crc32.table;
+  if (!table) { table = []; for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; table[n] = c >>> 0; } crc32.table = table; }
+  let crc = 0xFFFFFFFF;
+  for (let i = 0; i < bytes.length; i++) crc = table[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 8);
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+function zipStore(files) {
+  const enc = new TextEncoder();
+  const u16 = (v) => new Uint8Array([v & 255, (v >> 8) & 255]);
+  const u32 = (v) => new Uint8Array([v & 255, (v >> 8) & 255, (v >> 16) & 255, (v >> 24) & 255]);
+  const cat = (...arrs) => { const total = arrs.reduce((s, a) => s + a.length, 0); const out = new Uint8Array(total); let o = 0; for (const a of arrs) { out.set(a, o); o += a.length; } return out; };
+  const chunks = []; const central = []; let offset = 0;
+  for (const f of files) {
+    const name = enc.encode(f.name);
+    const data = typeof f.data === "string" ? enc.encode(f.data) : f.data;
+    const crc = crc32(data);
+    const local = cat(u32(0x04034b50), u16(20), u16(0x0800), u16(0), u16(0), u16(0x21), u32(crc), u32(data.length), u32(data.length), u16(name.length), u16(0), name);
+    chunks.push(local, data);
+    central.push(cat(u32(0x02014b50), u16(20), u16(20), u16(0x0800), u16(0), u16(0), u16(0x21), u32(crc), u32(data.length), u32(data.length), u16(name.length), u16(0), u16(0), u16(0), u16(0), u32(0), u32(offset), name));
+    offset += local.length + data.length;
+  }
+  const cdSize = central.reduce((s, a) => s + a.length, 0);
+  const end = cat(u32(0x06054b50), u16(0), u16(0), u16(files.length), u16(files.length), u32(cdSize), u32(offset), u16(0));
+  return cat(...chunks, ...central, end);
+}
+function downloadBytes(name, bytes, mime = "application/octet-stream") {
+  if (typeof window !== "undefined" && window.__dashbenExportDb) { window.__dashbenExportDb(name, bytes); return; }
+  const blob = new Blob([bytes], { type: mime });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+function exportMarkdown() {
+  const folders = { tasks: "tasks", notes: "notes", people: "people", projects: "projects", reading_items: "reading", inbox_items: "inbox" };
+  const files = []; const used = new Set(); let count = 0;
+  for (const [table, folder] of Object.entries(folders)) {
+    for (const row of allRows(table)) {
+      if (row.archived) continue;
+      const base = `${folder}/${slugify(row.title)}`;
+      let path = `${base}.md`; let n = 2;
+      while (used.has(path)) path = `${base}-${n++}.md`;
+      used.add(path);
+      files.push({ name: path, data: objectToMarkdown(table, row) });
+      count++;
+    }
+  }
+  files.unshift({ name: "index.md", data: `# DashBen Markdown export\n\n${count} items · exported ${todayToronto()}.\n` });
+  downloadBytes(`dashben-markdown-${todayToronto()}.zip`, zipStore(files), "application/zip");
+  showToast(`<span>Markdown export saved (${count} items)</span>`);
+}
+
 function renderInbox() {
-  return `<form data-capture class="form"><input name="title" placeholder="Title (optional)"><textarea name="body" rows="3" placeholder="Capture…" required></textarea><button>Capture</button></form>
-  ${inboxItems().map((i) => `<div class="row" data-inbox="${i.id}"><span class="row-title">${esc(i.title)}</span><span class="muted">${esc((i.body_markdown ?? "").slice(0, 80))}</span><button data-archive-inbox="${i.id}">Archive</button></div>`).join("") || "<p class='muted'>Inbox empty.</p>"}`;
+  const items = inboxItems();
+  const photoCounts = attachmentCounts("inbox_items");
+  const bulk = !!state.inboxBulk;
+  const sel = state.inboxSel ?? new Set();
+  return `<div class="panel"><h3>Capture</h3><form data-capture class="form"><input name="title" placeholder="Title (optional)"><textarea name="body" rows="3" placeholder="Capture… a pasted link files to Reading; start with task: to make a task"></textarea><input type="file" name="photo" accept="image/*,.pdf,.txt,.md,.csv,.doc,.docx,.rtf" multiple><button class="primary-btn">Capture</button></form></div>
+  ${bulk ? `<div class="panel bulk-bar"><strong>${sel.size} selected</strong> <button data-inbox-bulk-move class="primary-btn">Move to notes</button> <button data-inbox-bulk-archive class="danger-btn">Archive</button> <button data-inbox-bulk-clear class="ghost-btn">Clear</button></div>` : ""}
+  <div class="panel"><h3>Inbox (${items.length})</h3><p><button data-inbox-bulk-toggle class="ghost-btn">${bulk ? "Done selecting" : "Select"}</button></p>
+  ${items.map((i) => `<div class="row" data-inbox="${i.id}">${bulk ? `<input type="checkbox" data-inbox-sel="${i.id}"${sel.has(i.id) ? " checked" : ""}> ` : ""}<span class="row-title">${esc(i.title)}${photoInd(photoCounts, i.id)}</span><span class="muted">${esc((i.body_markdown ?? "").slice(0, 80))}</span><button data-archive-inbox="${i.id}">Archive</button></div>`).join("") || "<p class='muted'>Inbox empty.</p>"}</div>`;
 }
 
 function renderPeople() {
@@ -845,7 +1787,7 @@ function renderPeople() {
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(r);
   }
-  const ordered = [...groups.entries()].sort(([a], [b]) => (a === "No role" ? 1 : b === "No role" ? -1 : a.localeCompare(b)));
+  const ordered = orderedGroupKeys([...groups.keys()], "people.role", { last: ["No role"] }).map((k) => [k, groups.get(k)]);
   return `<div style="display:flex;justify-content:flex-end;align-items:center"><button data-new-person class="primary-btn">New person</button></div>
   ${ordered.map(([g, list]) => `<details class="group" open><summary>${esc(g)} (${list.length})</summary>${list.map((r) => `<div class="row" data-person="${r.id}"><span class="row-title">${esc(r.title)}</span>${r.role ? `<span class="project-pill">${esc(r.role)}</span>` : ""}</div>`).join("")}</details>`).join("") || "<p class='muted'>Nothing here yet.</p>"}`;
 }
@@ -858,13 +1800,7 @@ function renderReading() {
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(r);
   }
-  const ordered = [...groups.entries()].sort(([a], [b]) => {
-    const ai = statusOrder.indexOf(a), bi = statusOrder.indexOf(b);
-    if (ai === -1 && bi === -1) return a.localeCompare(b);
-    if (ai === -1) return 1;
-    if (bi === -1) return -1;
-    return ai - bi;
-  });
+  const ordered = orderedGroupKeys([...groups.keys()], "reading_items.status", { last: ["No status"], fallback: statusOrder }).map((k) => [k, groups.get(k)]);
   return `<div style="display:flex;justify-content:flex-end;align-items:center"><button data-new-reading class="primary-btn">New reading item</button></div>
   ${ordered.map(([g, list]) => `<details class="group" open><summary>${esc(g)} (${list.length})</summary>${list.map((r) => `<div class="row"><span class="row-title" data-reading="${r.id}">${esc(r.title)}</span>${r.source ? `<span class="muted">${esc(r.source)}</span>` : ""}<select data-reading-status="${r.id}">${vocabValues("reading_items", "status").map((s) => `<option ${s === r.status ? "selected" : ""}>${s}</option>`).join("")}</select></div>`).join("")}</details>`).join("") || "<p class='muted'>Nothing here yet.</p>"}`;
 }
@@ -876,7 +1812,7 @@ function renderProjects() {
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(r);
   }
-  const ordered = [...groups.entries()].sort(([a], [b]) => (a === "No category" ? 1 : b === "No category" ? -1 : a.localeCompare(b)));
+  const ordered = orderedGroupKeys([...groups.keys()], "projects.category", { last: ["No category"] }).map((k) => [k, groups.get(k)]);
   return `<div style="display:flex;justify-content:flex-end;align-items:center"><button data-new-project class="primary-btn">New project</button></div>
   ${ordered.map(([g, list]) => `<details class="group" open><summary>${esc(g)} (${list.length})</summary>${list.map((r) => `<div class="row" data-project="${r.id}"><span class="row-title">${esc(r.title)}</span>${r.status ? `<span class="project-pill">${esc(r.status)}</span>` : ""}${r.category ? `<span class="muted">${esc(r.category)}</span>` : ""}</div>`).join("")}</details>`).join("") || "<p class='muted'>Nothing here yet.</p>"}`;
 }
@@ -901,6 +1837,199 @@ function runSearch(q) {
   }
   $("#search-results").innerHTML = out.join("") || "<p class='muted'>No matches.</p>";
 }
+
+
+
+
+// --- Attachments (stamp 2026-11-04s): photos on inbox items and
+// notes. Images are downscaled to <=1280px JPEG before storage, kept
+// as base64 in the synced attachments table, and follow an inbox item
+// when it is moved to notes.
+const CAMERA_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>`;
+async function fileToAttachment(file) {
+  const type = file?.type || "";
+  if (type.startsWith("image/")) {
+    const url = URL.createObjectURL(file);
+    try {
+      const img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = url; });
+      const scale = Math.min(1, 1280 / Math.max(img.naturalWidth, img.naturalHeight));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(img.naturalWidth * scale));
+      canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
+      canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+      let dataUrl = canvas.toDataURL("image/jpeg", 0.82);
+      if (dataUrl.length > 900000) dataUrl = canvas.toDataURL("image/jpeg", 0.6);
+      return { mime: "image/jpeg", data: dataUrl.split(",")[1], name: file.name || null };
+    } finally { URL.revokeObjectURL(url); }
+  }
+  // Non-image files (stamp 2026-11-04ao): stored as-is under a cap.
+  if (file.size > 512 * 1024) throw new Error("That file is over the 512 KB attachment limit.");
+  const dataUrl = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(file); });
+  return { mime: type || "application/octet-stream", data: String(dataUrl).split(",")[1], name: file.name || null };
+}
+async function dataToAttachment(b64, mime) {
+  const blob = await (await fetch(`data:${mime};base64,${b64}`)).blob();
+  return fileToAttachment(blob);
+}
+function attachmentsHtml(ownerType, ownerId) {
+  const list = state.store.attachmentsFor(ownerType, ownerId);
+  const images = list.filter((a) => (a.mime || "").startsWith("image/"));
+  const files = list.filter((a) => !(a.mime || "").startsWith("image/"));
+  return `<div class="attach-block">${images.length ? `<div class="attach-grid" data-photo-owner="${ownerType}:${ownerId}">${images.map((a) => `<span class="attach-thumb"><img src="data:${a.mime};base64,${a.data}" alt="Attached photo" data-photo-view="${a.id}"><button type="button" data-del-attachment="${a.id}" aria-label="Remove photo">\u00d7</button></span>`).join("")}</div>` : ""}${files.map((a) => `<p class="attach-file-row"><a class="attach-file" href="data:${a.mime};base64,${a.data}" download="${esc(a.name || "attachment")}">${esc(a.name || a.mime)}</a> <button type="button" data-del-attachment="${a.id}" class="ghost-btn" aria-label="Remove file">\u00d7</button></p>`).join("")}
+    <label class="attach-add">${CAMERA_ICON} Add photo or file<input type="file" accept="image/*,.pdf,.txt,.md,.csv,.doc,.docx,.rtf" multiple data-photo-add="${ownerType}:${ownerId}" hidden></label></div>`;
+}
+// Photo lightbox (stamp 2026-11-04aj): tap a thumbnail to view it
+// full-screen; arrows, Esc and backdrop-click navigate/close.
+let lbState = null;
+function lightboxHtml(list, idx) {
+  const a = list[idx];
+  if (!a) return "";
+  return `<div class="lightbox"><button type="button" class="lb-btn lb-close" data-lb-close aria-label="Close">\u00d7</button>${list.length > 1 ? `<button type="button" class="lb-btn lb-prev" data-lb-prev aria-label="Previous photo">\u2039</button><button type="button" class="lb-btn lb-next" data-lb-next aria-label="Next photo">\u203a</button>` : ""}<img src="data:${a.mime};base64,${a.data}" alt="Attached photo"><span class="lb-count">${idx + 1} / ${list.length}</span></div>`;
+}
+function renderLightbox() {
+  let root = $("#lightbox-root");
+  if (!root) {
+    if (typeof document === "undefined" || !document.createElement) return;
+    root = document.createElement("div");
+    root.id = "lightbox-root";
+    document.body.appendChild(root);
+  }
+  root.innerHTML = lbState ? lightboxHtml(lbState.list, lbState.idx) : "";
+}
+function showLightbox(ownerType, ownerId, attId) {
+  const list = state.store.attachmentsFor(ownerType, ownerId);
+  if (!list.length) return;
+  lbState = { list, idx: Math.max(0, list.findIndex((a) => a.id === attId)) };
+  renderLightbox();
+}
+function attachmentCounts(ownerType) {
+  const map = new Map();
+  try { for (const r of state.db.prepare("SELECT owner_id, COUNT(*) AS n FROM attachments WHERE owner_type=? AND archived=0 GROUP BY owner_id").all(ownerType)) map.set(r.owner_id, r.n); } catch {}
+  return map;
+}
+function photoInd(counts, id) {
+  const n = counts.get(id);
+  return n ? `<span class="sub-ind" title="${n} photo${n === 1 ? "" : "s"} attached">${CAMERA_ICON}${n}</span>` : "";
+}
+function refreshOpenPopup() {
+  const ref = document.querySelector("#popup-root [data-open-page]")?.dataset?.openPage;
+  if (!ref) { closePopup(); return; }
+  const v = parsePageRef(ref);
+  if (v.type === "custom") openPopupByRef("custom_objects", v.id);
+  else openPopupByRef(v.type, v.id);
+}
+
+// --- Toasts, archive undo, database export (stamp 2026-11-04j) ---
+let toastTimer = null;
+let toastUndo = null;
+function showToast(html) {
+  const root = document.querySelector("#toast-root");
+  if (!root) return;
+  root.innerHTML = `<div class="toast">${html}</div>`;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { root.innerHTML = ""; toastUndo = null; }, 9000);
+}
+function archiveWithUndo(table, id) {
+  const title = state.store.getRow(table, id)?.title ?? "Item";
+  state.store.archiveObject(table, id);
+  toastUndo = () => {
+    try { state.store.unarchiveObject(table, id); } catch {}
+    state.searchDirty = true;
+    const root = document.querySelector("#toast-root");
+    if (root) root.innerHTML = "";
+    render(); saveBytes();
+  };
+  showToast(`<span>Archived \u201c${esc(title)}\u201d</span><button data-toast-undo class="primary-btn">Undo</button>`);
+}
+async function exportDb() {
+  try {
+    const bytes = state.db.exportBytes();
+    const name = `dashben-backup-${todayToronto()}.db`;
+    if (typeof window !== "undefined" && window.__dashbenExportDb) {
+      await window.__dashbenExportDb(name, bytes);
+      showToast(`<span>Backup saved as ${esc(name)}</span>`);
+      return;
+    }
+    const blob = new Blob([bytes], { type: "application/octet-stream" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = name; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    showToast(`<span>Backup downloaded: ${esc(name)}</span>`);
+  } catch (err) { alert(`Export failed: ${err.message}`); }
+}
+
+// --- Command palette (stamp 2026-11-04i): Ctrl/Cmd-K overlay ---
+// Jump to any tab or item, or run a create/sync action, mouse-free.
+// Items come from the same search_tokens index as the Search tab;
+// picking one opens its full page.
+let paletteState = null;
+function paletteActions(q) {
+  const acts = [];
+  const lq = q.trim().toLowerCase();
+  const match = (label) => !lq || label.toLowerCase().includes(lq);
+  for (const id of allTabIds()) {
+    const label = `Go to ${tabLabel(id)}`;
+    if (match(label)) acts.push({ kind: "tab", label, run: () => { state.itemView = null; state.tab = id; saveTab(); render(); } });
+  }
+  const creates = [
+    ["New task", () => openTaskCreatePopup()],
+    ["New note", () => openNoteCreatePopup()],
+    ["New reading item", () => openReadingCreatePopup()],
+    ["New project", () => openProjectCreatePopup()],
+    ["Capture to inbox", () => { state.itemView = null; state.tab = "inbox"; saveTab(); render(); document.querySelector("[data-capture] textarea")?.focus(); }],
+    ["Sync now", () => doSync()],
+  ];
+  if (!dailyNoteFor(todayToronto())) creates.push(["Create today's daily note", () => { state.store.createNote({ title: todayToronto(), date: todayToronto() }); render(); saveBytes(); }]);
+  for (const [label, run] of creates) if (match(label)) acts.push({ kind: "action", label, run });
+  return acts;
+}
+function paletteItems(q) {
+  const terms = tokenize(q);
+  if (!terms.length || !state.db) return [];
+  let rows = [];
+  try {
+    const parts = terms.map(() => "SELECT object_type, object_id, title FROM search_tokens WHERE token LIKE ?");
+    rows = state.db.prepare(parts.join(" INTERSECT ")).all(...terms.map((t) => `${t}%`));
+  } catch { rows = []; }
+  const TYPE_LABEL = { tasks: "Task", notes: "Note", people: "Person", projects: "Project", reading_items: "Reading", inbox_items: "Inbox", custom_objects: "Item" };
+  const seen = new Set();
+  const out = [];
+  for (const r of rows) {
+    const key = `${r.object_type}:${r.object_id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ kind: "item", label: r.title, typeLabel: TYPE_LABEL[r.object_type] ?? r.object_type, run: () => {
+      if (r.object_type === "custom_objects") { const row = state.store.getRow("custom_objects", r.object_id); if (row) openPageRef(`custom:${row.type}:${row.id}`); }
+      else openPageRef(`${r.object_type}:${r.object_id}`);
+    } });
+    if (out.length >= 10) break;
+  }
+  return out;
+}
+function paletteEntries() { const q = paletteState?.q ?? ""; return [...paletteActions(q), ...paletteItems(q)]; }
+function openPalette() {
+  if (!state.store) return;
+  paletteState = { q: "", active: 0, entries: [] };
+  const root = document.querySelector("#palette-root");
+  if (!root) return;
+  root.innerHTML = `<div class="palette-backdrop" data-palette-backdrop><div class="palette-card"><input id="palette-input" placeholder="Jump to or create…" autocomplete="off"><div class="palette-list" id="palette-list"></div><div class="palette-hint muted">↑↓ navigate · Enter select · Esc close</div></div></div>`;
+  const input = document.querySelector("#palette-input");
+  input.addEventListener("input", () => { paletteState.q = input.value; paletteState.active = 0; updatePaletteList(); });
+  updatePaletteList();
+  input.focus();
+}
+function closePalette() { paletteState = null; const root = document.querySelector("#palette-root"); if (root) root.innerHTML = ""; }
+function updatePaletteList() {
+  const list = document.querySelector("#palette-list");
+  if (!list || !paletteState) return;
+  const entries = paletteEntries();
+  paletteState.entries = entries;
+  if (paletteState.active >= entries.length) paletteState.active = Math.max(0, entries.length - 1);
+  list.innerHTML = entries.map((e, i) => `<div class="palette-item${i === paletteState.active ? " active" : ""}" data-palette-idx="${i}"><span class="badge">${e.kind === "item" ? esc(e.typeLabel) : e.kind === "tab" ? "Go" : "Do"}</span><span class="palette-label">${esc(e.label)}</span></div>`).join("") || `<p class="muted" style="padding:10px 14px">No matches.</p>`;
+  list.querySelector(".palette-item.active")?.scrollIntoView?.({ block: "nearest" });
+}
+function runPaletteEntry(i) { const ent = paletteState?.entries?.[i]; if (!ent) return; closePalette(); ent.run(); }
 
 // --- Event binding ---
 // Main-tab forms are rebound after every render (fresh DOM, so no
@@ -932,7 +2061,15 @@ function bindMainForms() {
   $$("[data-capture]").forEach((f) => f.addEventListener("submit", async (e) => {
     e.preventDefault();
     const d = new FormData(f);
-    state.store.captureInbox({ title: d.get("title") || "", body: d.get("body") });
+    const bodyText = (d.get("body") || "").trim();
+    const photos = d.getAll("photo").filter((p) => p && typeof p === "object" && "size" in p && p.size > 0);
+    if (!bodyText && !photos.length) return;
+    if (!photos.length && !(d.get("title") || "").trim() && routeCapture(bodyText) !== "inbox") { render(); saveBytes(); return; }
+    const item = state.store.captureInbox({ title: d.get("title") || "", body: bodyText || "Photo" });
+    for (const photo of photos) {
+      try { const att = await fileToAttachment(photo); state.store.addAttachment("inbox_items", item.id, att.mime, att.data, att.name ?? null); }
+      catch { alert("An attachment could not be added."); }
+    }
     render(); saveBytes();
   }));
   $$("[data-create-simple]").forEach((f) => f.addEventListener("submit", async (e) => {
@@ -965,10 +2102,164 @@ async function saveBody(table, id, body) {
   state.store.saveBody(table, id, body, row.body_version);
 }
 
-function bindPopupForms() {
-  const root = $("#popup-root");
-  // Subtask Add only appends a row to the checklist in the popup;
-  // the merged Save persists the whole list.
+// Persist the subtask checklist from a popup edit form immediately, so
+// closing the popup without Save never loses a tick, an add, or a delete.
+// The merged Save re-reads the same DOM list, so it stays consistent.
+function persistSubtasks(form) {
+  const table = form.dataset.editTask ? "tasks" : "projects";
+  const id = form.dataset.editTask || form.dataset.editProject;
+  if (!id) return;
+  state.store.setSubtasks(table, id, readSubtasks(form));
+  saveBytes();
+}
+
+// Moving an inbox item to notes asks which category (note type) it gets.
+// The explicit choice wins over the date-title -> Daily Notes rule.
+function openMoveCategoryPrompt(item, from) {
+  const title = item.title || (item.body_markdown ?? "").split("\n")[0].slice(0, 60);
+  const defType = /^\d{4}-\d{2}-\d{2}$/.test(title.trim()) ? "Daily Notes" : "General Notes";
+  const opts = vocabOptions("notes", "type", defType);
+  openPopup("Move to notes", `<p class="muted">“${esc(title)}” will become a note. Pick its category:</p>
+    <form data-move-category class="form">
+      <input type="hidden" name="inboxId" value="${item.id}">
+      <input type="hidden" name="from" value="${from}">
+      <label class="cf-label">Category</label>
+      <select name="category">${opts.map((v) => `<option value="${esc(v)}" ${v === defType ? "selected" : ""}>${esc(v)}</option>`).join("")}</select>
+      <input name="categoryNew" placeholder="Or type a new category…">
+      <p class="popup-actions"><button type="submit" class="primary-btn">Move to notes</button><button type="button" data-close-popup class="ghost-btn">Cancel</button></p>
+    </form>`);
+}
+
+function bindPopupForms(root = $("#popup-root")) {
+  bindMdEditors(root);
+  // Subtask ticks and deletes persist immediately (delegated once: the
+  // popup root element survives popup re-renders, its content does not).
+  if (!root.dataset.subDelegated) {
+    root.dataset.subDelegated = "1";
+    let subDragSuppressUntil = 0;
+    root.addEventListener("click", (e) => {
+      if (Date.now() < subDragSuppressUntil && e.target.closest?.("[data-sub-row]")) return;
+      const del = e.target.closest("[data-sub-del]");
+      if (!del) return;
+      const form = del.closest("form");
+      const row = del.closest("[data-sub-row]");
+      const list = form?.querySelector("[data-sub-list]");
+      row?.remove();
+      if (list && !list.querySelector("[data-sub-row]")) list.innerHTML = "<p class='muted'>No subtasks.</p>";
+      if (form) persistSubtasks(form);
+    });
+    root.addEventListener("change", (e) => {
+      const row = e.target.closest("[data-sub-row]");
+      if (!row || e.target.type !== "checkbox") return;
+      if (Date.now() < subDragSuppressUntil) return;
+      const form = row.closest("form");
+      if (form) persistSubtasks(form);
+    });
+    // Drag to rearrange: reordering the DOM rows is enough — the drop
+    // persists through the same readSubtasks order the save uses.
+    let dragRow = null;
+    root.addEventListener("dragstart", (e) => {
+      const r = e.target.closest?.("[data-sub-row]");
+      if (!r) return;
+      dragRow = r;
+      r.classList.add("dragging");
+      if (e.dataTransfer) { e.dataTransfer.effectAllowed = "move"; try { e.dataTransfer.setData("text/plain", "subtask"); } catch {} }
+    });
+    root.addEventListener("dragover", (e) => {
+      if (!dragRow) return;
+      const r = e.target.closest?.("[data-sub-row]");
+      if (!r || r === dragRow || r.parentElement !== dragRow.parentElement) return;
+      e.preventDefault();
+      const rect = r.getBoundingClientRect();
+      const after = e.clientY - rect.top > rect.height / 2;
+      r.parentElement.insertBefore(dragRow, after ? r.nextSibling : r);
+    });
+    root.addEventListener("dragend", () => {
+      if (!dragRow) return;
+      const form = dragRow.closest("form");
+      dragRow.classList.remove("dragging");
+      dragRow = null;
+      subDragSuppressUntil = Date.now() + 250;
+      if (form) persistSubtasks(form);
+    });
+    root.addEventListener("contextmenu", (e) => {
+      if (e.target.closest?.("[data-sub-row]")) e.preventDefault();
+    });
+    // Touch long-press drag: HTML5 drag events never fire for touch in
+    // the Android WebView, so subtask rows also reorder via pointer
+    // events. Hold still ~350 ms to arm the drag; moving sooner is a
+    // scroll (rows have touch-action: none, so pre-arm vertical moves
+    // scroll the popup manually) or a tap. Release persists via the
+    // same persistSubtasks path, and the trailing click/change is
+    // suppressed so a drag starting on the checkbox doesn't toggle it.
+    let lpDrag = null;
+    let lpTimer = null;
+    const clearLpTimer = () => { if (lpTimer) { clearTimeout(lpTimer); lpTimer = null; } };
+    root.addEventListener("pointerdown", (e) => {
+      if (e.pointerType !== "touch") return;
+      const row = e.target.closest?.("[data-sub-row]");
+      if (!row || e.target.closest?.("[data-sub-del]")) return;
+      clearLpTimer();
+      lpDrag = { row, pointerId: e.pointerId, startX: e.clientX, startY: e.clientY, lastY: e.clientY, active: false, moved: false, scrolling: false, sc: null };
+      lpTimer = setTimeout(() => {
+        if (!lpDrag || lpDrag.pointerId !== e.pointerId || lpDrag.scrolling) return;
+        lpDrag.active = true;
+        row.classList.add("dragging");
+        try { row.setPointerCapture(e.pointerId); } catch {}
+      }, 350);
+    });
+    root.addEventListener("pointermove", (e) => {
+      if (!lpDrag || e.pointerId !== lpDrag.pointerId) return;
+      if (!lpDrag.active) {
+        if (lpDrag.scrolling) {
+          if (lpDrag.sc) lpDrag.sc.scrollTop -= e.clientY - lpDrag.lastY;
+          lpDrag.lastY = e.clientY;
+          return;
+        }
+        const dx = e.clientX - lpDrag.startX, dy = e.clientY - lpDrag.startY;
+        if (Math.hypot(dx, dy) > 10) {
+          clearLpTimer();
+          if (Math.abs(dy) > Math.abs(dx)) {
+            lpDrag.scrolling = true;
+            let sc = lpDrag.row.parentElement;
+            while (sc && !(sc.scrollHeight > sc.clientHeight && /(auto|scroll)/.test(getComputedStyle(sc).overflowY))) sc = sc.parentElement;
+            lpDrag.sc = sc || document.scrollingElement;
+            if (lpDrag.sc) lpDrag.sc.scrollTop -= e.clientY - lpDrag.lastY;
+            lpDrag.lastY = e.clientY;
+          } else {
+            lpDrag = null;
+          }
+        }
+        return;
+      }
+      e.preventDefault();
+      const list = lpDrag.row.parentElement;
+      if (!list) return;
+      const siblings = [...list.querySelectorAll("[data-sub-row]")].filter((r) => r !== lpDrag.row);
+      const before = siblings.find((sib) => { const r = sib.getBoundingClientRect(); return e.clientY < r.top + r.height / 2; });
+      if (before) {
+        if (lpDrag.row.nextSibling !== before) { list.insertBefore(lpDrag.row, before); lpDrag.moved = true; }
+      } else if (list.lastElementChild !== lpDrag.row) {
+        list.appendChild(lpDrag.row);
+        lpDrag.moved = true;
+      }
+    });
+    const finishLp = (e) => {
+      if (!lpDrag || e.pointerId !== lpDrag.pointerId) return;
+      clearLpTimer();
+      const wasActive = lpDrag.active, wasMoved = lpDrag.moved, wasScrolling = lpDrag.scrolling;
+      const row = lpDrag.row;
+      lpDrag = null;
+      if (wasScrolling) { subDragSuppressUntil = Date.now() + 150; return; }
+      if (!wasActive) return;
+      row.classList.remove("dragging");
+      subDragSuppressUntil = Date.now() + 300;
+      if (wasMoved) { const form = row.closest("form"); if (form) persistSubtasks(form); }
+    };
+    root.addEventListener("pointerup", finishLp);
+    root.addEventListener("pointercancel", finishLp);
+  }
+  // Subtask Add appends a row and persists it right away.
   $$("[data-add-sub-btn]", root).forEach((btn) => btn.addEventListener("click", () => {
     const form = btn.closest("form");
     const input = form.querySelector("[data-sub-new]");
@@ -976,9 +2267,10 @@ function bindPopupForms() {
     const text = input.value.trim();
     if (!text || !list) return;
     list.querySelector("p.muted")?.remove();
-    list.insertAdjacentHTML("beforeend", `<div class="row" data-sub-row="s-${Date.now()}"><input type="checkbox"><span data-sub-text>${esc(text)}</span></div>`);
+    list.insertAdjacentHTML("beforeend", `<div class="row" data-sub-row="s-${Date.now()}" draggable="true"><span class="sub-grip" aria-hidden="true">⠿</span><input type="checkbox"><span data-sub-text>${esc(text)}</span><button type="button" data-sub-del aria-label="Delete subtask">×</button></div>`);
     input.value = "";
     input.focus();
+    persistSubtasks(form);
   }));
   // Enter in the subtask box adds it (same as clicking Add) instead of
   // submitting the whole edit form.
@@ -986,6 +2278,33 @@ function bindPopupForms() {
     if (e.key !== "Enter") return;
     e.preventDefault();
     input.closest(".inline-add")?.querySelector("[data-add-sub-btn]")?.click();
+  }));
+  $$("[data-fab-capture]", root).forEach((f) => f.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const d = new FormData(f);
+    state.store.captureInbox({ title: d.get("title") || "", body: d.get("body") });
+    closePopup(); render(); saveBytes();
+  }));
+  $$("[data-move-category]", root).forEach((f) => f.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const d = new FormData(f);
+    const id = d.get("inboxId");
+    const from = d.get("from");
+    const item = state.store.getRow("inbox_items", id);
+    if (!item) { closePopup(); return; }
+    const type = (d.get("categoryNew")?.trim()) || d.get("category") || "General Notes";
+    try {
+      state.engine.txn(() => {
+        const note = state.store.createNote({ title: item.title || (item.body_markdown ?? "").split("\n")[0].slice(0, 60), body: item.body_markdown ?? "", type });
+        if (note && note.type !== type) state.store.updateProps("notes", note.id, { type });
+        if (note) state.store.reassignAttachments("inbox_items", id, "notes", note.id);
+        state.store.archiveObject("inbox_items", id);
+      });
+      if (type && !vocabValues("notes", "type").includes(type)) state.store.addFieldValue("notes", "type", type);
+    } catch (err) { alert(err.message); return; }
+    closePopup();
+    if (from === "page") state.itemView = null;
+    render(); saveBytes();
   }));
   $$("[data-edit-task]", root).forEach((f) => f.addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -1101,6 +2420,7 @@ function bindPopupForms() {
       if (btn) btn.closest(".row")?.remove();
     });
   });
+  $$("[data-edit-reading]", root).forEach((f) => bindLinkTitle(f));
   $$("[data-edit-reading]", root).forEach((f) => f.addEventListener("submit", async (e) => {
     e.preventDefault();
     const id = f.dataset.editReading;
@@ -1125,19 +2445,55 @@ function bindPopupForms() {
     closePopup(); render(); saveBytes();
   }));
   $$("[data-add-link]", root).forEach((f) => {
-    refreshLinkOptions(f);
-    f.querySelector("[name=linkType]").addEventListener("change", () => refreshLinkOptions(f));
     f.addEventListener("submit", async (e) => {
       e.preventDefault();
       const [fromType, fromId] = f.dataset.addLink.split(":");
-      const d = new FormData(f);
-      try { state.store.addLink(fromType, fromId, d.get("linkType"), d.get("linkId")); } catch (err) { alert(err.message); return; }
+      const target = new FormData(f).get("linkTarget") || "";
+      const sep = target.indexOf(":");
+      if (sep < 1) { alert("Search and pick an item to link first."); return; }
+      try { state.store.addLink(fromType, fromId, target.slice(0, sep), target.slice(sep + 1)); } catch (err) { alert(err.message); return; }
       render(); saveBytes(); openPopupByRef(fromType, fromId);
     });
   });
 }
 
 function attachPersistentListeners() {
+  // Swipe left on a task row toggles it done. The row's checkbox and
+  // popup still work if a swipe never fires; a detected swipe kills
+  // the synthetic tap click so the popup does not open.
+  let swRow = null, swX = null, swMoved = false;
+  $("#main").addEventListener("touchstart", (e) => {
+    const row = e.target.closest?.("[data-task]");
+    if (!row || e.touches.length !== 1) { swRow = null; swX = null; return; }
+    swRow = row; swX = e.touches[0].clientX; swMoved = false;
+  }, { passive: true });
+  $("#main").addEventListener("touchmove", (e) => {
+    if (!swRow || swX === null) return;
+    const dx = e.touches[0].clientX - swX;
+    swRow.style.transform = `translateX(${Math.max(-80, Math.min(80, dx))}px)`;
+    if (Math.abs(dx) > 12) swMoved = true;
+  }, { passive: true });
+  $("#main").addEventListener("touchend", (e) => {
+    if (!swRow) return;
+    const m = /translateX\((-?[\d.]+)px\)/.exec(swRow.style.transform || "");
+    const dx = m ? parseFloat(m[1]) : 0;
+    swRow.style.transform = "";
+    if (swMoved && dx <= -60) {
+      e.preventDefault();
+      swRow.querySelector("[data-tick]")?.click();
+    } else if (swMoved && dx >= 60) {
+      e.preventDefault();
+      const id = swRow.querySelector("[data-tick]")?.dataset.tick ?? swRow.dataset.task;
+      const task = id ? state.store.getRow("tasks", id) : null;
+      if (task && !task.done) {
+        const today = todayToronto();
+        const base = task.due_date && task.due_date > today ? task.due_date : today;
+        state.store.updateProps("tasks", id, { due_date: ymdAdd(base, 1) });
+        render(); saveBytes();
+      }
+    }
+    swRow = null; swX = null; swMoved = false;
+  }, { passive: false });
   $("#main").addEventListener("click", async (e) => {
     const tick = e.target.closest("[data-tick]");
     if (tick) {
@@ -1148,6 +2504,51 @@ function attachPersistentListeners() {
       render(); saveBytes();
       return;
     }
+    const readingDone = e.target.closest("[data-reading-done]");
+    if (readingDone) {
+      state.store.updateProps("reading_items", readingDone.dataset.readingDone, { status: "Read" });
+      if (!vocabValues("reading_items", "status").includes("Read")) state.store.addFieldValue("reading_items", "status", "Read");
+      render(); saveBytes();
+      return;
+    }
+    const calNav = e.target.closest("[data-cal-nav]");
+    if (calNav) {
+      const v = calState();
+      const [yy, mm] = v.month.split("-").map(Number);
+      const t = new Date(Date.UTC(yy, mm - 1 + parseInt(calNav.dataset.calNav, 10), 1));
+      v.month = `${t.getUTCFullYear()}-${String(t.getUTCMonth() + 1).padStart(2, "0")}`;
+      render();
+      return;
+    }
+    const calTodayBtn = e.target.closest("[data-cal-today]");
+    if (calTodayBtn) { const v = calState(); const td = todayToronto(); v.month = td.slice(0, 7); v.selected = td; render(); return; }
+    const calDay = e.target.closest("[data-cal-day]");
+    if (calDay && !e.target.closest("[data-open]")) { calState().selected = calDay.dataset.calDay; render(); return; }
+    const calRetry = e.target.closest("[data-cal-retry]");
+    if (calRetry) { loadCalRange(true); return; }
+    const famBtn = e.target.closest("[data-fam-refresh]");
+    if (famBtn) { loadFamilyCalendar(true); return; }
+    const focusBtn = e.target.closest("[data-focus-toggle]");
+    if (focusBtn) {
+      setFocusMode(!focusOn());
+      state.itemView = null; state.tab = "dashboard"; saveTab();
+      render();
+      return;
+    }
+    const mdDl = e.target.closest("[data-md-download]");
+    if (mdDl) { const v = parsePageRef(mdDl.dataset.mdDownload); const row = v.type === "custom" ? state.store.getRow("custom_objects", v.id) : state.store.getRow(v.type, v.id); if (row) downloadBytes(`${slugify(row.title)}.md`, new TextEncoder().encode(objectToMarkdown(v.type, row)), "text/markdown"); return; }
+    const pinOpen = e.target.closest("[data-pin-open]");
+    if (pinOpen) { openPageRef(pinOpen.dataset.pinOpen); return; }
+    const pinBtn = e.target.closest("[data-pin-toggle]");
+    if (pinBtn) {
+      togglePin(pinBtn.dataset.pinToggle);
+      render(); saveBytes();
+      return;
+    }
+    const dupTask = e.target.closest("[data-duplicate-task]");
+    if (dupTask) { duplicateTask(dupTask.dataset.duplicateTask); return; }
+    const dupNote = e.target.closest("[data-duplicate-note]");
+    if (dupNote) { duplicateNote(dupNote.dataset.duplicateNote); return; }
     const open = e.target.closest("[data-open]");
     if (open) {
       const [type, id] = open.dataset.open.split(":");
@@ -1164,10 +2565,11 @@ function attachPersistentListeners() {
     if (readingTitle) { openReadingPopup(readingTitle.dataset.reading); return; }
     const projectRow = e.target.closest("[data-project]");
     if (projectRow) { openProjectPopup(projectRow.dataset.project); return; }
+    if (state.inboxBulk) { const bulkRow = e.target.closest("[data-inbox]"); if (bulkRow && !e.target.closest("[data-archive-inbox]") && !e.target.closest("[data-inbox-sel]")) { const s = (state.inboxSel ??= new Set()); if (s.has(bulkRow.dataset.inbox)) s.delete(bulkRow.dataset.inbox); else s.add(bulkRow.dataset.inbox); render(); return; } }
     const inboxRow = e.target.closest("[data-inbox]");
     if (inboxRow && !e.target.closest("button")) { openInboxPopup(inboxRow.dataset.inbox); return; }
     const archI = e.target.closest("[data-archive-inbox]");
-    if (archI) { state.store.archiveObject("inbox_items", archI.dataset.archiveInbox); render(); saveBytes(); return; }
+    if (archI) { archiveWithUndo("inbox_items", archI.dataset.archiveInbox); render(); saveBytes(); return; }
   });
   $("#main").addEventListener("change", async (e) => {
     const sel = e.target.closest("[data-reading-status]");
@@ -1177,7 +2579,9 @@ function attachPersistentListeners() {
     }
   });
   $("#popup-root").addEventListener("click", async (e) => {
-    if (e.target.classList.contains("popup-backdrop")) { closePopup(); return; }
+    if (e.target.classList.contains("popup-backdrop")) { savePopupAndClose(); return; }
+    const pinBtnP = e.target.closest("[data-pin-toggle]");
+    if (pinBtnP) { togglePin(pinBtnP.dataset.pinToggle); render(); saveBytes(); refreshOpenPopup(); return; }
     if (e.target.closest("[data-close-popup]")) { closePopup(); return; }
     const pageOpen = e.target.closest("[data-open-page]");
     if (pageOpen) { closePopup(); openPageRef(pageOpen.dataset.openPage); return; }
@@ -1189,19 +2593,14 @@ function attachPersistentListeners() {
     if (arch) {
       const table = arch.dataset.archiveTask ? "tasks" : arch.dataset.archiveNote ? "notes" : arch.dataset.archivePerson ? "people" : arch.dataset.archiveProject ? "projects" : arch.dataset.archiveReading ? "reading_items" : "inbox_items";
       const id = arch.dataset.archiveTask ?? arch.dataset.archiveNote ?? arch.dataset.archivePerson ?? arch.dataset.archiveProject ?? arch.dataset.archiveReading ?? arch.dataset.archiveInbox;
-      state.store.archiveObject(table, id);
+      archiveWithUndo(table, id);
       closePopup(); render(); saveBytes();
       return;
     }
     const move = e.target.closest("[data-move-personal]");
     if (move) {
-      const id = move.dataset.movePersonal;
-      const item = state.store.getRow("inbox_items", id);
-      state.engine.txn(() => {
-        state.store.createNote({ title: item.title || (item.body_markdown ?? "").split("\n")[0].slice(0, 60), body: item.body_markdown ?? "" });
-        state.store.archiveObject("inbox_items", id);
-      });
-      closePopup(); render(); saveBytes();
+      const item = state.store.getRow("inbox_items", move.dataset.movePersonal);
+      if (item) openMoveCategoryPrompt(item, "popup");
       return;
     }
     const rmLink = e.target.closest("[data-remove-link]");
@@ -1253,6 +2652,8 @@ async function boot() {
   state.transport = new HttpTransport(state.base, state.token);
   state.booted = !fresh || !!bytes;
   console.log("[dashben-boot] db ready");
+  try { state.db.exec(`CREATE TABLE IF NOT EXISTS attachments (id TEXT PRIMARY KEY, owner_type TEXT NOT NULL, owner_id TEXT NOT NULL, mime TEXT NOT NULL, data TEXT NOT NULL, created_at TEXT, updated_at TEXT, archived INTEGER NOT NULL DEFAULT 0)`); } catch {}
+  try { const cols = state.db.prepare(`PRAGMA table_info(attachments)`).all(); if (cols.length && !cols.some((c) => c.name === "name")) state.db.exec(`ALTER TABLE attachments ADD COLUMN name TEXT`); } catch {}
   ensureSearchIndex();
   const origLocalWrite = state.engine.localWrite.bind(state.engine);
   // Sync-after-write: edits push within seconds when online, instead
@@ -1273,6 +2674,91 @@ async function boot() {
   $$(".tab-btn").forEach((b) => b.addEventListener("click", () => { $("#sidebar").classList.remove("open"); state.tab = b.dataset.tab; state.itemView = null; saveTab(); render(); }));
   $("#sync-btn").addEventListener("click", doSync);
   $("#menu-btn").addEventListener("click", () => $("#sidebar").classList.toggle("open"));
+  $("#collapse-btn")?.addEventListener("click", () => {
+    const on = document.body.classList.toggle("nav-collapsed");
+    $("#collapse-btn").textContent = on ? "»" : "«";
+    try { const s = JSON.parse(localStorage.getItem("pkm-local-settings") || "{}"); s.navCollapsed = on; localStorage.setItem("pkm-local-settings", JSON.stringify(s)); } catch {}
+  });
+  document.addEventListener("change", async (e) => {
+    const input = e.target.closest?.("[data-photo-add]");
+    if (!input || !input.files?.length) return;
+    const [ownerType, ownerId] = input.dataset.photoAdd.split(":");
+    const inPopup = !!input.closest("#popup-root");
+    try { for (const file of input.files) { const att = await fileToAttachment(file); state.store.addAttachment(ownerType, ownerId, att.mime, att.data, att.name ?? null); } }
+    catch { alert("An attachment could not be added."); }
+    render(); saveBytes();
+    if (inPopup) refreshOpenPopup();
+  });
+  document.addEventListener("click", (e) => {
+    const view = e.target.closest?.("[data-photo-view]");
+    if (view) {
+      const grid = view.closest("[data-photo-owner]");
+      const [ot, oi] = (grid?.dataset.photoOwner || "").split(":");
+      if (ot && oi) showLightbox(ot, oi, view.dataset.photoView);
+      return;
+    }
+    if (e.target.closest?.("[data-lb-close]") || e.target.classList?.contains("lightbox")) { lbState = null; renderLightbox(); return; }
+    if (e.target.closest?.("[data-lb-prev]") && lbState) { lbState.idx = (lbState.idx - 1 + lbState.list.length) % lbState.list.length; renderLightbox(); return; }
+    if (e.target.closest?.("[data-lb-next]") && lbState) { lbState.idx = (lbState.idx + 1) % lbState.list.length; renderLightbox(); return; }
+    const del = e.target.closest?.("[data-del-attachment]");
+    if (!del) return;
+    const inPopup = !!del.closest("#popup-root");
+    try { state.store.archiveAttachment(del.dataset.delAttachment); } catch {}
+    render(); saveBytes();
+    if (inPopup) refreshOpenPopup();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (!lbState) return;
+    if (e.key === "Escape") { lbState = null; renderLightbox(); }
+    else if (e.key === "ArrowLeft") { lbState.idx = (lbState.idx - 1 + lbState.list.length) % lbState.list.length; renderLightbox(); }
+    else if (e.key === "ArrowRight") { lbState.idx = (lbState.idx + 1) % lbState.list.length; renderLightbox(); }
+  });
+  $("#palette-btn")?.addEventListener("click", () => openPalette());
+  $("#toast-root")?.addEventListener("click", (e) => {
+    if (e.target.closest("[data-toast-undo]")) { const u = toastUndo; toastUndo = null; if (u) u(); }
+  });
+  document.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") { e.preventDefault(); if (paletteState) closePalette(); else openPalette(); return; }
+    if (!paletteState) return;
+    if (e.key === "Escape") { closePalette(); return; }
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      const n = paletteState.entries?.length ?? 0;
+      if (n) { paletteState.active = (paletteState.active + (e.key === "ArrowDown" ? 1 : -1) + n) % n; updatePaletteList(); }
+      return;
+    }
+    if (e.key === "Enter" && document.activeElement?.id === "palette-input") { e.preventDefault(); runPaletteEntry(paletteState.active); }
+  });
+  $("#palette-root")?.addEventListener("click", (e) => {
+    if (e.target.hasAttribute?.("data-palette-backdrop")) { closePalette(); return; }
+    const item = e.target.closest?.("[data-palette-idx]");
+    if (item) runPaletteEntry(Number(item.dataset.paletteIdx));
+  });
+  $("#nav-more").addEventListener("click", () => $("#sidebar").classList.toggle("open"));
+  $("#fab-capture").addEventListener("click", () => openPopup("Capture", `<form data-fab-capture class="form"><input name="title" placeholder="Title (optional)"><textarea name="body" rows="4" placeholder="Capture…" required></textarea><p class="popup-actions"><button type="submit" class="primary-btn">Capture</button><button type="button" data-close-popup class="ghost-btn">Cancel</button></p></form>`));
+  // "Auto (system)" theme follows the OS; re-apply when it flips.
+  window.matchMedia("(prefers-color-scheme: light)").addEventListener("change", applyTheme);
+  // Pull-to-refresh (shell only, additive: Sync now still works if a
+  // pull never fires). Only at the very top, no popup open, online.
+  let ptrY = null, ptrDy = 0;
+  const ptrEl = document.getElementById("ptr-indicator");
+  document.addEventListener("touchstart", (e) => {
+    if (window.scrollY <= 0 && !$("div#popup-root").firstChild && e.touches.length === 1) { ptrY = e.touches[0].clientY; ptrDy = 0; }
+    else ptrY = null;
+  }, { passive: true });
+  document.addEventListener("touchmove", (e) => {
+    if (ptrY === null) return;
+    ptrDy = e.touches[0].clientY - ptrY;
+    if (ptrDy > 0) {
+      ptrEl.textContent = ptrDy > 70 ? "Release to sync…" : "Pull to sync…";
+      ptrEl.classList.add("show");
+    } else ptrEl.classList.remove("show");
+  }, { passive: true });
+  document.addEventListener("touchend", () => {
+    if (ptrY !== null && ptrDy > 70 && state.token && navigator.onLine && !state.syncing) doSync();
+    ptrEl.classList.remove("show");
+    ptrY = null; ptrDy = 0;
+  }, { passive: true });
   // Auto-sync on reconnect: coming back online pushes queued local
   // edits and pulls anything that landed server-side while offline.
   window.addEventListener("online", () => { render(); if (state.booted) doSync(); });
@@ -1285,6 +2771,12 @@ async function boot() {
     const s = JSON.parse(localStorage.getItem("pkm-local-settings") || "{}");
     if (s.tab && allTabIds().includes(s.tab)) state.tab = s.tab;
   } catch {}
+  try {
+    const s0 = JSON.parse(localStorage.getItem("pkm-local-settings") || "{}");
+    if (s0.navCollapsed) { document.body.classList.add("nav-collapsed"); const cb = $("#collapse-btn"); if (cb) cb.textContent = "»"; }
+  } catch {}
+  initNav();
+  loadFamilyCalendar();
   render();
   console.log("[dashben-boot] rendered");
   await captureSharedText();
@@ -1292,6 +2784,7 @@ async function boot() {
   // database, first sync runs on the first manual Sync press (so a
   // missing token doesn't block first paint).
   if (!fresh) await doSync();
+  void initReminders();
 }
 
 boot().catch((e) => {
@@ -1299,20 +2792,23 @@ boot().catch((e) => {
 });
 
 // --- Parity P2/P3/P4/P6: Daily, Management, custom types, FTS, themes ---
-const DEFAULT_TABS = ["dashboard", "daily", "tasks", "notes", "projects", "reading", "people", "inbox", "search", "management"];
-const TAB_LABELS = { dashboard: "Dashboard", daily: "Daily", tasks: "Tasks", notes: "Notes", projects: "Projects", reading: "Reading", people: "People", inbox: "Inbox", search: "Search", management: "Management" };
+const DEFAULT_TABS = ["dashboard", "daily", "calendar", "review", "tasks", "notes", "projects", "reading", "people", "inbox", "search", "management"];
+const TAB_LABELS = { dashboard: "Dashboard", daily: "Daily", calendar: "Calendar", review: "Review", tasks: "Tasks", notes: "Notes", projects: "Projects", reading: "Reading", people: "People", inbox: "Inbox", search: "Search", management: "Management" };
 const MANAGED_FIELD_LIST = [
   ["tasks", "priority"], ["tasks", "project"], ["notes", "type"], ["people", "role"],
   ["reading_items", "status"], ["projects", "status"], ["projects", "category"],
 ];
-const THEMES = [["blueprint", "Blueprint dark"], ["paper", "Paper light"], ["civic", "Civic"], ["minimal", "Minimal light"], ["notebook", "Field notebook"], ["ember", "Ember dark"]];
+const THEMES = [["auto", "Auto (system)"], ["blueprint", "Blueprint dark"], ["linear-light", "Linear light"], ["paper", "Paper light"], ["civic", "Civic"], ["minimal", "Minimal light"], ["notebook", "Field notebook"], ["ember", "Ember dark"]];
 
 function getTabPrefs() {
   try {
     const row = state.store.getRow("ui_prefs", "tabs");
     if (!row?.value) return { order: [...DEFAULT_TABS], hidden: [], rearrangeEnabled: true, groups: [] };
     const p = JSON.parse(row.value);
-    return { order: Array.isArray(p.order) ? p.order : [...DEFAULT_TABS], hidden: Array.isArray(p.hidden) ? p.hidden : [], rearrangeEnabled: true, groups: Array.isArray(p.groups) ? p.groups : [] };
+    const order = Array.isArray(p.order) ? p.order : [...DEFAULT_TABS];
+    const missing = DEFAULT_TABS.filter((t) => !order.includes(t));
+    if (missing.length) { const i = order.indexOf("daily"); order.splice(i >= 0 ? i + 1 : order.length, 0, ...missing); }
+    return { order, hidden: Array.isArray(p.hidden) ? p.hidden : [], rearrangeEnabled: true, groups: Array.isArray(p.groups) ? p.groups : [] };
   } catch { return { order: [...DEFAULT_TABS], hidden: [], rearrangeEnabled: true, groups: [] }; }
 }
 function customTabDefs() {
@@ -1383,7 +2879,8 @@ function renderSidebar() {
 }
 
 function applyTheme() {
-  const theme = state.store.getRow("ui_prefs", "theme")?.value ?? "blueprint";
+  let theme = state.store.getRow("ui_prefs", "theme")?.value ?? "ember";
+  if (theme === "auto") theme = window.matchMedia("(prefers-color-scheme: light)").matches ? "paper" : "blueprint";
   if (theme === "blueprint") document.documentElement.removeAttribute("data-theme");
   else document.documentElement.setAttribute("data-theme", theme);
 }
@@ -1414,17 +2911,19 @@ function renderDaily() {
     <form data-daily-jot="${date}" class="form"><textarea name="jot" rows="3" placeholder="Jot a note…" style="flex:1"></textarea><button>Jot it down</button></form>
     <p><button data-open="notes:${note.id}">Edit daily note</button></p>`;
   } else {
-    body = `<p class="muted">No daily note for this date yet.</p><p><button data-create-daily="${date}">Create daily note for ${date}</button></p>`;
+    body = `<p class="muted">No daily note for this date yet.</p><p><button data-create-daily="${date}" class="primary-btn">Create daily note for ${date}</button></p>`;
   }
   return `<form data-daily-nav class="form">
-    <button type="button" data-daily-shift="-1">← Prev</button>
+    <button type="button" data-daily-shift="-1"><span class="nav-arrow">← </span>Prev</button>
     <input type="date" name="date" value="${date}" data-daily-date>
     <button type="button" data-daily-go>Go</button>
-    <button type="button" data-daily-shift="1">Next →</button>
+    <button type="button" data-daily-shift="1">Next <span class="nav-arrow">→</span></button>
     <button type="button" data-daily-shift="0">Today</button>
+    <button type="button" data-print-daily class="ghost-btn">Print</button>
   </form>
-  <div class="panel"><h3>Overdue (${overdue.length})</h3>${overdue.length ? overdue.map(taskRow).join("") : "<p class='muted'>Nothing overdue.</p>"}</div>
-  <div class="panel"><h3>Due Today (${todos.length})</h3>${todos.length ? todos.map(taskRow).join("") : "<p class='muted'>Nothing due this day.</p>"}</div>
+  ${dayContextPanel(date)}
+  <div class="panel"><h3>${date === todayToronto() ? "Carried over" : "Overdue"} (${overdue.length})</h3>${date === todayToronto() && overdue.length ? ` <button data-carry-all class="ghost-btn">All → today</button>` : ""}${overdue.length ? overdue.map((t) => taskRow(t, { carry: date === todayToronto() })).join("") : "<p class='muted'>Nothing overdue.</p>"}</div>
+  <div class="panel"><h3>Due Today (${todos.length})</h3>${date === todayToronto() && todos.length ? `<p><button data-push-all class="ghost-btn">All → tomorrow</button></p>` : ""}${todos.length ? todos.map(taskRow).join("") : "<p class='muted'>Nothing due this day.</p>"}</div>
   ${body}`;
 }
 
@@ -1445,68 +2944,99 @@ async function fetchWeather() {
   state.weatherTried = true;
   try {
     // Same request production uses (today + next 3 days).
-    const url = "https://api.open-meteo.com/v1/forecast?latitude=43.4635&longitude=-81.18748&current=temperature_2m&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=America%2FToronto&forecast_days=4";
+    const url = "https://api.open-meteo.com/v1/forecast?latitude=43.4635&longitude=-81.18748&current=temperature_2m&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum,wind_speed_10m_max,sunrise,sunset&hourly=temperature_2m,weather_code,precipitation_probability&timezone=America%2FToronto&forecast_days=4";
     const res = await fetch(url);
     if (!res.ok) throw new Error("weather fetch failed");
     state.weather = await res.json();
   } catch { state.weather = null; }
-  if (state.tab === "dashboard") render();
+  if (state.tab === "dashboard" || state.tab === "daily") render();
 }
 function weatherPanel() {
   if (!state.weather) {
-    if (state.weatherTried) return `<div class="panel"><h3>Weather — Mitchell, Ontario</h3><p class="muted">Weather unavailable right now — reload to try again.</p></div>`;
+    if (state.weatherTried) return `<div class="panel weather-panel"><h3>Weather — Mitchell, Ontario</h3><p class="muted">Weather unavailable right now — reload to try again.</p></div>`;
     fetchWeather();
-    return `<div class="panel"><h3>Weather — Mitchell, Ontario</h3><p class="muted">Loading…</p></div>`;
+    return `<div class="panel weather-panel"><h3>Weather — Mitchell, Ontario</h3><p class="muted">Loading…</p></div>`;
   }
   const days = state.weather.daily;
   const cards = days.time.map((date, i) => {
     const { icon, condition } = weatherIcon(days.weathercode?.[i] ?? -1);
     const label = i === 0 ? "Today" : new Intl.DateTimeFormat("en-CA", { weekday: "short", timeZone: "America/Toronto" }).format(new Date(`${date}T12:00:00Z`));
     const monthDay = new Intl.DateTimeFormat("en-CA", { month: "short", day: "numeric", timeZone: "America/Toronto" }).format(new Date(`${date}T12:00:00Z`));
-    return `<div class="weather-card"><div><strong>${label}</strong></div><div class="muted">${monthDay}</div><div style="font-size:28px">${icon}</div><div class="muted">${condition}</div><div>${Math.round(days.temperature_2m_max[i])}° / ${Math.round(days.temperature_2m_min[i])}°</div><div class="muted">💧 ${days.precipitation_probability_max?.[i] ?? "?"}%</div></div>`;
+    return `<div class="weather-card${i === state.weatherDay ? " selected" : ""}" data-weather-day="${i}"><div><strong>${label}</strong></div><div class="muted">${monthDay}</div><div style="font-size:28px">${icon}</div><div class="muted">${condition}</div><div>${Math.round(days.temperature_2m_max[i])}° / ${Math.round(days.temperature_2m_min[i])}°</div><div class="muted">💧 ${days.precipitation_probability_max?.[i] ?? "?"}%</div></div>`;
   }).join("");
-  return `<div class="panel"><h3>Weather — Mitchell, Ontario</h3><p class="muted">${Math.round(state.weather.current.temperature_2m)}° now</p><div class="weather-grid">${cards}</div></div>`;
+  const sel = state.weatherDay;
+  const detail = (sel !== null && sel !== undefined && days.time[sel]) ? (() => {
+    const i = sel;
+    const { icon, condition } = weatherIcon(days.weathercode?.[i] ?? -1);
+    const label = i === 0 ? "Today" : new Intl.DateTimeFormat("en-CA", { weekday: "long", timeZone: "America/Toronto" }).format(new Date(`${days.time[i]}T12:00:00Z`));
+    const monthDay = new Intl.DateTimeFormat("en-CA", { month: "long", day: "numeric", timeZone: "America/Toronto" }).format(new Date(`${days.time[i]}T12:00:00Z`));
+    const hm = (iso) => (iso ? String(iso).slice(11, 16) : "?");
+    const stat = (ico, val, lab) => `<div class="wd-stat"><span class="wd-ico">${ico}</span><span class="wd-val">${val}</span><span class="wd-lab">${lab}</span></div>`;
+    // Hourly breakdown in 3-hour chunks under the day detail
+    // (Ben, Nov 4, 2026): average temp, mid-chunk condition icon,
+    // peak rain chance; today's current chunk is highlighted.
+    const hours = state.weather.hourly;
+    let chunks = "";
+    if (hours?.time?.length) {
+      const base = i * 24;
+      const hourLabel = (h) => `${((h + 11) % 12) + 1} ${h < 12 ? "AM" : "PM"}`;
+      const nowH = i === 0 ? new Date().getHours() : -1;
+      const tiles = [];
+      for (let c = 0; c < 8; c++) {
+        const hs = [base + c * 3, base + c * 3 + 1, base + c * 3 + 2];
+        const temps = hs.map((k) => hours.temperature_2m?.[k]).filter((v) => v !== undefined && v !== null);
+        if (!temps.length) continue;
+        const avg = Math.round(temps.reduce((a, b) => a + b, 0) / temps.length);
+        const pop = Math.max(...hs.map((k) => hours.precipitation_probability?.[k] ?? 0));
+        const mid = weatherIcon(hours.weather_code?.[hs[1]] ?? -1);
+        const isNow = nowH >= c * 3 && nowH < c * 3 + 3;
+        tiles.push(`<div class="wd-chunk${isNow ? " now" : ""}"><span class="wd-lab">${hourLabel(c * 3)}</span><span class="wd-ico">${mid.icon}</span><span class="wd-val">${avg}°</span><span class="wd-lab">🌧️ ${pop}%</span></div>`);
+      }
+      if (tiles.length) chunks = `<div class="wd-chunks">${tiles.join("")}</div>`;
+    }
+    return `<div class="weather-detail"><div class="wd-head"><span class="wd-icon">${icon}</span><div><strong>${label}, ${monthDay}</strong><div class="muted">${condition}</div></div><div class="wd-temps">${Math.round(days.temperature_2m_max[i])}°<span class="muted"> / ${Math.round(days.temperature_2m_min[i])}°</span></div></div><div class="wd-grid">${stat("🌡️", `${Math.round(days.temperature_2m_max[i])}°`, "High")}${stat("❄️", `${Math.round(days.temperature_2m_min[i])}°`, "Low")}${stat("🌧️", `${days.precipitation_probability_max?.[i] ?? "?"}%`, "Rain chance")}${stat("💧", `${days.precipitation_sum?.[i] ?? "?"} mm`, "Precipitation")}${stat("💨", `${days.wind_speed_10m_max?.[i] ?? "?"} km/h`, "Wind")}${stat("🌅", hm(days.sunrise?.[i]), "Sunrise")}${stat("🌇", hm(days.sunset?.[i]), "Sunset")}</div>${chunks}</div>`;
+  })() : "";
+  return `<div class="panel weather-panel"><h3>Weather — Mitchell, Ontario</h3><p class="muted">${Math.round(state.weather.current.temperature_2m)}° now</p><div class="weather-grid">${cards}</div>${detail}</div>`;
 }
 function dailyWorkspacePanel() {
   const today = todayToronto();
   const note = dailyNoteFor(today);
-  const todos = openTasks().filter((t) => t.due_date && t.due_date <= today);
+  const overdue = openTasks().filter((t) => t.due_date && t.due_date < today);
+  const dueToday = openTasks().filter((t) => t.due_date === today);
   let inner = "";
   if (note) {
     const { schedule, notes } = splitSchedule(note.body_markdown ?? "");
-    inner = `<div class="panel"><h3>Todos</h3>${todos.length ? todos.map(taskRow).join("") : "<p class='muted'>Nothing due today.</p>"}</div>
+    inner = `<div class="panel"><h3>Todos</h3>${overdue.length ? `<button data-carry-all class="ghost-btn">All overdue → today</button> ` : ""}${dueToday.length ? `<button data-push-all class="ghost-btn">All today → tomorrow</button> ` : ""}${overdue.length ? `<h4>Carried over (${overdue.length})</h4>${overdue.map((t) => taskRow(t, { carry: true, snooze: true })).join("")}<h4>Due today</h4>` : ""}${dueToday.length ? dueToday.map((t) => taskRow(t, { snooze: true })).join("") : "<p class='muted'>Nothing due today.</p>"}</div>
+    <form data-dash-task class="form"><input name="title" placeholder="New task" required style="flex:1"><button class="primary-btn">+ New task</button></form>
     <h4>Schedule</h4>${schedule.length ? schedule.map((l) => `<p>${esc(l)}</p>`).join("") : "<p class='muted'>No schedule yet.</p>"}
     <h4>Notes</h4>${notes.join("\n").trim() ? notes.map((l) => `<p>${esc(l)}</p>`).join("") : "<p class='muted'>No notes yet.</p>"}
     <form data-daily-jot="${today}" class="form"><input name="jot" placeholder="Jot a note…" style="flex:1"><button>Add note</button></form>
     <p><button data-open="notes:${note.id}">Open full note</button></p>`;
   } else {
-    inner = `<div class="panel"><h3>Todos</h3>${todos.length ? todos.map(taskRow).join("") : "<p class='muted'>Nothing due today.</p>"}</div>
-    <p class="muted">No daily note for today yet.</p><p><button data-create-daily="${today}">Create today's daily note</button></p>`;
+    inner = `<div class="panel"><h3>Todos</h3>${overdue.length ? `<button data-carry-all class="ghost-btn">All overdue → today</button> ` : ""}${dueToday.length ? `<button data-push-all class="ghost-btn">All today → tomorrow</button> ` : ""}${overdue.length ? `<h4>Carried over (${overdue.length})</h4>${overdue.map((t) => taskRow(t, { carry: true, snooze: true })).join("")}<h4>Due today</h4>` : ""}${dueToday.length ? dueToday.map((t) => taskRow(t, { snooze: true })).join("") : "<p class='muted'>Nothing due today.</p>"}</div>
+    <form data-dash-task class="form"><input name="title" placeholder="New task" required style="flex:1"><button class="primary-btn">+ New task</button></form>
+    <p class="muted">No daily note for today yet.</p><p><button data-create-daily="${today}" class="primary-btn">Create today's daily note</button></p>`;
   }
-  return `<div class="panel"><h3>Daily Note</h3><p><button data-daily-tab>Open Daily tab →</button></p>${inner}</div>`;
+  return `<div class="panel"><h3>Daily Note</h3><p><button data-daily-tab>Open Daily tab →</button> <button data-focus-toggle class="ghost-btn">${focusOn() ? "Exit focus" : "Focus"}</button></p>${dayProgressHtml()}${inner}</div>`;
 }
 function upcomingPanel() {
   const today = todayToronto();
   const d = new Date(today + "T12:00:00");
   const addDays = (n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x.toISOString().slice(0, 10); };
   const tomorrow = addDays(1), weekEnd = addDays(7);
-  const overdue = openTasks().filter((t) => t.due_date && t.due_date < today);
-  const dueToday = openTasks().filter((t) => t.due_date === today);
   const dueTomorrow = openTasks().filter((t) => t.due_date === tomorrow);
   const dueWeek = openTasks().filter((t) => t.due_date && t.due_date > tomorrow && t.due_date <= weekEnd);
-  const section = (label, list) => `<h4>${label} (${list.length})</h4>${list.length ? list.map(taskRow).join("") : "<p class='muted'>None.</p>"}`;
+  const section = (label, list) => `<h4>${label} (${list.length})</h4>${list.length ? list.map((t) => taskRow(t, { snooze: true })).join("") : "<p class='muted'>None.</p>"}`;
   return `<div class="panel"><h3>Upcoming</h3>
-  ${section("Overdue", overdue)}
-  ${section("Due Today", dueToday)}
   ${section("Due Tomorrow", dueTomorrow)}
-  ${section("Due This Week", dueWeek)}
-  <form data-dash-task class="form"><input name="title" placeholder="New task" required><button>+ New task</button></form></div>`;
+  ${section("Due This Week", dueWeek)}</div>`;
 }
 function inboxPanel() {
   const items = inboxItems();
-  return `<div class="panel"><h3>Inbox (${items.length})</h3>
-  ${items.map((i) => `<div class="row" data-inbox="${i.id}"><span class="row-title">${esc(i.title)}</span><span class="muted">${esc((i.body_markdown ?? "").slice(0, 80))}</span></div>`).join("") || "<p class='muted'>Inbox empty.</p>"}
-  <form data-capture class="form"><input name="title" placeholder="Title (optional)"><textarea name="body" rows="2" placeholder="Capture…" required></textarea><button>+ Capture to inbox</button></form></div>`;
+  const photoCounts = attachmentCounts("inbox_items");
+  return `<div class="panel inbox-panel"><h3>Inbox (${items.length})</h3>
+  ${items.map((i) => `<div class="row" data-inbox="${i.id}"><span class="row-title">${esc(i.title)}${photoInd(photoCounts, i.id)}</span><span class="muted">${esc((i.body_markdown ?? "").slice(0, 80))}</span></div>`).join("") || "<p class='muted'>Inbox empty.</p>"}
+  <form data-capture class="form"><input name="title" placeholder="Title (optional)"><textarea name="body" rows="2" placeholder="Capture… a pasted link files to Reading; start with task: to make a task"></textarea><input type="file" name="photo" accept="image/*,.pdf,.txt,.md,.csv,.doc,.docx,.rtf" multiple><button class="primary-btn">+ Capture to inbox</button></form></div>`;
 }
 
 // --- Local search index (P4). search_fts is deliberately never
@@ -1559,11 +3089,100 @@ function runSearchTokens(q) {
   return rows.map((r) => `<div class="row"><span class="badge">${esc(r.object_type)}</span><span class="row-title" data-open="${r.object_type}:${r.object_id}">${esc(r.title)}</span><span class="muted">${esc(searchSnippet(r.object_type, r.object_id, terms))}</span></div>`);
 }
 
+// --- Calendar tab (stamp 2026-11-04ak) ---
+// Month view of the family calendar. Fetches the exact grid range
+// (?from=<first cell>&days=42) through the same Worker feed as the
+// dashboard panel; ranges are cached per grid start for 15 minutes.
+function calState() {
+  if (!state.calView) { const today = todayToronto(); state.calView = { month: today.slice(0, 7), selected: today }; }
+  return state.calView;
+}
+function buildCalCells(month) {
+  const first = month + "-01";
+  const dow = new Date(first + "T12:00:00").getDay();
+  const start = ymdAdd(first, -dow);
+  return Array.from({ length: 42 }, (_, i) => ymdAdd(start, i));
+}
+function calMonthLabel(month) {
+  return new Date(month + "-01T12:00:00").toLocaleDateString("en-CA", { month: "long", year: "numeric" });
+}
+function calEventsByDay(events) {
+  const map = new Map();
+  for (const e of events) for (const d of famEventDays(e)) {
+    if (!map.has(d)) map.set(d, []);
+    map.get(d).push(e);
+  }
+  for (const list of map.values()) list.sort((a, b) => (a.allDay === b.allDay ? (a.start < b.start ? -1 : 1) : a.allDay ? -1 : 1));
+  return map;
+}
+function calChipTime(iso) {
+  const p = {};
+  for (const part of new Intl.DateTimeFormat("en-CA", { timeZone: "America/Toronto", hour: "numeric", minute: "2-digit", hour12: true }).formatToParts(new Date(iso))) {
+    if (part.type !== "literal") p[part.type] = part.value;
+  }
+  const suffix = (p.dayPeriod || "").toLowerCase().startsWith("p") ? "p" : "a";
+  return p.minute === "00" ? `${parseInt(p.hour, 10)}${suffix}` : `${parseInt(p.hour, 10)}:${p.minute}${suffix}`;
+}
+async function loadCalRange(force = false) {
+  const view = calState();
+  const key = buildCalCells(view.month)[0];
+  const t = state.transport;
+  if (!t || !t.base || !t.token) return;
+  const cur = state.calRange;
+  if (!force && cur && cur.key === key && cur.status === "ok" && Date.now() - cur.fetchedAt < 15 * 60 * 1000) return;
+  if (cur?.loading) return;
+  state.calRange = { key, loading: true, status: cur?.status ?? "idle", events: cur?.key === key ? cur.events : [], fetchedAt: cur?.fetchedAt ?? 0 };
+  try {
+    const res = await fetch(`${t.base}/api/sync/calendar?from=${key}&days=42`, { headers: { Authorization: `Bearer ${t.token}` } });
+    if (res.status === 501) state.calRange = { key, status: "unconfigured", events: [], fetchedAt: 0 };
+    else if (!res.ok) throw new Error(`calendar -> ${res.status}`);
+    else { const data = await res.json(); state.calRange = { key, status: "ok", events: data.events ?? [], fetchedAt: Date.now() }; }
+  } catch {
+    state.calRange = { key, status: "error", events: state.calRange?.events ?? [], fetchedAt: state.calRange?.fetchedAt ?? 0 };
+  }
+  if (state.tab === "calendar" && !state.itemView) render();
+}
+function renderCalendar() {
+  const view = calState();
+  const cells = buildCalCells(view.month);
+  const range = state.calRange;
+  if (!range || range.key !== cells[0]) loadCalRange();
+  if (range?.status === "unconfigured") {
+    return `<div class="panel"><h3>Calendar</h3><p class="muted">The family calendar isn't connected yet — add the FAMILY_CAL_ICS_URL secret to the pkm-new Worker, deploy, then check again.</p><p><button data-cal-retry class="ghost-btn">Check again</button></p></div>`;
+  }
+  const byDay = calEventsByDay(range?.events ?? []);
+  const tasksByDay = new Map();
+  for (const t of allRows("tasks")) {
+    if (t.archived || t.done || !t.due_date) continue;
+    if (t.due_date < cells[0] || t.due_date > cells[cells.length - 1]) continue;
+    if (!tasksByDay.has(t.due_date)) tasksByDay.set(t.due_date, []);
+    tasksByDay.get(t.due_date).push(t);
+  }
+  const today = todayToronto();
+  const grid = cells.map((d) => {
+    const list = byDay.get(d) ?? [];
+    const tlist = tasksByDay.get(d) ?? [];
+    const chips = list.slice(0, 3).map((e) => `<span class="cal-chip${e.allDay ? " cal-chip-allday" : ""}">${e.allDay ? "" : esc(calChipTime(e.start)) + " "}${esc(e.title)}</span>`).join("") + tlist.slice(0, Math.max(0, 3 - list.length)).map((t) => `<span class="cal-chip cal-task" data-open="tasks:${t.id}">${esc(t.title)}</span>`).join("");
+    const total = list.length + tlist.length;
+    const more = total > 3 ? `<span class="cal-more">+${total - 3} more</span>` : "";
+    return `<button type="button" class="cal-cell${d.slice(0, 7) !== view.month ? " cal-other" : ""}${d === today ? " cal-today" : ""}${d === view.selected ? " cal-selected" : ""}" data-cal-day="${d}"><span class="cal-dnum">${parseInt(d.slice(8), 10)}</span>${chips}${more}</button>`;
+  }).join("");
+  const selList = byDay.get(view.selected) ?? [];
+  const selTasks = tasksByDay.get(view.selected) ?? [];
+  const selLabel = view.selected === today ? "Today" : new Date(view.selected + "T12:00:00").toLocaleDateString("en-CA", { weekday: "long", month: "long", day: "numeric" });
+  return `<div class="panel cal-panel"><div class="cal-head"><button data-cal-nav="-1" class="ghost-btn" aria-label="Previous month">\u2039</button><h3>${esc(calMonthLabel(view.month))}</h3><button data-cal-nav="1" class="ghost-btn" aria-label="Next month">\u203a</button><button data-cal-today class="ghost-btn">Today</button></div>
+  <div class="cal-week">${["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((w) => `<span>${w}</span>`).join("")}</div>
+  <div class="cal-grid">${grid}</div>
+  ${range?.status === "error" ? `<p class="muted">Couldn't load the calendar. <button data-cal-retry class="ghost-btn">Retry</button></p>` : range?.status !== "ok" ? "<p class='muted'>Loading\u2026</p>" : ""}
+  </div>
+  <div class="panel"><h3>${esc(selLabel)}</h3>${selList.length || selTasks.length ? selList.map((e) => `<div class="row"><span class="fam-time">${esc(famTimeLabel(e))}</span><span class="row-title">${esc(e.title)}</span>${e.location ? `<span class="muted">${esc(e.location)}</span>` : ""}</div>`).join("") + selTasks.map((t) => `<div class="row"><span class="fam-time">Task</span><span class="row-title cal-task-link" data-open="tasks:${t.id}">${esc(t.title)}</span></div>`).join("") : "<p class='muted'>Nothing scheduled.</p>"}</div>`;
+}
+
 function renderManagement() {
   const prefs = getTabPrefs();
   const allTags = state.db.prepare("SELECT DISTINCT tag FROM object_tags ORDER BY tag").all().map((r) => r.tag);
   const types = state.db.prepare("SELECT * FROM custom_object_types ORDER BY name").all();
-  const currentTheme = state.store.getRow("ui_prefs", "theme")?.value ?? "blueprint";
+  const currentTheme = state.store.getRow("ui_prefs", "theme")?.value ?? "ember";
   const ungrouped = allTabIds().filter((id) => !prefs.groups.some((g) => (g.tabs ?? []).includes(id)));
   const knownTabs = allTabIds();
   const order = [...prefs.order.filter((id) => knownTabs.includes(id)), ...knownTabs.filter((id) => !prefs.order.includes(id))];
@@ -1572,7 +3191,10 @@ function renderManagement() {
   <input id="sync-token-input" type="password" autocomplete="off" placeholder="SYNC_TOKEN">
   <button data-token-save class="ghost-btn">Save token</button>
   <button data-full-sync class="ghost-btn">Re-download everything</button>
-  <span class="muted">${state.token ? "Token saved" : "No token set"}</span></div></div>
+  <span class="muted">${state.token ? "Token saved" : "No token set"}</span></div>
+  <p class="muted">Due reminders: <b>${state.store.getRow("ui_prefs", "reminders")?.value === "off" ? "Off" : "On"}</b> \u2014 a 9 a.m. nudge on each due day, plus a morning digest while tasks are overdue.</p>
+  <p><button data-reminder-toggle class="ghost-btn">${state.store.getRow("ui_prefs", "reminders")?.value === "off" ? "Turn reminders on" : "Turn reminders off"}</button></p></div>
+  <div class="panel"><h3>Backup</h3><p class="muted">Download a full copy of the local database (.db) — the same format the app loads. Keep it somewhere safe as offline insurance.</p><p><button data-export-db class="primary-btn">Export database</button></p><p><button data-export-md class="primary-btn">Export Markdown (.zip)</button></p></div>
   <div class="panel"><h3>Field values</h3><p class="muted">Selectable values for every field on every object type. Renaming a value renames it on every row using it. Deleting a value that is in use is blocked.</p>
   ${MANAGED_FIELD_LIST.map(([ot, f]) => `<h4>${ot}.${f}</h4>
     ${vocabValues(ot, f).map((v) => `<form data-fv-rename class="form inline"><input type="hidden" name="objectType" value="${ot}"><input type="hidden" name="field" value="${f}"><input type="hidden" name="old" value="${esc(v)}"><input name="new" value="${esc(v)}"><button>Rename</button><button type="button" data-fv-delete="${ot}|${f}|${esc(v)}">Delete</button></form>`).join("")}
@@ -1591,6 +3213,19 @@ function renderManagement() {
   <div class="panel"><h3>Tab order</h3><p class="muted">Drag tabs to reorder them, then save.</p>
   <ul data-tab-order-list>${order.map((tid) => `<li draggable="true" data-tab-order-item="${tid}">☰ ${esc(tabLabel(tid))}</li>`).join("")}</ul>
   <p><button data-tab-order-save>Save</button></p></div>
+  <div class="panel"><h3>Templates</h3><p class="muted">Prefilled skeletons offered in the New task / New note forms. Stored in the app and synced like everything else.</p>
+  ${getTemplates().map((t) => `<p class="tpl-row"><strong>${esc(t.name)}</strong> <span class="muted">${esc(t.kind)}</span> <button data-tpl-del="${t.id}" class="ghost-btn">Delete</button></p>`).join("")}
+  <form data-tpl-add class="form">
+    <div class="cf-row"><div class="cf-field"><label class="cf-label">Name</label><input name="name" required></div>
+    <div class="cf-field"><label class="cf-label">Kind</label><select name="kind"><option value="note">Note</option><option value="task">Task</option></select></div></div>
+    <div class="cf-field"><label class="cf-label">Title prefill (optional)</label><input name="title"></div>
+    <div class="cf-field"><label class="cf-label">Body</label><textarea name="body" rows="4"></textarea></div>
+    <button class="primary-btn">Add template</button>
+  </form></div>
+  <div class="panel"><h3>Group order</h3><p class="muted">Drag to rearrange the section order on grouped pages, then save each list. Sections with no items right now are included, so the order is ready when they appear. \u201cNo project\u201d, \u201cNo type\u201d and friends always stay last; Daily notes stays first.</p>
+  ${GROUPINGS.map((g) => { const vals = groupOrderCandidates(g); return `<h4>${g.label}</h4>
+    <ul data-group-order-list="${g.key}">${vals.map((v) => `<li draggable="true" data-group-order-item="${esc(v)}">\u2630 ${esc(v)}</li>`).join("") || "<li class='muted'>No values yet.</li>"}</ul>
+    <p><button data-group-order-save="${g.key}">Save order</button></p>`; }).join("")}</div>
   <div class="panel"><h3>Custom object types</h3>
   ${types.map((t) => `<p>${esc(t.name)} (${esc(t.slug)}) — ${JSON.parse(t.fields_json ?? "[]").map((f) => `${esc(f.name)} (${esc(f.kind)})`).join(", ") || "no fields"} <button data-custom-tab-toggle="${t.slug}|${t.has_tab ? 0 : 1}">${t.has_tab ? "Remove tab" : "Add tab"}</button></p>`).join("") || "<p class='muted'>No custom types yet.</p>"}
   <form data-create-custom-type class="form"><input name="name" placeholder="Type name (e.g. Book)" required>
@@ -1617,7 +3252,7 @@ function renderCustomTab(slug) {
   }).join("") || "<p class='muted'>Nothing here yet.</p>"}`;
 }
 
-function openCustomPopup(slug, id) {
+function customEditorHtml(slug, id, forPage) {
   const def = state.store.getRow("custom_object_types", slug);
   const row = state.store.getRow("custom_objects", id);
   if (!def || !row) return;
@@ -1631,13 +3266,18 @@ function openCustomPopup(slug, id) {
     if (f.kind === "Yes-No") return `<div class="cf-field"><label><input type="checkbox" name="f:${esc(f.name)}" ${val ? "checked" : ""}>${esc(f.name)}</label></div>`;
     return `<div class="cf-field"><label class="cf-label">${esc(f.name)}</label><input name="f:${esc(f.name)}" value="${esc(val ?? "")}"></div>`;
   };
-  openPopup(row.title, `
-    <form data-edit-custom="${slug}:${id}" class="form popup-form">
+  return `
+    <form data-edit-custom="${slug}:${id}" id="custom-form" class="form popup-form">
       <div class="cf-field"><label class="cf-label">Title</label><input name="title" value="${esc(row.title)}" required></div>
       ${fields.map(fieldInput).join("")}
       <button class="primary-btn">Save</button> <button>Save and close</button>
     </form>
-    <p><button data-archive-custom="${id}">Archive</button> <button data-close-popup>Close</button></p>`, `custom:${slug}:${id}`);
+    ${forPage ? "" : `<p><button data-archive-custom="${id}">Archive</button> <button data-close-popup class="ghost-btn">Close</button></p>`}`;
+}
+
+function openCustomPopup(slug, id) {
+  const __row = state.store.getRow("custom_objects", id);
+  if (__row) openPopup(__row.title, customEditorHtml(slug, id, false), `custom:${slug}:${id}`);
 }
 
 function customFormFields(form, def) {
@@ -1661,6 +3301,17 @@ async function appendDailyLine(date, line) {
 function bindExtraForms() {
   const main = $("#main");
   $$("[data-daily-date]", main).forEach((el) => el.addEventListener("change", () => { state.dailyDate = el.value; render(); }));
+  $$("[data-carry-all]", main).forEach((b) => b.addEventListener("click", () => { const td = todayToronto(); allRows("tasks").filter((t) => !t.archived && !t.done && t.due_date && t.due_date < td).forEach((t) => state.store.updateProps("tasks", t.id, { due_date: td })); render(); saveBytes(); }));
+  $$("[data-push-all]", main).forEach((b) => b.addEventListener("click", () => { const td = todayToronto(); allRows("tasks").filter((t) => !t.archived && !t.done && t.due_date === td).forEach((t) => state.store.updateProps("tasks", t.id, { due_date: ymdAdd(td, 1) })); render(); saveBytes(); }));
+  $$("[data-tpl-add]", main).forEach((f) => f.addEventListener("submit", (e) => { e.preventDefault(); const d = new FormData(f); const name = (d.get("name") || "").trim(); if (!name) return; setTemplates([...getTemplates(), { id: "tpl-" + Date.now().toString(36), kind: d.get("kind") || "note", name, title: (d.get("title") || "").trim(), body: d.get("body") || "" }]); render(); saveBytes(); }));
+  $$("[data-tpl-del]", main).forEach((b) => b.addEventListener("click", () => { setTemplates(getTemplates().filter((t) => t.id !== b.dataset.tplDel)); render(); saveBytes(); }));
+  $$("[data-print-daily]", main).forEach((b) => b.addEventListener("click", () => window.print()));
+  $$("[data-inbox-bulk-toggle]", main).forEach((b) => b.addEventListener("click", () => { state.inboxBulk = !state.inboxBulk; if (!state.inboxBulk) state.inboxSel = new Set(); render(); }));
+  $$("[data-inbox-sel]", main).forEach((c) => c.addEventListener("change", () => { const s = (state.inboxSel ??= new Set()); if (c.checked) s.add(c.dataset.inboxSel); else s.delete(c.dataset.inboxSel); render(); }));
+  $$("[data-inbox-bulk-clear]", main).forEach((b) => b.addEventListener("click", () => { state.inboxSel = new Set(); render(); }));
+  $$("[data-inbox-bulk-archive]", main).forEach((b) => b.addEventListener("click", () => { for (const id of [...(state.inboxSel ?? [])]) state.store.archiveObject("inbox_items", id); state.inboxSel = new Set(); state.inboxBulk = false; render(); saveBytes(); }));
+  $$("[data-inbox-bulk-move]", main).forEach((b) => b.addEventListener("click", () => { for (const id of [...(state.inboxSel ?? [])]) { const item = state.store.getRow("inbox_items", id); if (!item) continue; const note = state.store.createNote({ title: item.title, body: item.body_markdown ?? "" }); state.store.reassignAttachments("inbox_items", id, "notes", note.id); state.store.archiveObject("inbox_items", id); } state.inboxSel = new Set(); state.inboxBulk = false; render(); saveBytes(); }));
+  $$("[data-weather-day]", main).forEach((el) => el.addEventListener("click", () => { const i = Number(el.dataset.weatherDay); state.weatherDay = state.weatherDay === i ? null : i; render(); }));
   $$("[data-daily-jot]", main).forEach((f) => f.addEventListener("submit", async (e) => {
     e.preventDefault();
     const text = (new FormData(f).get("jot") || "").trim();
@@ -1680,8 +3331,15 @@ function bindExtraForms() {
     e.preventDefault();
     const title = (new FormData(f).get("title") || "").trim();
     if (!title) return;
-    state.store.createTask({ title });
+    // Smart quick-add (stamp 2026-11-04w): a due date / priority in
+    // the text ("Pay rent Fri P1") is parsed out of the title.
+    const parsed = parseQuickTask(title);
+    state.store.createTask({ title: parsed.title, due: parsed.due ?? todayToronto(), priority: parsed.priority, project: "General" });
     render(); saveBytes();
+    // Rapid entry (stamp 2026-11-04l): render() rebuilt the dashboard,
+    // so put the cursor straight back in the new quick-add box — Enter,
+    // type, Enter chains without touching the mouse.
+    document.querySelector("[data-dash-task] input[name=title]")?.focus();
   }));
   $$("[data-daily-nav]", main).forEach((f) => f.addEventListener("submit", (e) => e.preventDefault()));
   $$("[data-fv-add]", main).forEach((f) => f.addEventListener("submit", async (e) => {
@@ -1736,6 +3394,43 @@ function bindExtraForms() {
     span.innerHTML = `<input name="fname" placeholder="Field name"><select name="fkind"><option>Text</option><option>Long text</option><option>Date</option><option>Number</option><option>Yes-No</option></select>`;
     wrap.appendChild(span);
   }));
+  $$("[data-group-order-list]", main).forEach((list) => {
+    let dragEl = null;
+    list.addEventListener("dragstart", (e) => {
+      const item = e.target.closest("[data-group-order-item]");
+      if (!item) return;
+      dragEl = item;
+      e.dataTransfer.effectAllowed = "move";
+      try { e.dataTransfer.setData("text/plain", item.dataset.groupOrderItem); } catch {}
+    });
+    list.addEventListener("dragover", (e) => {
+      const item = e.target.closest("[data-group-order-item]");
+      if (!item || item === dragEl) return;
+      e.preventDefault();
+      item.classList.add("drag-over");
+    });
+    list.addEventListener("dragleave", (e) => {
+      const item = e.target.closest("[data-group-order-item]");
+      if (item) item.classList.remove("drag-over");
+    });
+    list.addEventListener("drop", (e) => {
+      e.preventDefault();
+      const item = e.target.closest("[data-group-order-item]");
+      if (dragEl && item && item !== dragEl) {
+        const r = item.getBoundingClientRect();
+        if (e.clientY < r.top + r.height / 2) item.before(dragEl);
+        else item.after(dragEl);
+      } else if (dragEl && !item) {
+        list.appendChild(dragEl);
+      }
+      list.querySelectorAll(".drag-over").forEach((el) => el.classList.remove("drag-over"));
+      dragEl = null;
+    });
+    list.addEventListener("dragend", () => {
+      list.querySelectorAll(".drag-over").forEach((el) => el.classList.remove("drag-over"));
+      dragEl = null;
+    });
+  });
   const orderList = $("[data-tab-order-list]", main);
   if (orderList) {
     let dragId = null;
@@ -1794,8 +3489,7 @@ function bindExtraForms() {
 }
 
 let comboDocBound = false;
-function bindCreateWidgets() {
-  const root = $("#popup-root");
+function bindCreateWidgets(root = $("#popup-root")) {
   $$("[data-combo]", root).forEach((combo) => {
     if (combo.dataset.bound) return; combo.dataset.bound = "1";
     const input = combo.querySelector("[data-combo-input]");
@@ -1882,14 +3576,16 @@ function bindCreateWidgets() {
   }
 }
 
-function bindExtraPopupForms() {
-  bindCreateWidgets();
-  const root0 = $("#popup-root");
+function bindExtraPopupForms(root = $("#popup-root")) {
+  bindCreateWidgets(root);
+  const root0 = root;
   $$("[data-create-task-popup]", root0).forEach((f) => {
     const freq = f.querySelector("[name=freq]");
     freq.addEventListener("change", () => { f.querySelector("[data-weekdays]").hidden = freq.value !== "weekly"; });
     const proj = f.querySelector("[name=project]");
     proj.addEventListener("change", () => { f.querySelector("[name=projectNew]").hidden = proj.value !== "__new__"; });
+    const tpT = f.querySelector("[data-template-pick]");
+    tpT?.addEventListener("change", () => applyTemplateToForm(f, tpT.value));
     f.addEventListener("submit", async (e) => {
       e.preventDefault();
       const d = new FormData(f);
@@ -1902,10 +3598,11 @@ function bindExtraPopupForms() {
       closePopup(); render(); saveBytes();
     });
   });
-  const root = $("#popup-root");
   $$("[data-create-note-popup]", root).forEach((f) => {
     const typeSel = f.querySelector("[name=type]");
     typeSel.addEventListener("change", () => { f.querySelector("[name=typeNew]").hidden = typeSel.value !== "__new__"; });
+    const tpN = f.querySelector("[data-template-pick]");
+    tpN?.addEventListener("change", () => applyTemplateToForm(f, tpN.value));
     f.addEventListener("submit", async (e) => {
       e.preventDefault();
       const d = new FormData(f);
@@ -1923,6 +3620,7 @@ function bindExtraPopupForms() {
     state.store.createPerson({ title: d.get("title"), role: d.get("role") || null });
     closePopup(); render(); saveBytes();
   }));
+  $$("[data-create-reading-popup]", root).forEach((f) => bindLinkTitle(f));
   $$("[data-create-reading-popup]", root).forEach((f) => f.addEventListener("submit", async (e) => {
     e.preventDefault();
     const d = new FormData(f);
@@ -1957,6 +3655,10 @@ function attachExtraListeners() {
     if (pageBack) { state.itemView = null; render(); return; }
     const fullSync = e.target.closest("[data-full-sync]");
     if (fullSync) { await doFullSync(); return; }
+    const exportBtn = e.target.closest("[data-export-db]");
+    if (exportBtn) { await exportDb(); return; }
+    const exportMdBtn = e.target.closest("[data-export-md]");
+    if (exportMdBtn) { exportMarkdown(); return; }
     const tokSave = e.target.closest("[data-token-save]");
     if (tokSave) {
       const card = tokSave.closest(".token-card");
@@ -1973,6 +3675,22 @@ function attachExtraListeners() {
       render(); saveBytes();
       return;
     }
+    const remToggle = e.target.closest("[data-reminder-toggle]");
+    if (remToggle) {
+      const turnOn = state.store.getRow("ui_prefs", "reminders")?.value === "off";
+      setRemindersPref(turnOn);
+      if (turnOn) {
+        try {
+          const perm = await withTimeout(NativeNotify.checkPermissions(), 5000, "notify.check").catch(() => null);
+          if (perm && perm.display !== "granted") await withTimeout(NativeNotify.requestPermissions(), 8000, "notify.request").catch(() => null);
+        } catch { /* best-effort */ }
+        await scheduleReminders();
+      } else {
+        await cancelAllReminders();
+      }
+      render(); saveBytes();
+      return;
+    }
     const pageEdit = e.target.closest("[data-page-edit]");
     if (pageEdit) {
       const v = parsePageRef(pageEdit.dataset.pageEdit);
@@ -1985,19 +3703,13 @@ function attachExtraListeners() {
     const pageArch = e.target.closest("[data-page-archive]");
     if (pageArch) {
       const v = parsePageRef(pageArch.dataset.pageArchive);
-      state.store.archiveObject(v.type === "custom" ? "custom_objects" : v.type, v.id);
+      archiveWithUndo(v.type === "custom" ? "custom_objects" : v.type, v.id);
       state.itemView = null; render(); saveBytes(); return;
     }
     const pageMove = e.target.closest("[data-page-move]");
     if (pageMove) {
       const item = state.store.getRow("inbox_items", pageMove.dataset.pageMove);
-      if (item) {
-        state.engine.txn(() => {
-          state.store.createNote({ title: item.title || (item.body_markdown ?? "").split("\n")[0].slice(0, 60), body: item.body_markdown ?? "" });
-          state.store.archiveObject("inbox_items", item.id);
-        });
-        saveBytes();
-      }
+      if (item) { openMoveCategoryPrompt(item, "page"); return; }
       state.itemView = null; render(); return;
     }
     const newPersonBtn = e.target.closest("[data-new-person]");
@@ -2010,6 +3722,39 @@ function attachExtraListeners() {
     if (newNoteBtn) { openNoteCreatePopup(); return; }
     const newTaskBtn = e.target.closest("[data-new-task]");
     if (newTaskBtn) { openTaskCreatePopup(); return; }
+    const bulkToggle = e.target.closest("[data-bulk-toggle]");
+    if (bulkToggle) { state.bulkMode = !state.bulkMode; if (!state.bulkMode) state.bulkSelected = new Set(); render(); return; }
+    const bulkSel = e.target.closest("[data-bulk-select]");
+    if (bulkSel) {
+      state.bulkSelected = state.bulkSelected || new Set();
+      if (bulkSel.checked) state.bulkSelected.add(bulkSel.dataset.bulkSelect); else state.bulkSelected.delete(bulkSel.dataset.bulkSelect);
+      render();
+      return;
+    }
+    const bulkAct = e.target.closest("[data-bulk-action]");
+    if (bulkAct) {
+      const action = bulkAct.dataset.bulkAction;
+      const today = todayToronto();
+      for (const id of [...(state.bulkSelected ?? [])]) {
+        try {
+          if (action === "complete") state.store.completeTask(id, today);
+          else if (action === "archive") state.store.archiveObject("tasks", id);
+          else if (action === "postpone") {
+            const t = state.store.getRow("tasks", id);
+            if (t) {
+              const baseStr = t.due_date && t.due_date > today ? t.due_date : today;
+              const d = new Date(baseStr + "T12:00:00");
+              d.setDate(d.getDate() + 1);
+              state.store.updateProps("tasks", id, { due_date: d.toISOString().slice(0, 10) });
+            }
+          }
+        } catch {}
+      }
+      state.bulkSelected = new Set();
+      if (action !== "clear") state.bulkMode = false;
+      render(); saveBytes();
+      return;
+    }
     const filterBtn = e.target.closest("[data-tasks-filter]");
     if (filterBtn) { state.tasksFilter = filterBtn.dataset.tasksFilter; render(); return; }
     const dailyGo = e.target.closest("[data-daily-go]");
@@ -2020,6 +3765,15 @@ function attachExtraListeners() {
     }
     const dailyTabBtn = e.target.closest("[data-daily-tab]");
     if (dailyTabBtn) { state.tab = "daily"; saveTab(); render(); return; }
+    const groupOrderSave = e.target.closest("[data-group-order-save]");
+    if (groupOrderSave) {
+      const key = groupOrderSave.dataset.groupOrderSave;
+      const list = document.querySelector(`[data-group-order-list="${key}"]`);
+      const order = list ? [...list.querySelectorAll("[data-group-order-item]")].map((el) => el.dataset.groupOrderItem) : [];
+      state.store.setGroupOrder(key, order);
+      render(); saveBytes();
+      return;
+    }
     const tabOrderSave = e.target.closest("[data-tab-order-save]");
     if (tabOrderSave) {
       const order = $$("[data-tab-order-item]").map((el) => el.dataset.tabOrderItem);
@@ -2051,11 +3805,30 @@ function attachExtraListeners() {
       render();
       return;
     }
+    const snoozeBtn = e.target.closest("[data-snooze-days]");
+    if (snoozeBtn) {
+      const t = state.store.getRow("tasks", snoozeBtn.dataset.snoozeTask);
+      if (t) {
+        const today = todayToronto();
+        const baseStr = t.due_date && t.due_date > today ? t.due_date : today;
+        const d = new Date(baseStr + "T12:00:00");
+        d.setDate(d.getDate() + parseInt(snoozeBtn.dataset.snoozeDays, 10));
+        state.store.updateProps("tasks", t.id, { due_date: d.toISOString().slice(0, 10) });
+      }
+      render(); saveBytes();
+      return;
+    }
+    const carryToday = e.target.closest("[data-carry-today]");
+    if (carryToday) {
+      state.store.updateProps("tasks", carryToday.dataset.carryToday, { due_date: todayToronto() });
+      render(); saveBytes();
+      return;
+    }
     const createDaily = e.target.closest("[data-create-daily]");
     if (createDaily) {
       const date = createDaily.dataset.createDaily;
-      const note = state.store.createNote({ title: date, date });
-      render(); saveBytes(); openNotePopup(note.id);
+      state.store.createNote({ title: date, date });
+      render(); saveBytes();
       return;
     }
     const fvDel = e.target.closest("[data-fv-delete]");
@@ -2112,7 +3885,7 @@ function attachExtraListeners() {
   $("#popup-root").addEventListener("click", async (e) => {
     const arch = e.target.closest("[data-archive-custom]");
     if (arch) {
-      state.store.archiveObject("custom_objects", arch.dataset.archiveCustom);
+      archiveWithUndo("custom_objects", arch.dataset.archiveCustom);
       closePopup(); render(); saveBytes();
       return;
     }

@@ -72,3 +72,16 @@ CREATE TABLE IF NOT EXISTS sync_conflicts (
   client_change_id TEXT, table_name TEXT, row_id TEXT,
   server_row_json TEXT, created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS attachments (
+  id TEXT PRIMARY KEY,
+  owner_type TEXT NOT NULL,
+  owner_id TEXT NOT NULL,
+  mime TEXT NOT NULL,
+  data TEXT NOT NULL,
+  name TEXT,
+  created_at TEXT,
+  updated_at TEXT,
+  archived INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_attachments_owner ON attachments(owner_type, owner_id);

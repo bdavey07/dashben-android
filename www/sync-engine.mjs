@@ -9,7 +9,7 @@
 export const SYNC_TABLES = [
   "notes", "tasks", "people", "reading_items", "inbox_items", "projects",
   "custom_objects", "custom_object_types", "relations", "object_tags",
-  "tag_vocab", "field_values", "ui_prefs",
+  "tag_vocab", "field_values", "ui_prefs", "attachments",
 ];
 
 export const TABLE_COLUMNS = {
@@ -26,6 +26,7 @@ export const TABLE_COLUMNS = {
   tag_vocab: ["id", "scope", "name"],
   field_values: ["object_type", "field", "value"],
   ui_prefs: ["key", "value", "updated_at"],
+  attachments: ["id", "owner_type", "owner_id", "mime", "data", "name", "created_at", "updated_at", "archived"],
 };
 
 const COMPOSITE = new Set(["relations", "object_tags", "field_values"]);
