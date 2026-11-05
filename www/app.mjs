@@ -936,9 +936,13 @@ function bodyFieldHtml(table, id, body, version) {
 function subtaskBlock(table, id, subtasksJson) {
   let subs = [];
   try { subs = JSON.parse(subtasksJson ?? "[]"); } catch { subs = []; }
+  // Checked-off subtasks list first (in the order they were checked —
+  // the stored order of the done group), then the open ones in the
+  // order they were added (Ben, Nov 5 2026).
+  const ordered = [...subs.filter((s) => s.done), ...subs.filter((s) => !s.done)];
   return `<h4>Subtasks</h4>
     <div data-sub-list>
-      ${subs.map((s) => `<div class="row" data-sub-row="${s.id}" draggable="true"><span class="sub-grip" aria-hidden="true">⠿</span><input type="checkbox" ${s.done ? "checked" : ""}><span data-sub-text>${esc(s.text)}</span><button type="button" data-sub-del aria-label="Delete subtask">×</button></div>`).join("") || "<p class='muted'>No subtasks.</p>"}
+      ${ordered.map((s) => `<div class="row" data-sub-row="${s.id}" draggable="true"><span class="sub-grip" aria-hidden="true">⠿</span><input type="checkbox" ${s.done ? "checked" : ""}><span data-sub-text>${esc(s.text)}</span><button type="button" data-sub-del aria-label="Delete subtask">×</button></div>`).join("") || "<p class='muted'>No subtasks.</p>"}
     </div>
     <div class="inline-add"><input data-sub-new placeholder="New subtask"><button type="button" data-add-sub-btn>Add</button></div>`;
 }
@@ -2811,6 +2815,16 @@ function bindPopupForms(root = $("#popup-root")) {
       const row = e.target.closest("[data-sub-row]");
       if (!row || e.target.type !== "checkbox") return;
       if (Date.now() < subDragSuppressUntil) return;
+      // Checked-off subtasks rise to the top, in check order: a tick
+      // moves the row to the end of the done block; an untick sends it
+      // to the bottom of the open ones (Ben, Nov 5 2026).
+      const list = row.parentElement;
+      if (list) {
+        if (e.target.checked) {
+          const doneRows = [...list.querySelectorAll("[data-sub-row]")].filter((r) => r !== row && r.querySelector("input")?.checked);
+          if (doneRows.length) doneRows[doneRows.length - 1].after(row); else list.prepend(row);
+        } else list.append(row);
+      }
       const form = row.closest("form");
       if (form) persistSubtasks(form);
     });
@@ -2976,6 +2990,16 @@ function bindPopupForms(root = $("#popup-root")) {
       const row = e.target.closest("[data-sub-row]");
       if (!row || e.target.type !== "checkbox") return;
       if (Date.now() < subDragSuppressUntil) return;
+      // Checked-off subtasks rise to the top, in check order: a tick
+      // moves the row to the end of the done block; an untick sends it
+      // to the bottom of the open ones (Ben, Nov 5 2026).
+      const list = row.parentElement;
+      if (list) {
+        if (e.target.checked) {
+          const doneRows = [...list.querySelectorAll("[data-sub-row]")].filter((r) => r !== row && r.querySelector("input")?.checked);
+          if (doneRows.length) doneRows[doneRows.length - 1].after(row); else list.prepend(row);
+        } else list.append(row);
+      }
       const form = row.closest("form");
       if (form) persistSubtasks(form);
     });
