@@ -604,6 +604,20 @@ export class LocalStore {
     try { const v = JSON.parse(raw); return Array.isArray(v) ? v : null; } catch { return null; }
   }
 
+  // Feed read state (stamp dp): {links: [...opened story links, newest
+  // last...], open: <ms epoch of the last Feed visit>}. Synced via
+  // ui_prefs so read state follows Ben across phone and web.
+  getFeedSeen() {
+    const raw = this.getRow("ui_prefs", "feed_seen")?.value;
+    if (!raw) return { links: [], open: 0 };
+    try { const v = JSON.parse(raw); return { links: Array.isArray(v?.links) ? v.links : [], open: Number(v?.open) || 0 }; } catch { return { links: [], open: 0 }; }
+  }
+
+  setFeedSeen(seen) {
+    const ts = new Date().toISOString();
+    this.engine.localWrite("ui_prefs", { key: "feed_seen", value: JSON.stringify(seen), updated_at: ts }, { baseUpdatedAt: this.getRow("ui_prefs", "feed_seen")?.updated_at ?? null });
+  }
+
   setFeedSources(list) {
     const ts = new Date().toISOString();
     this.engine.localWrite("ui_prefs", { key: "feed_sources", value: list ? JSON.stringify(list) : "", updated_at: ts }, { baseUpdatedAt: this.getRow("ui_prefs", "feed_sources")?.updated_at ?? null });

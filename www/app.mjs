@@ -512,6 +512,7 @@ async function doSync() {
   saveBytes();
   if (typeof window !== "undefined") window.__dashbenAfterSync?.();
   loadFamilyCalendar();
+  loadFeed();
   if (state.feedReload) { state.feedReload = false; loadFeed(true); }
 }
 
@@ -622,7 +623,7 @@ function statusLine() {
 
 // --- Queries (local only) ---
 function openTasks() {
-  return state.db.prepare("SELECT * FROM tasks WHERE archived=0 AND done=0 ORDER BY (due_date IS NULL), due_date, (created_at IS NULL), created_at").all(); // stamp cy: within a due date, oldest-added first (was title/alphabetical) — new tasks land at the bottom of Dashboard + Daily lists
+  return state.db.prepare("SELECT * FROM tasks WHERE archived=0 AND done=0 ORDER BY (due_date IS NULL), due_date, (created_at IS NULL), created_at").all(); // within a due date, oldest-added first (was title/alphabetical) — new tasks land at the bottom of Dashboard + Daily lists
 }
 function doneTasks() {
   return state.db.prepare("SELECT * FROM tasks WHERE archived=0 AND done=1 ORDER BY updated_at DESC LIMIT 50").all();
@@ -1444,8 +1445,38 @@ async function loadFamilyCalendar(force = false) {
 // category views over it, and edits the source list into the synced
 // ui_prefs 'feed_sources' row (store.getFeedSources/setFeedSources).
 function feedSeed() {
-  if (!state.feed) state.feed = { status: "idle", items: [], sources: [], errors: [], fetchedAt: 0, category: "All", loading: false };
+  if (!state.feed) state.feed = { status: "idle", items: [], sources: [], errors: [], fetchedAt: 0, category: "All", loading: false, seen: null, lastOpen: 0, prevOpen: null };
   return state.feed;
+}
+
+// Stamp dp: feed read state. The seen set + last-visit stamp live in the
+// synced ui_prefs row "feed_seen", so reading on one device dims the
+// story everywhere.
+function feedSeenSet() {
+  const f = feedSeed();
+  if (!f.seen) { const sv = state.store.getFeedSeen(); f.seen = new Set(sv.links); f.lastOpen = sv.open || 0; }
+  return f.seen;
+}
+function persistFeedSeen() {
+  const f = feedSeed();
+  state.store.setFeedSeen({ links: [...(f.seen ?? [])].slice(-400), open: f.lastOpen ?? 0 });
+  saveBytes();
+}
+function feedNewCount() {
+  const f = feedSeed(); feedSeenSet();
+  if (!f.items.length || !f.lastOpen) return 0;
+  return f.items.filter((i) => i.published && Date.parse(i.published) > f.lastOpen && !f.seen.has(i.link)).length;
+}
+function updateFeedBadge() {
+  const n = feedNewCount();
+  const place = (host, cls) => {
+    if (!host) return;
+    let b = host.querySelector("." + cls);
+    if (n > 0) { if (!b && typeof document.createElement === "function") { b = document.createElement("span"); b.className = cls; host.appendChild(b); } if (b) b.textContent = String(n); }
+    else if (b) b.remove();
+  };
+  place(document.querySelector('[data-tab="feed"]'), "tab-badge");
+  place($("#feed-btn"), "feed-badge");
 }
 
 function feedAgo(iso) {
@@ -1469,6 +1500,7 @@ async function loadFeed(force = false) {
     if (!res.ok) throw new Error(`feed -> ${res.status}`);
     const data = await res.json();
     state.feed = { ...f, status: "ok", items: data.items ?? [], sources: data.sources ?? [], errors: data.errors ?? [], fetchedAt: Date.now(), loading: false };
+    updateFeedBadge();
   } catch {
     f.loading = false;
     f.status = f.items.length ? "stale" : "error";
@@ -1479,13 +1511,28 @@ async function loadFeed(force = false) {
 function renderFeed() {
   const f = feedSeed();
   if (f.status === "idle") loadFeed();
+  // Stamp dp: visiting stamps lastOpen; the divider + badge math use the
+  // PREVIOUS visit's stamp, kept in prevOpen for the whole session.
+  feedSeenSet();
+  if (f.prevOpen === null || f.prevOpen === undefined) { f.prevOpen = f.lastOpen; f.lastOpen = Date.now(); persistFeedSeen(); updateFeedBadge(); }
   const cats = ["All", ...new Set(f.sources.map((x) => x.category))];
   if (!cats.includes(f.category)) f.category = "All";
   const items = f.category === "All" ? f.items : f.items.filter((i) => i.category === f.category);
+  const savedUrls = new Set(allRows("reading_items").filter((r) => !r.archived && r.url).map((r) => r.url));
+  let rowsHtml = "";
+  let sawNew = false; let broke = false;
+  for (const i of items) {
+    const ix = f.items.indexOf(i);
+    const isNew = f.prevOpen && i.published && Date.parse(i.published) > f.prevOpen;
+    if (isNew) sawNew = true;
+    if (!broke && sawNew && !isNew) { rowsHtml += `<div class="feed-divider"><span>Older — from before your last visit</span></div>`; broke = true; }
+    const saved = savedUrls.has(i.link);
+    rowsHtml += `<div class="feed-row${f.seen.has(i.link) ? " feed-read" : ""}"><div class="feed-meta"><span class="badge">${esc(i.source)}</span><span class="muted">${esc(i.category)}${i.published ? ` · ${feedAgo(i.published)}` : ""}</span><span class="feed-acts">${saved ? `<span class="feed-saved">Saved ✓</span>` : `<button data-feed-save="${ix}" class="ghost-btn feed-save">Save</button>`}</span></div><a class="feed-title" data-feed-open="${ix}" href="${esc(i.link)}" target="_blank" rel="noopener">${esc(i.title)}</a>${i.summary ? `<p class="feed-sum">${esc(i.summary)}</p>` : ""}</div>`;
+  }
   return `<div class="feed-head"><div class="feed-chips">${cats.map((c) => `<button data-feed-cat="${esc(c)}" class="chip${c === f.category ? " chip-on" : ""}">${esc(c)}</button>`).join("")}</div><div class="feed-actions"><button data-feed-sources class="ghost-btn">Sources</button> <button data-feed-refresh class="ghost-btn">Refresh</button></div></div>
-  ${f.status === "error" ? `<div class="panel"><p>Couldn't load the feed. <button data-feed-refresh class="ghost-btn">Retry</button></p></div>` : (f.status === "idle" || (f.loading && !f.items.length)) ? "<p class='muted'>Loading the river\\u2026</p>" : items.map((i) => `<div class="feed-row"><div class="feed-meta"><span class="badge">${esc(i.source)}</span><span class="muted">${esc(i.category)}${i.published ? ` \\u00b7 ${feedAgo(i.published)}` : ""}</span></div><a class="feed-title" href="${esc(i.link)}" target="_blank" rel="noopener">${esc(i.title)}</a>${i.summary ? `<p class="feed-sum">${esc(i.summary)}</p>` : ""}</div>`).join("") || "<p class='muted'>Nothing in this view yet.</p>"}
+  ${f.status === "error" ? `<div class="panel"><p>Couldn't load the feed. <button data-feed-refresh class="ghost-btn">Retry</button></p></div>` : (f.status === "idle" || (f.loading && !f.items.length)) ? "<p class='muted'>Loading the river…</p>" : rowsHtml || "<p class='muted'>Nothing in this view yet.</p>"}
   ${f.errors?.length ? `<p class="muted">Couldn't fetch: ${f.errors.map((e) => esc(e.source)).join(", ")}</p>` : ""}
-  ${f.fetchedAt ? `<p class="muted">Updated ${feedAgo(new Date(f.fetchedAt).toISOString())}${f.status === "stale" ? " \\u00b7 showing the last good copy" : ""}</p>` : ""}`;
+  ${f.fetchedAt ? `<p class="muted">Updated ${feedAgo(new Date(f.fetchedAt).toISOString())}${f.status === "stale" ? " · showing the last good copy" : ""}</p>` : ""}`;
 }
 
 // The working source list for the editor: Ben's saved list when one
@@ -4637,6 +4684,10 @@ function attachExtraListeners() {
     }, true);
   }
   $("#main").addEventListener("click", async (e) => {
+    const feedSave = e.target.closest("[data-feed-save]");
+    if (feedSave) { const it = feedSeed().items[Number(feedSave.dataset.feedSave)]; if (it) { state.store.createReading({ title: it.title, url: it.link }); state.searchDirty = true; showToast("Saved to Reading"); render(); saveBytes(); } return; }
+    const feedOpen = e.target.closest("[data-feed-open]");
+    if (feedOpen) { const it = feedSeed().items[Number(feedOpen.dataset.feedOpen)]; if (it && !feedSeenSet().has(it.link)) { feedSeenSet().add(it.link); persistFeedSeen(); updateFeedBadge(); } }
     const feedCat = e.target.closest("[data-feed-cat]");
     if (feedCat) { feedSeed().category = feedCat.dataset.feedCat; render(); return; }
     if (e.target.closest("[data-feed-refresh]")) { loadFeed(true); return; }

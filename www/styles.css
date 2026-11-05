@@ -585,3 +585,14 @@ body.boot-faded #main { animation: bootfade 160ms ease-out; }
 /* Stamp do: header feed shortcut (mobile quick access to the river). */
 #feed-btn svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 1.8; display: block; }
 #feed-btn.on { color: var(--primary-light); border-color: var(--primary); }
+
+/* Stamp dp: feed read state, save-to-Reading, new-since divider, badges. */
+.feed-read { opacity: .55; }
+.feed-read .feed-title { font-weight: 400; }
+.feed-acts { margin-left: auto; display: inline-flex; align-items: center; }
+.feed-save { padding: 2px 10px; min-height: 30px; }
+.feed-saved { color: var(--muted); font-size: 12.5px; }
+.feed-divider { display: flex; align-items: center; gap: 10px; margin: 16px 0 6px; color: var(--muted); font-size: 12.5px; }
+.feed-divider::before, .feed-divider::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
+#feed-btn { position: relative; }
+.feed-badge { position: absolute; top: -5px; right: -5px; background: var(--danger); color: #fff; border-radius: 999px; font-size: 10.5px; line-height: 1.5; padding: 0 5px; pointer-events: none; }
