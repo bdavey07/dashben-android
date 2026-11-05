@@ -3904,10 +3904,10 @@ function renderManagement() {
   ${sec("vocab", "Vocabularies", `${MANAGED_FIELD_LIST.length} fields \u00b7 ${allTags.length} tags`, `
   <p class="muted">Selectable values for every field. Renaming a value renames it on every row using it; deleting a value that is in use is blocked.</p>
   ${MANAGED_FIELD_LIST.map(([ot, f]) => `<h4 class="mgmt-sub">${ot}.${f}</h4>
-    ${vocabValues(ot, f).map((v) => `<form data-fv-rename class="form inline mgmt-vrow"><input type="hidden" name="objectType" value="${ot}"><input type="hidden" name="field" value="${f}"><input type="hidden" name="old" value="${esc(v)}"><input name="new" value="${esc(v)}"><button>Rename</button><button type="button" data-fv-delete="${ot}|${f}|${esc(v)}">Delete</button></form>`).join("")}
+    ${vocabValues(ot, f).map((v) => `<form data-fv-rename class="form inline mgmt-vrow"><input type="hidden" name="objectType" value="${ot}"><input type="hidden" name="field" value="${f}"><input type="hidden" name="old" value="${esc(v)}"><span class="mgmt-vname">${esc(v)}</span><input name="new" value="${esc(v)}"><button type="button" class="vrow-edit ghost-btn" data-vrow-edit>Edit</button><button class="vrow-save primary-btn">Save</button><button type="button" class="vrow-cancel ghost-btn" data-vrow-cancel>Cancel</button><button type="button" class="vrow-del ghost-btn" data-fv-delete="${ot}|${f}|${esc(v)}">Delete</button></form>`).join("")}
     <form data-fv-add class="form inline mgmt-vrow"><input type="hidden" name="objectType" value="${ot}"><input type="hidden" name="field" value="${f}"><input name="value" placeholder="New value"><button>Add</button></form>`).join("")}
   <h4 class="mgmt-sub">Tags</h4><p class="muted">Renaming a tag renames it on every item using it; deleting removes it from every item using it.</p>
-  ${allTags.map((t) => `<form data-tag-rename class="form inline mgmt-vrow"><input type="hidden" name="old" value="${esc(t)}"><input name="new" value="${esc(t)}"><button>Rename</button><button type="button" data-tag-delete="${esc(t)}">Delete</button></form>`).join("") || "<p class='muted'>No tags yet.</p>"}`)}
+  ${allTags.map((t) => `<form data-tag-rename class="form inline mgmt-vrow"><input type="hidden" name="old" value="${esc(t)}"><span class="mgmt-vname">${esc(t)}</span><input name="new" value="${esc(t)}"><button type="button" class="vrow-edit ghost-btn" data-vrow-edit>Edit</button><button class="vrow-save primary-btn">Save</button><button type="button" class="vrow-cancel ghost-btn" data-vrow-cancel>Cancel</button><button type="button" class="vrow-del ghost-btn" data-tag-delete="${esc(t)}">Delete</button></form>`).join("") || "<p class='muted'>No tags yet.</p>"}`)}
   ${sec("templates", "Templates", `${getTemplates().length} saved`, `
   <p class="muted">Prefilled skeletons offered in the New task / New note forms. Stored in the app and synced like everything else.</p>
   ${getTemplates().map((t) => `<p class="tpl-row"><strong>${esc(t.name)}</strong> <span class="muted">${esc(t.kind)}</span> <button data-tpl-del="${t.id}" class="ghost-btn">Delete</button></p>`).join("") || "<p class='muted'>No templates yet.</p>"}
@@ -4358,6 +4358,12 @@ function attachExtraListeners() {
   const mainEl = $("#main");
   if (!mainEl.dataset.mgmtBound) {
     mainEl.dataset.mgmtBound = "1";
+    mainEl.addEventListener("click", (e) => {
+      const ed = e.target.closest("[data-vrow-edit]");
+      if (ed) { const row = ed.closest(".mgmt-vrow"); row?.classList.add("editing"); row?.querySelector("[name=new]")?.focus(); return; }
+      const cx = e.target.closest("[data-vrow-cancel]");
+      if (cx) { const row = cx.closest(".mgmt-vrow"); if (row) { row.classList.remove("editing"); const inp = row.querySelector("[name=new]"); const old = row.querySelector("[name=old]"); if (inp && old) inp.value = old.value; } }
+    });
     mainEl.addEventListener("toggle", (e) => {
       const d = e.target?.closest?.("[data-mgmt-sec]");
       if (!d) return;
