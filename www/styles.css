@@ -512,3 +512,8 @@ body.boot-faded #main { animation: bootfade 160ms ease-out; }
 .parse-chips { display: none; flex-basis: 100%; gap: 6px; flex-wrap: wrap; }
 .pchip { display: inline-flex; align-items: center; gap: 6px; background: rgba(127, 135, 160, .12); border: 1px solid var(--line); border-radius: 999px; padding: 2px 4px 2px 10px; font-size: 12px; }
 .pchip button { border: none; background: none; color: inherit; opacity: .65; min-height: 0; padding: 0 6px; font-size: 14px; line-height: 1.4; cursor: pointer; }
+
+/* Stamp da: recurrence weekday expandable. */
+[data-rec-days] { margin-top: 6px; }
+[data-rec-days] label { margin-right: 10px; white-space: nowrap; }
+[data-rec-days-toggle] { margin-top: 6px; }

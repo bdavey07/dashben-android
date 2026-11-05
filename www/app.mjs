@@ -953,6 +953,9 @@ function recurrenceForm(row) {
   const { rule } = parseRecurrence(row.recurrence ?? "");
   const freq = rule?.freq ?? "";
   const weekdays = rule?.weekdays ?? [1, 2, 3, 4, 5];
+  const dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const selDays = dayNames.filter((_, i) => weekdays.includes(i));
+  const weekdaySummary = !selDays.length ? "none" : selDays.length === 7 ? "every day" : selDays.join(" ");
   return `<h4>Repeats</h4>
     <div class="cf-box">
       <div class="cf-row">
@@ -960,7 +963,8 @@ function recurrenceForm(row) {
         <div class="cf-field"><label class="cf-label">Every</label><input type="number" name="interval" value="${rule?.interval ?? 1}" min="1"></div>
         <div class="cf-field"><label class="cf-label">Ends</label><input type="date" name="end" value="${rule?.endDate ?? ""}"></div>
       </div>
-      <div data-rec-weekdays ${freq !== "weekly" ? "hidden" : ""}>Weekdays: ${["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((d, i) => `<label><input type="checkbox" name="wd" value="${i}" ${weekdays.includes(i) ? "checked" : ""}>${d}</label>`).join(" ")}</div>
+      <div data-rec-weekdays ${freq !== "weekly" ? "hidden" : ""}><button type="button" class="ghost-btn" data-rec-days-toggle aria-expanded="false">Weekdays: ${weekdaySummary} \u25b8</button>
+      <div data-rec-days hidden>${dayNames.map((d, i) => `<label><input type="checkbox" name="wd" value="${i}" ${weekdays.includes(i) ? "checked" : ""}>${d}</label>`).join(" ")}</div></div>
     </div>
     ${rule ? `<p class="muted">${esc(recurrenceSummary(rule))}</p><p><button type="button" data-skip="${row.id}">Skip occurrence</button> <button type="button" data-stop="${row.id}">Stop recurring</button></p>` : ""}`;
 }
@@ -1037,11 +1041,8 @@ function taskEditorHtml(id, forPage) {
             <p data-combo-empty hidden style="padding:8px 12px" class="muted">No matches.</p>
           </div>
         </div></div>
-      ${recurrenceForm(t)}
-      <h4>Tags</h4>${tagsForm("tasks", id)}
-      <h4>Body</h4>${bodyFieldHtml("tasks", id, t.body_markdown, t.body_version)}
+      ${parent ? `<p class="muted">Parent: <span class="row-title" data-open="tasks:${parent.id}">${esc(parent.title)}</span></p>` : ""}
       ${subtaskBlock("tasks", id, t.subtasks)}
-    </form>
     <h4>Linked subtasks</h4>
     ${children.map((c) => `<div class="row"><span class="row-title" data-open="tasks:${c.id}">${esc(c.row.title)}</span></div>`).join("") || "<p class='muted'>No linked subtasks yet.</p>"}
     ${linkOptions.length ? `<div data-link-subtask-wrap class="inline-add">
@@ -1055,7 +1056,10 @@ function taskEditorHtml(id, forPage) {
       </div>
       <button type="button" data-link-subtask="${t.id}">Link</button>
     </div>` : ""}
-    ${parent ? `<p class="muted">Parent: <span class="row-title" data-open="tasks:${parent.id}">${esc(parent.title)}</span></p>` : ""}
+      <h4>Body</h4>${bodyFieldHtml("tasks", id, t.body_markdown, t.body_version)}
+      ${recurrenceForm(t)}
+      <h4>Tags</h4>${tagsForm("tasks", id)}
+    </form>
     ${linksBlock("tasks", id)}
     ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Close</button><button data-duplicate-task="${t.id}" class="ghost-btn">Duplicate</button><button data-archive-task="${t.id}" class="danger-btn">Archive task</button></p>`}`;
 }
@@ -2544,6 +2548,18 @@ function bindPopupForms(root = $("#popup-root")) {
   bindMdEditors(root);
   // Subtask ticks and deletes persist immediately (delegated once: the
   // popup root element survives popup re-renders, its content does not).
+  if (!root.dataset.recDaysBound) {
+    root.dataset.recDaysBound = "1";
+    root.addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-rec-days-toggle]");
+      if (!btn) return;
+      const box = btn.parentElement?.querySelector("[data-rec-days]");
+      if (!box) return;
+      box.hidden = !box.hidden;
+      btn.setAttribute("aria-expanded", String(!box.hidden));
+      btn.textContent = btn.textContent.replace(box.hidden ? "\u25be" : "\u25b8", box.hidden ? "\u25b8" : "\u25be");
+    });
+  }
   if (!root.dataset.subDelegated) {
     root.dataset.subDelegated = "1";
     let subDragSuppressUntil = 0;
