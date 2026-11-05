@@ -1157,7 +1157,7 @@ function readingEditorHtml(id, forPage) {
       <h4>Notes</h4>${bodyFieldHtml("reading_items", id, r.body_markdown, r.body_version)}
     </form>
     ${linksBlock("reading_items", id)}
-    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Close</button><button data-archive-reading="${r.id}" class="danger-btn">Archive item</button></p>`}`;
+    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Close</button><button data-send-tony="reading_items:${r.id}" class="ghost-btn">Send to Tony</button><button data-archive-reading="${r.id}" class="danger-btn">Archive item</button></p>`}`;
 }
 
 function openReadingPopup(id) {
@@ -1234,7 +1234,7 @@ function pageSubtasks(subtasksJson) {
     ${subs.map((x) => `<div class="row"><input type="checkbox" disabled ${x.done ? "checked" : ""}><span>${esc(x.text)}</span></div>`).join("") || "<p class='muted'>No subtasks.</p>"}`;
 }
 function pageActions(view, extra) {
-  return `<div class="page-actions"><button data-page-back class="ghost-btn">Back</button>${extra || ""}${view.type === "tasks" ? `<button data-send-tony="tasks:${view.id}" class="ghost-btn">Send to Tony</button><button data-duplicate-task="${view.id}" class="ghost-btn">Duplicate</button>` : view.type === "notes" ? `<button data-share-tony="notes:${view.id}" class="ghost-btn">Share with Tony</button><button data-duplicate-note="${view.id}" class="ghost-btn">Duplicate</button>` : ""}<button data-pin-toggle="${viewRef(view)}" class="ghost-btn">${isPinned(viewRef(view)) ? "Unpin" : "Pin"}</button><button data-md-download="${viewRef(view)}" class="ghost-btn">Download .md</button><button data-page-archive="${viewRef(view)}" class="danger-btn">Archive</button></div>`;
+  return `<div class="page-actions"><button data-page-back class="ghost-btn">Back</button>${extra || ""}${view.type === "tasks" ? `<button data-send-tony="tasks:${view.id}" class="ghost-btn">Send to Tony</button><button data-duplicate-task="${view.id}" class="ghost-btn">Duplicate</button>` : view.type === "notes" ? `<button data-share-tony="notes:${view.id}" class="ghost-btn">Share with Tony</button><button data-duplicate-note="${view.id}" class="ghost-btn">Duplicate</button>` : view.type === "reading_items" ? `<button data-send-tony="reading_items:${view.id}" class="ghost-btn">Send to Tony</button>` : ""}<button data-pin-toggle="${viewRef(view)}" class="ghost-btn">${isPinned(viewRef(view)) ? "Unpin" : "Pin"}</button><button data-md-download="${viewRef(view)}" class="ghost-btn">Download .md</button><button data-page-archive="${viewRef(view)}" class="danger-btn">Archive</button></div>`;
 }
 function renderItemPage(view) {
   const { type, id, slug } = view;
@@ -2488,7 +2488,7 @@ function refreshOpenPopup() {
 
 
 // --- Send to Tony (stamp dw) -------------------------------------------
-// Tasks and inbox items can be handed to Tony: a snapshot is appended
+// Tasks, inbox items and reading items can be handed to Tony: a snapshot is appended
 // to the synced ui_prefs queue "tony_outbox" (a poller on Tony's side
 // drains it into the Sent to Tony chat), and the item is archived out
 // of Ben's PKM with an Undo that also pulls the queue entry back.
@@ -2504,6 +2504,7 @@ function queueForTony(kind, row) {
   const entry = { qid: "q" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8), kind, title: row.title ?? "", body: row.body_markdown ?? "", queued_at: new Date().toISOString(), meta: {} };
   if (kind === "task") entry.meta = { due: row.due_date ?? "", priority: row.priority ?? "", project: row.project ?? "", subtasks: row.subtasks ?? "" };
   if (kind === "note") entry.meta = { date: row.date ?? "", type: row.type ?? "" };
+  if (kind === "reading") entry.meta = { url: row.url ?? "", source: row.source ?? "", status: row.status ?? "" };
   const list = tonyOutbox(); list.push(entry); writeTonyOutbox(list);
   return entry;
 }
@@ -2513,7 +2514,7 @@ function doSendTony(ref) {
   const table = v.type === "inbox" ? "inbox_items" : v.type;
   const row = state.store.getRow(table, v.id);
   if (!row) return;
-  const entry = queueForTony(v.type === "inbox" ? "inbox" : "task", row);
+  const entry = queueForTony(v.type === "inbox" ? "inbox" : v.type === "reading_items" ? "reading" : "task", row);
   state.store.archiveObject(table, v.id);
   state.searchDirty = true;
   toastUndo = () => { unqueueForTony(entry.qid); try { state.store.unarchiveObject(table, v.id); } catch {} state.searchDirty = true; const root = document.querySelector("#toast-root"); if (root) root.innerHTML = ""; render(); saveBytes(); };
