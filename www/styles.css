@@ -561,3 +561,14 @@ body.boot-faded #main { animation: bootfade 160ms ease-out; }
 .mgmt-body .form.inline input { width: auto; flex: 1; min-width: 0; }
 .mgmt-body .form.inline button { flex: 0 0 auto; width: auto; }
 .mgmt-body .form.inline select { width: auto; flex: 0 1 auto; min-width: 0; }
+
+/* Stamp dh: news feed tab. */
+.feed-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+.feed-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.chip { border-radius: 999px; padding: 5px 12px; }
+.chip-on { background: var(--primary); color: #fff; border-color: var(--primary); }
+.feed-row { padding: 10px 0; border-bottom: 1px solid var(--line); }
+.feed-meta { display: flex; gap: 8px; align-items: center; margin-bottom: 3px; font-size: 12.5px; }
+.feed-title { font-size: 16px; font-weight: 550; color: var(--text); text-decoration: none; display: block; line-height: 1.35; }
+.feed-title:hover { text-decoration: underline; }
+.feed-sum { margin: 3px 0 0; color: var(--muted, #a89e92); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }

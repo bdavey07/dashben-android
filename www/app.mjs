@@ -512,6 +512,7 @@ async function doSync() {
   saveBytes();
   if (typeof window !== "undefined") window.__dashbenAfterSync?.();
   loadFamilyCalendar();
+  if (state.feedReload) { state.feedReload = false; loadFeed(true); }
 }
 
 // Full re-download: pushes any pending local edits first (so they
@@ -1379,6 +1380,7 @@ function render() {
   else if (state.tab === "inbox") main.innerHTML = renderInbox();
   else if (state.tab === "people") main.innerHTML = renderPeople();
   else if (state.tab === "reading") main.innerHTML = renderReading();
+  else if (state.tab === "feed") main.innerHTML = renderFeed();
   else if (state.tab === "projects") main.innerHTML = renderProjects();
   else if (state.tab === "search") main.innerHTML = renderSearch();
   else if (state.tab === "daily") main.innerHTML = renderDaily();
@@ -1435,6 +1437,87 @@ async function loadFamilyCalendar(force = false) {
   state.family.loading = false;
   if (state.tab === "dashboard" && !state.itemView) render();
 }
+// --- News feed (stamp dh) ---
+// The river itself is assembled server-side (GET /api/sync/feed on
+// the sync transport); this client keeps a 15-minute copy, renders
+// category views over it, and edits the source list into the synced
+// ui_prefs 'feed_sources' row (store.getFeedSources/setFeedSources).
+function feedSeed() {
+  if (!state.feed) state.feed = { status: "idle", items: [], sources: [], errors: [], fetchedAt: 0, category: "All", loading: false };
+  return state.feed;
+}
+
+function feedAgo(iso) {
+  if (!iso) return "";
+  const mins = Math.max(1, Math.round((Date.now() - new Date(iso).getTime()) / 60000));
+  if (mins < 60) return `${mins}m ago`;
+  const h = Math.round(mins / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.round(h / 24)}d ago`;
+}
+
+async function loadFeed(force = false) {
+  const f = feedSeed();
+  const t = state.transport;
+  if (!t || !t.base || !t.token) return;
+  if (!force && f.status === "ok" && Date.now() - f.fetchedAt < 15 * 60 * 1000) return;
+  if (f.loading) return;
+  f.loading = true;
+  try {
+    const res = await fetch(`${t.base}/api/sync/feed`, { headers: { Authorization: `Bearer ${t.token}` } });
+    if (!res.ok) throw new Error(`feed -> ${res.status}`);
+    const data = await res.json();
+    state.feed = { ...f, status: "ok", items: data.items ?? [], sources: data.sources ?? [], errors: data.errors ?? [], fetchedAt: Date.now(), loading: false };
+  } catch {
+    f.loading = false;
+    f.status = f.items.length ? "stale" : "error";
+  }
+  if (state.tab === "feed" && !state.itemView) render();
+}
+
+function renderFeed() {
+  const f = feedSeed();
+  if (f.status === "idle") loadFeed();
+  const cats = ["All", ...new Set(f.sources.map((x) => x.category))];
+  if (!cats.includes(f.category)) f.category = "All";
+  const items = f.category === "All" ? f.items : f.items.filter((i) => i.category === f.category);
+  return `<div class="feed-head"><div class="feed-chips">${cats.map((c) => `<button data-feed-cat="${esc(c)}" class="chip${c === f.category ? " chip-on" : ""}">${esc(c)}</button>`).join("")}</div><div class="feed-actions"><button data-feed-sources class="ghost-btn">Sources</button> <button data-feed-refresh class="ghost-btn">Refresh</button></div></div>
+  ${f.status === "error" ? `<div class="panel"><p>Couldn't load the feed. <button data-feed-refresh class="ghost-btn">Retry</button></p></div>` : (f.status === "idle" || (f.loading && !f.items.length)) ? "<p class='muted'>Loading the river\\u2026</p>" : items.map((i) => `<div class="feed-row"><div class="feed-meta"><span class="badge">${esc(i.source)}</span><span class="muted">${esc(i.category)}${i.published ? ` \\u00b7 ${feedAgo(i.published)}` : ""}</span></div><a class="feed-title" href="${esc(i.link)}" target="_blank" rel="noopener">${esc(i.title)}</a>${i.summary ? `<p class="feed-sum">${esc(i.summary)}</p>` : ""}</div>`).join("") || "<p class='muted'>Nothing in this view yet.</p>"}
+  ${f.errors?.length ? `<p class="muted">Couldn't fetch: ${f.errors.map((e) => esc(e.source)).join(", ")}</p>` : ""}
+  ${f.fetchedAt ? `<p class="muted">Updated ${feedAgo(new Date(f.fetchedAt).toISOString())}${f.status === "stale" ? " \\u00b7 showing the last good copy" : ""}</p>` : ""}`;
+}
+
+// The working source list for the editor: Ben's saved list when one
+// exists, otherwise the effective list the endpoint last returned
+// (the starter pack until he customizes).
+function feedWorkingList() {
+  return state.store.getFeedSources() ?? feedSeed().sources;
+}
+
+function saveFeedList(list) {
+  state.store.setFeedSources(list);
+  state.feedReload = true;
+  openFeedSources();
+  showToast("Sources saved");
+}
+
+function openFeedSources() {
+  const custom = state.store.getFeedSources();
+  const effective = feedWorkingList();
+  const cats = [...new Set(effective.map((x) => x.category))];
+  openPopup("Feed sources", `
+  <p class="muted">${custom ? "Your custom source list \\u2014 it syncs to every client." : "You're on the built-in starter pack. Adding or removing a source saves it as your list."}</p>
+  ${effective.map((x, ix) => `<div class="row"><span class="row-title">${esc(x.name)}</span><span class="muted">${esc(x.category)}</span><button data-feed-src-del="${ix}">Remove</button></div>`).join("") || "<p class='muted'>No sources.</p>"}
+  <form data-feed-source-add class="form">
+    <div class="cf-field"><label class="cf-label">Name</label><input name="name" required placeholder="e.g. CBC London"></div>
+    <div class="cf-field"><label class="cf-label">Feed URL (RSS/Atom)</label><input name="url" required placeholder="https://\\u2026/feed"></div>
+    <div class="cf-field"><label class="cf-label">Category</label><select name="category">${cats.map((c) => `<option>${esc(c)}</option>`).join("")}<option value="__new__">New category\\u2026</option></select></div>
+    <div class="cf-field" data-feed-catnew hidden><label class="cf-label">New category</label><input name="categoryNew"></div>
+    <p class="popup-actions"><button class="primary-btn">Add source</button></p>
+  </form>
+  ${custom ? `<p><button data-feed-src-reset class="ghost-btn">Reset to the starter pack</button></p>` : ""}`, "feed:sources");
+}
+
 function torontoYmdOf(iso) {
   const p = {};
   for (const part of new Intl.DateTimeFormat("en-CA", { timeZone: "America/Toronto", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date(iso))) {
@@ -2547,6 +2630,184 @@ function openMoveCategoryPrompt(item, from) {
 }
 
 function bindPopupForms(root = $("#popup-root")) {
+  $$("[data-feed-src-del]", root).forEach((b) => b.addEventListener("click", () => {
+    const list = [...feedWorkingList()];
+    list.splice(Number(b.dataset.feedSrcDel), 1);
+    saveFeedList(list);
+  }));
+  $$("[data-feed-src-reset]", root).forEach((b) => b.addEventListener("click", () => {
+    state.store.setFeedSources(null);
+    state.feedReload = true;
+    openFeedSources();
+    showToast("Back to the starter pack");
+  }));
+  $$("[data-feed-source-add]", root).forEach((f) => {
+    const sel = f.querySelector("[name=category]");
+    const nw = f.querySelector("[data-feed-catnew]");
+    if (sel && nw) sel.addEventListener("change", () => { nw.hidden = sel.value !== "__new__"; });
+    f.addEventListener("submit", (e) => {
+      e.preventDefault();
+      const d = new FormData(f);
+      const name = (d.get("name") || "").trim();
+      const url = (d.get("url") || "").trim();
+      if (!name || !/^https?:\/\//.test(url)) return;
+      const category = d.get("category") === "__new__" ? ((d.get("categoryNew") || "").trim() || "General") : (d.get("category") || "General");
+      saveFeedList([...feedWorkingList(), { name, url, category }]);
+    });
+  });
+  bindMdEditors(root);
+  // Subtask ticks and deletes persist immediately (delegated once: the
+  // popup root element survives popup re-renders, its content does not).
+  if (!root.dataset.subDelegated) {
+    root.dataset.subDelegated = "1";
+    let subDragSuppressUntil = 0;
+    root.addEventListener("click", (e) => {
+      if (Date.now() < subDragSuppressUntil && e.target.closest?.("[data-sub-row]")) return;
+      const del = e.target.closest("[data-sub-del]");
+      if (!del) return;
+      const form = del.closest("form");
+      const row = del.closest("[data-sub-row]");
+      const list = form?.querySelector("[data-sub-list]");
+      row?.remove();
+      if (list && !list.querySelector("[data-sub-row]")) list.innerHTML = "<p class='muted'>No subtasks.</p>";
+      if (form) persistSubtasks(form);
+    });
+    // Enter in the New-subtask box adds the subtask (stamp as): a
+    // delegated capture-phase handler with a keyCode fallback, because
+    // the per-input binding misses keys some Android IMEs deliver
+    // without a clean key value (focus just jumped to the next field).
+    root.addEventListener("keydown", (e) => {
+      const inp = e.target.closest?.("[data-sub-new]");
+      if (!inp) return;
+      if (e.key !== "Enter" && e.keyCode !== 13) return;
+      e.preventDefault();
+      inp.closest(".inline-add")?.querySelector("[data-add-sub-btn]")?.click();
+    }, true);
+    root.addEventListener("change", (e) => {
+      const row = e.target.closest("[data-sub-row]");
+      if (!row || e.target.type !== "checkbox") return;
+      if (Date.now() < subDragSuppressUntil) return;
+      const form = row.closest("form");
+      if (form) persistSubtasks(form);
+    });
+    // Drag to rearrange: reordering the DOM rows is enough — the drop
+    // persists through the same readSubtasks order the save uses.
+    let dragRow = null;
+    root.addEventListener("dragstart", (e) => {
+      const r = e.target.closest?.("[data-sub-row]");
+      if (!r) return;
+      dragRow = r;
+      r.classList.add("dragging");
+      if (e.dataTransfer) { e.dataTransfer.effectAllowed = "move"; try { e.dataTransfer.setData("text/plain", "subtask"); } catch {} }
+    });
+    root.addEventListener("dragover", (e) => {
+      if (!dragRow) return;
+      const r = e.target.closest?.("[data-sub-row]");
+      if (!r || r === dragRow || r.parentElement !== dragRow.parentElement) return;
+      e.preventDefault();
+      const rect = r.getBoundingClientRect();
+      const after = e.clientY - rect.top > rect.height / 2;
+      r.parentElement.insertBefore(dragRow, after ? r.nextSibling : r);
+    });
+    root.addEventListener("dragend", () => {
+      if (!dragRow) return;
+      const form = dragRow.closest("form");
+      dragRow.classList.remove("dragging");
+      dragRow = null;
+      subDragSuppressUntil = Date.now() + 250;
+      if (form) persistSubtasks(form);
+    });
+    root.addEventListener("contextmenu", (e) => {
+      if (e.target.closest?.("[data-sub-row]")) e.preventDefault();
+    });
+    // Touch long-press drag: HTML5 drag events never fire for touch in
+    // the Android WebView, so subtask rows also reorder via pointer
+    // events. Hold still ~350 ms to arm the drag; moving sooner is a
+    // scroll (rows have touch-action: none, so pre-arm vertical moves
+    // scroll the popup manually) or a tap. Release persists via the
+    // same persistSubtasks path, and the trailing click/change is
+    // suppressed so a drag starting on the checkbox doesn't toggle it.
+    let lpDrag = null;
+    let lpTimer = null;
+    const clearLpTimer = () => { if (lpTimer) { clearTimeout(lpTimer); lpTimer = null; } };
+    root.addEventListener("pointerdown", (e) => {
+      if (e.pointerType !== "touch") return;
+      const row = e.target.closest?.("[data-sub-row]");
+      if (!row || e.target.closest?.("[data-sub-del]")) return;
+      clearLpTimer();
+      lpDrag = { row, pointerId: e.pointerId, startX: e.clientX, startY: e.clientY, lastY: e.clientY, active: false, moved: false, scrolling: false, sc: null };
+      lpTimer = setTimeout(() => {
+        if (!lpDrag || lpDrag.pointerId !== e.pointerId || lpDrag.scrolling) return;
+        lpDrag.active = true;
+        row.classList.add("dragging");
+        try { row.setPointerCapture(e.pointerId); } catch {}
+      }, 350);
+    });
+    root.addEventListener("pointermove", (e) => {
+      if (!lpDrag || e.pointerId !== lpDrag.pointerId) return;
+      if (!lpDrag.active) {
+        if (lpDrag.scrolling) {
+          if (lpDrag.sc) lpDrag.sc.scrollTop -= e.clientY - lpDrag.lastY;
+          lpDrag.lastY = e.clientY;
+          return;
+        }
+        const dx = e.clientX - lpDrag.startX, dy = e.clientY - lpDrag.startY;
+        if (Math.hypot(dx, dy) > 10) {
+          clearLpTimer();
+          if (Math.abs(dy) > Math.abs(dx)) {
+            lpDrag.scrolling = true;
+            let sc = lpDrag.row.parentElement;
+            while (sc && !(sc.scrollHeight > sc.clientHeight && /(auto|scroll)/.test(getComputedStyle(sc).overflowY))) sc = sc.parentElement;
+            lpDrag.sc = sc || document.scrollingElement;
+            if (lpDrag.sc) lpDrag.sc.scrollTop -= e.clientY - lpDrag.lastY;
+            lpDrag.lastY = e.clientY;
+          } else {
+            lpDrag = null;
+          }
+        }
+        return;
+      }
+      e.preventDefault();
+      const list = lpDrag.row.parentElement;
+      if (!list) return;
+      const siblings = [...list.querySelectorAll("[data-sub-row]")].filter((r) => r !== lpDrag.row);
+      const before = siblings.find((sib) => { const r = sib.getBoundingClientRect(); return e.clientY < r.top + r.height / 2; });
+      if (before) {
+        if (lpDrag.row.nextSibling !== before) { list.insertBefore(lpDrag.row, before); lpDrag.moved = true; }
+      } else if (list.lastElementChild !== lpDrag.row) {
+        list.appendChild(lpDrag.row);
+        lpDrag.moved = true;
+      }
+    });
+    const finishLp = (e) => {
+      if (!lpDrag || e.pointerId !== lpDrag.pointerId) return;
+      clearLpTimer();
+      const wasActive = lpDrag.active, wasMoved = lpDrag.moved, wasScrolling = lpDrag.scrolling;
+      const row = lpDrag.row;
+      lpDrag = null;
+      if (wasScrolling) { subDragSuppressUntil = Date.now() + 150; return; }
+      if (!wasActive) return;
+      row.classList.remove("dragging");
+      subDragSuppressUntil = Date.now() + 300;
+      if (wasMoved) { const form = row.closest("form"); if (form) persistSubtasks(form); }
+    };
+    root.addEventListener("pointerup", finishLp);
+    root.addEventListener("pointercancel", finishLp);
+  }
+  // Subtask Add appends a row and persists it right away.
+  $$("[data-add-sub-btn]", root).forEach((btn) => btn.addEventListener("click", () => {
+    const form = btn.closest("form");
+    const input = form.querySelector("[data-sub-new]");
+    const list = form.querySelector("[data-sub-list]");
+    const text = input.value.trim();
+    if (!text || !list) return;
+    list.querySelector("p.muted")?.remove();
+    list.insertAdjacentHTML("beforeend", `<div class="row" data-sub-row="s-${Date.now()}" draggable="true"><span class="sub-grip" aria-hidden="true">⠿</span><input type="checkbox"><span data-sub-text>${esc(text)}</span><button type="button" data-sub-del aria-label="Delete subtask">×</button></div>`);
+    input.value = "";
+    input.focus();
+    persistSubtasks(form);
+  }));
+
   bindMdEditors(root);
   // Subtask ticks and deletes persist immediately (delegated once: the
   // popup root element survives popup re-renders, its content does not).
@@ -3418,8 +3679,8 @@ boot().catch((e) => {
 });
 
 // --- Parity P2/P3/P4/P6: Daily, Management, custom types, FTS, themes ---
-const DEFAULT_TABS = ["dashboard", "daily", "calendar", "tasks", "notes", "projects", "reading", "people", "inbox", "search", "management"]; // Review tab removed on mobile (stamp bc)
-const TAB_LABELS = { dashboard: "Dashboard", daily: "Daily", calendar: "Calendar", review: "Review", tasks: "Tasks", notes: "Notes", projects: "Projects", reading: "Reading", people: "People", inbox: "Inbox", search: "Search", management: "Management" };
+const DEFAULT_TABS = ["dashboard", "daily", "calendar", "tasks", "notes", "projects", "reading", "feed", "people", "inbox", "search", "management"]; // Review tab removed on mobile (stamp bc)
+const TAB_LABELS = { dashboard: "Dashboard", daily: "Daily", calendar: "Calendar", review: "Review", tasks: "Tasks", notes: "Notes", projects: "Projects", reading: "Reading", feed: "Feed", people: "People", inbox: "Inbox", search: "Search", management: "Management" };
 const MANAGED_FIELD_LIST = [
   ["tasks", "priority"], ["tasks", "project"], ["notes", "type"], ["people", "role"],
   ["reading_items", "status"], ["projects", "status"], ["projects", "category"],
@@ -4371,6 +4632,10 @@ function attachExtraListeners() {
     }, true);
   }
   $("#main").addEventListener("click", async (e) => {
+    const feedCat = e.target.closest("[data-feed-cat]");
+    if (feedCat) { feedSeed().category = feedCat.dataset.feedCat; render(); return; }
+    if (e.target.closest("[data-feed-refresh]")) { loadFeed(true); return; }
+    if (e.target.closest("[data-feed-sources]")) { openFeedSources(); return; }
     const pageBack = e.target.closest("[data-page-back]");
     if (pageBack) { state.itemView = null; render(); return; }
     const fullSync = e.target.closest("[data-full-sync]");

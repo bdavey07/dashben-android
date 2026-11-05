@@ -595,6 +595,20 @@ export class LocalStore {
     this.engine.localWrite("ui_prefs", { key: "theme", value: theme, updated_at: ts }, { baseUpdatedAt: this.getRow("ui_prefs", "theme")?.updated_at ?? null });
   }
 
+  // News feed sources (stamp dh): a JSON list in ui_prefs, synced
+  // like every other pref. null = unset (the Worker serves its
+  // curated defaults); setFeedSources(null) clears back to unset.
+  getFeedSources() {
+    const raw = this.getRow("ui_prefs", "feed_sources")?.value;
+    if (!raw) return null;
+    try { const v = JSON.parse(raw); return Array.isArray(v) ? v : null; } catch { return null; }
+  }
+
+  setFeedSources(list) {
+    const ts = new Date().toISOString();
+    this.engine.localWrite("ui_prefs", { key: "feed_sources", value: list ? JSON.stringify(list) : "", updated_at: ts }, { baseUpdatedAt: this.getRow("ui_prefs", "feed_sources")?.updated_at ?? null });
+  }
+
   addFieldValue(objectType, field, value) {
     const def = MANAGED_FIELDS.find((f) => f.objectType === objectType && f.field === field);
     if (!def) throw new Error(`Unknown managed field: ${objectType}.${field}.`);
