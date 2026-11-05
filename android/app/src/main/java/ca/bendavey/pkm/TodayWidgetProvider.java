@@ -96,7 +96,11 @@ public class TodayWidgetProvider extends AppWidgetProvider {
 
     private RemoteViews build(Context ctx, int appWidgetId) {
         RemoteViews v = new RemoteViews(ctx.getPackageName(), R.layout.widget_today);
-        v.setOnClickPendingIntent(R.id.w_root, pending(ctx, 100, openIntent(ctx, "open", null)));
+        // Stamp cs: the open-app tap lives on the header + counts line, NOT
+        // the root — a root-level click target made the launcher treat
+        // drags as widget taps instead of letting the list scroll.
+        v.setOnClickPendingIntent(R.id.w_header, pending(ctx, 100, openIntent(ctx, "open", null)));
+        v.setOnClickPendingIntent(R.id.w_counts, pending(ctx, 101, openIntent(ctx, "open", null)));
         v.setOnClickPendingIntent(R.id.w_btn_capture, pending(ctx, 400, openIntent(ctx, "capture", null)));
         v.setOnClickPendingIntent(R.id.w_btn_task, pending(ctx, 401, openIntent(ctx, "task", null)));
         v.setOnClickPendingIntent(R.id.w_btn_note, pending(ctx, 402, openIntent(ctx, "note", null)));

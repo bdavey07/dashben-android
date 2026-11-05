@@ -27,6 +27,9 @@ public class MainActivity extends BridgeActivity {
     @Override
     public void onResume() {
         super.onResume();
+        // Re-assert the autofill exclusion once the WebView certainly exists.
+        try { getBridge().getWebView().setImportantForAutofill(android.view.View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS); } catch (Exception e) { /* best effort */ }
+        try { getBridge().getWebView().setImportantForAccessibility(android.view.View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS); } catch (Exception e) { /* best effort */ }
         WidgetPlugin.poke(this);
     }
 
