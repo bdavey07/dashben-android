@@ -84,11 +84,23 @@ public class ShareIntentPlugin extends Plugin {
 
     @PluginMethod
     public void getWidgetAction(PluginCall call) {
-        JSObject ret = new JSObject();
-        ret.put("action", pendingWidgetAction != null ? pendingWidgetAction : "");
-        ret.put("taskId", pendingWidgetTask != null ? pendingWidgetTask : "");
+        String act = pendingWidgetAction;
+        String task = pendingWidgetTask;
         pendingWidgetAction = null;
         pendingWidgetTask = null;
+        if (act == null || act.isEmpty()) {
+            // Fall back to the SharedPreferences stash MainActivity
+            // writes on every widget-tap intent.
+            try {
+                android.content.SharedPreferences prefs = getContext().getSharedPreferences("dashben", android.content.Context.MODE_PRIVATE);
+                act = prefs.getString("widget_action", "");
+                task = prefs.getString("widget_task", "");
+                prefs.edit().remove("widget_action").remove("widget_task").apply();
+            } catch (Exception e) { /* in-memory channel only */ }
+        }
+        JSObject ret = new JSObject();
+        ret.put("action", act != null ? act : "");
+        ret.put("taskId", task != null ? task : "");
         call.resolve(ret);
     }
 

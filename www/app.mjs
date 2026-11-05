@@ -241,6 +241,7 @@ async function checkWidgetAction() {
     const r = await withTimeout(NativeShare.getWidgetAction({}), 3000, "share.widget");
     const act = r?.action;
     if (!act) return;
+    try { localStorage.setItem("dashben-last-widget-action", `${act}${r.taskId ? " " + r.taskId.slice(0, 8) : ""} @ ${new Date().toLocaleTimeString("en-CA", { hour: "numeric", minute: "2-digit" })}`); } catch { /* ignore */ }
     if (act === "task-open" && r.taskId && state.store?.getRow("tasks", r.taskId)) {
       state.itemView = null; state.tab = "tasks"; saveTab(); render(); openTaskPopup(r.taskId);
     } else if (act === "capture" || act === "task" || act === "note") {
@@ -3229,6 +3230,10 @@ function applyTheme() {
   if (theme === "auto") theme = window.matchMedia("(prefers-color-scheme: light)").matches ? "paper" : "blueprint";
   if (theme === "blueprint") document.documentElement.removeAttribute("data-theme");
   else document.documentElement.setAttribute("data-theme", theme);
+  // Mirror the resolved theme to localStorage (stamp cc): an inline
+  // script in index.html applies it before first paint, so the app
+  // no longer flashes the default theme while the database loads.
+  try { localStorage.setItem("dashben-theme", theme); } catch { /* private mode */ }
 }
 
 function dailyNoteFor(date) {
@@ -3593,6 +3598,8 @@ function renderManagement() {
   <p><button data-reminder-toggle class="ghost-btn">${state.store.getRow("ui_prefs", "reminders")?.value === "off" ? "Turn reminders on" : "Turn reminders off"}</button></p></div>
   <div class="panel"><h3>App lock</h3><p class="muted">Require fingerprint or device PIN to open DashBen (off by default; locks again after a minute in the background). Current: <b>${appLockOn() ? "On" : "Off"}</b></p>
   <p><button data-applock-toggle class="ghost-btn">${appLockOn() ? "Turn app lock off" : "Turn app lock on"}</button></p></div>
+  <div class="panel"><h3>Widgets</h3><p class="muted" data-widget-status>Snapshot and tap channel for the home-screen widgets.</p>
+  <p><button data-widget-check class="ghost-btn">Check widgets</button></p></div>
   <div class="panel"><h3>Backup</h3><p class="muted">Download a full copy of the local database (.db) — the same format the app loads. Keep it somewhere safe as offline insurance.</p><p><button data-export-db class="primary-btn">Export database</button></p><p><button data-export-md class="primary-btn">Export Markdown (.zip)</button></p></div>
   <div class="panel"><h3>Field values</h3><p class="muted">Selectable values for every field on every object type. Renaming a value renames it on every row using it. Deleting a value that is in use is blocked.</p>
   ${MANAGED_FIELD_LIST.map(([ot, f]) => `<h4>${ot}.${f}</h4>
@@ -4101,6 +4108,19 @@ function attachExtraListeners() {
         } catch { /* best-effort */ }
         render();
       }
+      return;
+    }
+    const wCheck = e.target.closest("[data-widget-check]");
+    if (wCheck) {
+      const out = wCheck.closest(".panel")?.querySelector("[data-widget-status]");
+      try {
+        let fileInfo = "no snapshot file yet \u2014 open the app once after adding the widget";
+        try { const st = await NativeFS.stat({ path: "widget.json", directory: "DATA" }); fileInfo = `snapshot written ${new Date(st.mtime).toLocaleTimeString("en-CA", { hour: "numeric", minute: "2-digit" })}`; } catch { /* missing */ }
+        let last = null;
+        try { last = localStorage.getItem("dashben-last-widget-action"); } catch { /* ignore */ }
+        if (NativeWidget) await NativeWidget.refresh({}).catch(() => null);
+        if (out) out.textContent = `Widgets: ${fileInfo}${last ? ` \u00B7 last widget tap received: ${last}` : " \u00B7 no widget tap received yet"}. Widgets refreshed just now.`;
+      } catch { if (out) out.textContent = "Widgets: check failed."; }
       return;
     }
     const pageEdit = e.target.closest("[data-page-edit]");

@@ -13,14 +13,22 @@ import com.getcapacitor.annotation.CapacitorPlugin;
 // for the system's 30-minute widget cadence.
 @CapacitorPlugin(name = "WidgetBridge")
 public class WidgetPlugin extends Plugin {
-    @PluginMethod
-    public void refresh(PluginCall call) {
-        Context ctx = getContext();
+    // Redraw both widgets from the current snapshot. Called from
+    // the JS bridge and from MainActivity.onResume, so opening the
+    // app refreshes the widgets even if a bridge call is missed.
+    public static void poke(Context ctx) {
         AppWidgetManager mgr = AppWidgetManager.getInstance(ctx);
         int[] todayIds = mgr.getAppWidgetIds(new ComponentName(ctx, TodayWidgetProvider.class));
         if (todayIds.length > 0) new TodayWidgetProvider().onUpdate(ctx, mgr, todayIds);
         int[] capIds = mgr.getAppWidgetIds(new ComponentName(ctx, CaptureWidgetProvider.class));
         if (capIds.length > 0) new CaptureWidgetProvider().onUpdate(ctx, mgr, capIds);
+    }
+
+    @PluginMethod
+    public void refresh(PluginCall call) {
+        Context ctx = getContext();
+        AppWidgetManager mgr = AppWidgetManager.getInstance(ctx);
+        poke(ctx);
         call.resolve();
     }
 }
