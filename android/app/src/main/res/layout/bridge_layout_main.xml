@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- App-module override of the Capacitor library's bridge layout.
+     BridgeActivity inflates THIS layout (not activity_main.xml — the
+     cq/cr attributes sat in a layout that is never used). The web view
+     is our NoAutofillWebView, and both layers declare the autofill and
+     accessibility exclusions. Stamp cu (2026-11-04). -->
+<androidx.coordinatorlayout.widget.CoordinatorLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:importantForAutofill="noExcludeDescendants"
+    android:importantForAccessibility="noHideDescendants"
+    tools:context="com.getcapacitor.BridgeActivity">
+
+    <ca.bendavey.pkm.NoAutofillWebView
+        android:id="@+id/webview"
+        android:layout_width="fill_parent"
+        android:layout_height="fill_parent"
+        android:importantForAutofill="noExcludeDescendants"
+        android:importantForAccessibility="noHideDescendants" />
+
+</androidx.coordinatorlayout.widget.CoordinatorLayout>
