@@ -96,24 +96,46 @@ async function scheduleReminders() {
     if (overdue.length) {
       let when = at9(today);
       if (when <= now) when = at9(tomorrow);
-      notes.push({ id: 1900000001, title: "DashBen \u2014 overdue", body: `${overdue.length} overdue task${overdue.length === 1 ? "" : "s"}. First up: ${overdue[0].title}`, schedule: { at: when, allowWhileIdle: true }, extra: { taskId: overdue[0].id } });
+      notes.push({ id: 1900000001, title: "DashBen \u2014 overdue", body: `${overdue.length} overdue task${overdue.length === 1 ? "" : "s"}. First up: ${overdue[0].title}`, schedule: { at: when, allowWhileIdle: true }, actionTypeId: "TASK_ACTIONS", extra: { taskId: overdue[0].id } });
     }
     for (const t of due) {
       if (t.due_date < today) continue;
       const when = at9(t.due_date);
       if (when <= now) continue;
-      notes.push({ id: reminderIdFor(t.id), title: "Due today", body: t.title, schedule: { at: when, allowWhileIdle: true }, extra: { taskId: t.id } });
+      notes.push({ id: reminderIdFor(t.id), title: "Due today", body: t.title, schedule: { at: when, allowWhileIdle: true }, actionTypeId: "TASK_ACTIONS", extra: { taskId: t.id } });
     }
     await cancelAllReminders();
     if (notes.length) await withTimeout(NativeNotify.schedule({ notifications: notes.slice(0, 24) }), 8000, "notify.schedule");
   } catch { /* reminders are best-effort */ } finally { remindersBusy = false; }
 }
+
+const pendingNotifActions = [];
+function applyNotifAction(act, id) {
+  const t = state.store?.getRow("tasks", id);
+  if (!t) return;
+  if (act === "done") { if (!t.done) state.store.completeTask(id, todayToronto()); }
+  else if (!t.done) {
+    const today = todayToronto();
+    const base = t.due_date && t.due_date > today ? t.due_date : today;
+    state.store.updateProps("tasks", id, { due_date: ymdAdd(base, 1) });
+  }
+  buzz(); render(); saveBytes(); void scheduleReminders();
+}
+function processPendingNotifActions() {
+  if (!state.booted || !state.store || !pendingNotifActions.length) return;
+  for (const { act, id } of pendingNotifActions.splice(0)) applyNotifAction(act, id);
+}
 async function initReminders() {
   if (!NativeNotify) return;
-  window.__dashbenAfterSync = () => { void scheduleReminders(); };
+  window.__dashbenAfterSync = () => { void scheduleReminders(); processPendingNotifActions(); };
+  try {
+    await NativeNotify.registerActionTypes({ types: [{ id: "TASK_ACTIONS", actions: [{ id: "done", title: "Done" }, { id: "snooze", title: "Snooze 1 day" }] }] });
+  } catch { /* older plugin build: plain taps still work */ }
   try {
     await NativeNotify.addListener("localNotificationActionPerformed", (ev) => {
       const id = ev?.notification?.extra?.taskId;
+      const act = ev?.actionId;
+      if (id && (act === "done" || act === "snooze")) { pendingNotifActions.push({ act, id }); processPendingNotifActions(); return; }
       if (id && state.store?.getRow("tasks", id)) { state.itemView = null; state.tab = "tasks"; saveTab(); render(); openTaskPopup(id); }
     });
   } catch { /* listener is a nicety */ }
@@ -126,8 +148,60 @@ async function initReminders() {
   await scheduleReminders();
 }
 
+// --- App lock (stamp 2026-11-04ca, shell only) ---
+// Optional fingerprint/PIN lock (Management > App lock), off by
+// default. Device-local flag (never synced): localStorage
+// "dashben-applock". Locks on app start and after >60 s in the
+// background. Native side: AppLockPlugin (framework BiometricPrompt
+// with device-credential fallback).
+const NativeLock = safePlugin("AppLock");
+function appLockOn() { try { return localStorage.getItem("dashben-applock") === "1"; } catch { return false; } }
+function setAppLock(on) { try { localStorage.setItem("dashben-applock", on ? "1" : "0"); } catch { /* ignore */ } }
+let unlockBusy = false;
+async function tryUnlock(el) {
+  if (unlockBusy) return;
+  unlockBusy = true;
+  const msg = el.querySelector("[data-lock-msg]");
+  try {
+    const r = await withTimeout(NativeLock.authenticate({}), 120000, "lock.auth");
+    if (r?.ok) { el.remove(); document.body.classList.remove("app-locked"); }
+    else if (msg) msg.textContent = r?.message || "Unlock failed \u2014 tap Unlock to try again.";
+  } catch { if (msg) msg.textContent = "Unlock failed \u2014 tap Unlock to try again."; }
+  unlockBusy = false;
+}
+function maybeLockApp() {
+  if (!NativeLock || !appLockOn() || document.querySelector("#lock-screen")) return;
+  const el = document.createElement("div");
+  el.id = "lock-screen";
+  el.innerHTML = `<div class="lock-card"><div class="lock-title">\uD83D\uDD12 DashBen</div><p class="muted">Locked \u2014 unlock to continue.</p><button type="button" class="primary-btn" data-unlock>Unlock</button><p class="muted" data-lock-msg></p></div>`;
+  document.body.appendChild(el);
+  document.body.classList.add("app-locked");
+  el.querySelector("[data-unlock]")?.addEventListener("click", () => void tryUnlock(el));
+  void tryUnlock(el);
+}
+let shellHiddenAt = 0;
+
+// Phone slimming (stamp au): the footer sync status stays hidden
+// unless the outbox or conflicts actually need attention.
+try {
+  const ssEl = document.querySelector("#sync-status");
+  if (ssEl && typeof MutationObserver === "function") {
+    const updSs = () => {
+      const t = ssEl.textContent || "";
+      const bad = Number((/outbox (\d+)/.exec(t) || [])[1] || 0) > 0 || Number((/conflicts (\d+)/.exec(t) || [])[1] || 0) > 0 || /error/i.test(t);
+      ssEl.style.display = bad ? "" : "none";
+    };
+    new MutationObserver(updSs).observe(ssEl, { childList: true, characterData: true, subtree: true });
+    updSs();
+  }
+} catch { /* cosmetic only */ }
+
+// Bottom-bar Daily button (stamps ax, bf): originally opened today's
+// daily-note popup; at Ben's direction it is now a plain tab button
+// (data-tab="daily") — no popup-opening handler remains.
 
 const SCHEMA_URL = "./schema.sql";
+const BOOT_T0 = typeof performance !== "undefined" ? performance.now() : 0;
 const state = {
   db: null, engine: null, store: null, transport: null,
   base: "https://pkm.ben-cloud.net", token: "",
@@ -195,7 +269,26 @@ async function loadBytes() {
     });
   } catch { return null; }
 }
-async function saveBytes() {
+// Persistence coalescing (stamp bz): every edit used to serialize
+// and write the whole database immediately; bursts (bulk actions,
+// sync applies) now collapse into one write ~150 ms after the last
+// change, with a trailing write if edits land while one is in
+// flight. saveBytes(true) flushes promptly for callers that need
+// the write landed before they proceed (e.g. before a reload).
+let saveChain = Promise.resolve(), saveScheduled = false, saveAgain = false;
+function saveBytes(flush = false) {
+  if (flush) { saveChain = saveChain.catch(() => {}).then(() => persistBytesNow()); return saveChain; }
+  if (saveScheduled) { saveAgain = true; return saveChain; }
+  saveScheduled = true;
+  saveChain = saveChain.catch(() => {}).then(async () => {
+    await new Promise((r) => setTimeout(r, 150));
+    saveScheduled = false;
+    await persistBytesNow();
+    if (saveAgain) { saveAgain = false; void saveBytes(); }
+  });
+  return saveChain;
+}
+async function persistBytesNow() {
   if (!state.db) return;
   const bytes = state.db.exportBytes();
   if (NativeFS) {
@@ -385,15 +478,16 @@ function forwardLinks(fromType, fromId) {
 
 // --- Popups (P1: production opens object detail in popups) ---
 function openPopup(title, inner, openRef) {
-  // Editor popups get their Save and close button in the header,
-  // beside Open and Close (stamp 2026-11-04u): it submits the
+  // Editor popups get their Close button (which saves) in the header,
+  // beside Pin and Open (stamp 2026-11-04u; the standalone
+  // Save and Close buttons were removed in stamp at): it submits the
   // popup's form from outside via the form= attribute.
   const formTag = /<form[^>]*popup-form[^>]*>/.exec(inner)?.[0] ?? "";
   const formId = /id="([^"]+)"/.exec(formTag)?.[1] ?? "";
-  const saveBtn = formId ? `<button type="submit" form="${formId}" class="primary-btn">Save and close</button>` : "";
+  const saveBtn = formId ? `<button type="submit" form="${formId}" class="primary-btn">Close</button>` : "";
   $("#popup-root").innerHTML = `<div class="popup-backdrop">
     <div class="popup-card" role="dialog" aria-label="${esc(title)}">
-      <div class="popup-head"><h3>${esc(title)}</h3><div class="popup-head-actions">${saveBtn}${openRef ? `<button data-pin-toggle="${openRef}" class="ghost-btn">${isPinned(openRef) ? "Unpin" : "Pin"}</button><button data-open-page="${openRef}" class="ghost-btn">Open</button>` : ""}<button data-close-popup class="ghost-btn">Close</button></div></div>
+      <div class="popup-head"><h3>${esc(title)}</h3><div class="popup-head-actions">${saveBtn}${openRef ? `<button data-pin-toggle="${openRef}" class="ghost-btn">${isPinned(openRef) ? "Unpin" : "Pin"}</button><button data-open-page="${openRef}" class="ghost-btn">Open</button>` : ""}</div></div>
       ${inner}
     </div>
   </div>`;
@@ -401,10 +495,11 @@ function openPopup(title, inner, openRef) {
   bindExtraPopupForms();
 }
 // Clicking the backdrop saves (stamp 2026-11-04aj): an editor
-// popup submits its form exactly like Save and close; a create
+// popup submits its form exactly like Close; a create
 // popup submits only when its title is filled, so a stray click
 // cannot create an untitled item; anything else just closes.
 function savePopupAndClose() {
+  buzz();
   const root = $("#popup-root");
   const form = root?.querySelector?.("form.popup-form") || root?.querySelector?.("form[data-create-person-popup], form[data-create-reading-popup]");
   if (!form || typeof form.requestSubmit !== "function") { closePopup(); return; }
@@ -790,7 +885,7 @@ function taskEditorHtml(id, forPage) {
     </div>` : ""}
     ${parent ? `<p class="muted">Parent: <span class="row-title" data-open="tasks:${parent.id}">${esc(parent.title)}</span></p>` : ""}
     ${linksBlock("tasks", id)}
-    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Save</button><button type="submit" form="${fid}" class="primary-btn">Save and close</button><button data-duplicate-task="${t.id}" class="ghost-btn">Duplicate</button><button data-archive-task="${t.id}" class="danger-btn">Archive task</button><button data-close-popup class="ghost-btn">Close</button></p>`}`;
+    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Close</button><button data-duplicate-task="${t.id}" class="ghost-btn">Duplicate</button><button data-archive-task="${t.id}" class="danger-btn">Archive task</button></p>`}`;
 }
 
 function openTaskPopup(id) {
@@ -812,7 +907,7 @@ function noteEditorHtml(id, forPage) {
       <h4>Body</h4>${bodyFieldHtml("notes", id, n.body_markdown, n.body_version)}
     </form>
     ${linksBlock("notes", id)}
-    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Save</button><button type="submit" form="${fid}" class="primary-btn">Save and close</button><button data-duplicate-note="${n.id}" class="ghost-btn">Duplicate</button><button data-archive-note="${n.id}" class="danger-btn">Archive note</button><button data-close-popup class="ghost-btn">Close</button></p>`}`;
+    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Close</button><button data-duplicate-note="${n.id}" class="ghost-btn">Duplicate</button><button data-archive-note="${n.id}" class="danger-btn">Archive note</button></p>`}`;
 }
 
 function openNotePopup(id) {
@@ -834,7 +929,7 @@ function personEditorHtml(id, forPage) {
     </form>
     ${items.length ? `<h4>Linked items</h4>${items.map((x) => `<div class="row"><span class="badge">${esc(x.type)}</span><span class="row-title" data-open="${x.type}:${x.row.id}">${esc(x.row.title)}</span></div>`).join("")}` : ""}
     ${linksBlock("people", id)}
-    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Save</button><button type="submit" form="${fid}" class="primary-btn">Save and close</button><button data-archive-person="${p.id}" class="danger-btn">Archive person</button><button data-close-popup class="ghost-btn">Close</button></p>`}`;
+    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Close</button><button data-archive-person="${p.id}" class="danger-btn">Archive person</button></p>`}`;
 }
 
 function openPersonPopup(id) {
@@ -863,7 +958,7 @@ function projectEditorHtml(id, forPage) {
       <div data-todo-selected>${[...related].map((tid) => { const t = tasks.find((x) => x.id === tid); return t ? `<div class="row"><span class="row-title">${esc(t.title)}</span><input type="hidden" name="todo" value="${t.id}"><button type="button" data-todo-remove>✕</button></div>` : ""; }).join("")}</div>
     </form>
     ${linksBlock("projects", id)}
-    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Save</button><button type="submit" form="${fid}" class="primary-btn">Save and close</button><button data-archive-project="${p.id}" class="danger-btn">Archive project</button><button data-close-popup class="ghost-btn">Close</button></p>`}`;
+    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Close</button><button data-archive-project="${p.id}" class="danger-btn">Archive project</button></p>`}`;
 }
 
 function openProjectPopup(id) {
@@ -884,7 +979,7 @@ function readingEditorHtml(id, forPage) {
       <h4>Notes</h4>${bodyFieldHtml("reading_items", id, r.body_markdown, r.body_version)}
     </form>
     ${linksBlock("reading_items", id)}
-    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Save</button><button type="submit" form="${fid}" class="primary-btn">Save and close</button><button data-archive-reading="${r.id}" class="danger-btn">Archive item</button><button data-close-popup class="ghost-btn">Close</button></p>`}`;
+    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Close</button><button data-archive-reading="${r.id}" class="danger-btn">Archive item</button></p>`}`;
 }
 
 function openReadingPopup(id) {
@@ -902,7 +997,7 @@ function inboxEditorHtml(id, forPage) {
       <div class="cf-field"><label class="cf-label">Title</label><input name="title" value="${esc(item.title)}"></div>
       <h4>Body</h4>${bodyFieldHtml("inbox_items", id, item.body_markdown, item.body_version)}
     </form>
-    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Save</button><button type="submit" form="${fid}" class="primary-btn">Save and close</button><button data-move-personal="${id}">Move to Personal Notes</button> <button data-archive-inbox="${id}" class="danger-btn">Archive</button> <button data-close-popup class="ghost-btn">Close</button></p>`}`;
+    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Close</button><button data-move-personal="${id}">Move to Personal Notes</button> <button data-archive-inbox="${id}" class="danger-btn">Archive</button> </p>`}`;
 }
 
 function openInboxPopup(id) {
@@ -1076,7 +1171,7 @@ function render() {
   renderSidebar();
   $$(".tab-btn").forEach((b) => {
     b.classList.toggle("active", b.dataset.tab === state.tab);
-    if (b.dataset.tab === "tasks") {
+    if (b.dataset.tab === "daily") {
       const n = openTasks().filter((t) => t.due_date && t.due_date <= todayToronto()).length;
       let badge = b.querySelector(".tab-badge");
       if (n > 0) {
@@ -1196,19 +1291,53 @@ function familyPanel() {
   return `<div class="panel"><h3>Family calendar <button type="button" data-fam-refresh class="ghost-btn fam-refresh">Refresh</button></h3>${fam.status === "stale" ? `<p class="muted">Couldn't refresh just now — showing the last copy${updated}.</p>` : ""}${sections || "<p class='muted'>Nothing on the family calendar this week.</p>"}</div>`;
 }
 
+// Phone dashboard weather (stamp au): one line instead of the full
+// panel — today's icon, high/low, condition, current temperature.
+// Phone weather (stamp bh): the one-line summary is the default
+// look; tapping it expands in place with the day cards and the
+// selected day's detail (3-hour chunks, stats) — the same data the
+// full weather panel uses. state.weatherDay picks the day.
+let wxOpen = false;
+// More drawer (stamp bj): tapping anywhere outside the open drawer
+// closes it, and that tap is swallowed so it doesn't also trigger
+// whatever it landed on.
+document.addEventListener("click", (e) => {
+  const sb = document.querySelector("#sidebar");
+  if (!sb?.classList.contains("open")) return;
+  if (e.target.closest?.("#sidebar") || e.target.closest?.("#nav-more") || e.target.closest?.("#menu-btn")) return;
+  sb.classList.remove("open");
+  e.preventDefault();
+  e.stopPropagation();
+}, true);
+document.addEventListener("click", (e) => {
+  if (!e.target.closest?.("[data-wx-toggle]")) return;
+  wxOpen = !wxOpen;
+  if (wxOpen && state.weatherDay == null) state.weatherDay = 0;
+  render();
+});
+function weatherLineHtml() {
+  if (!state.weather) {
+    fetchWeather();
+    return "";
+  }
+  const days = state.weather.daily;
+  const { icon, condition } = weatherIcon(days.weathercode?.[0] ?? -1);
+  const hi = Math.round(days.temperature_2m_max?.[0] ?? 0);
+  const lo = Math.round(days.temperature_2m_min?.[0] ?? 0);
+  const now = Math.round(state.weather.current.temperature_2m);
+  const line = `<div class="panel wx-line" data-wx-toggle>${icon} <b>${hi}°</b><span class="muted"> / ${lo}° · ${esc(condition)} · ${now}° now · Mitchell</span>${state.weatherStale ? `<span class="muted"> · as of ${new Date(state.weatherStale).toLocaleTimeString("en-CA", { hour: "numeric", minute: "2-digit" })}</span>` : ""}<span class="wx-chev">${wxOpen ? "▾" : "▸"}</span></div>`;
+  if (!wxOpen) return line;
+  const full = weatherPanel();
+  const inner = full.replace(/^<div class="panel weather-panel"><h3>Weather — Mitchell, Ontario<\/h3>/, "").replace(/<\/div>$/, "");
+  return `${line}<div class="panel wx-open">${inner}</div>`;
+}
+
 function renderDashboard() {
   const conflicts = state.engine.listConflicts();
-  if (focusOn()) {
-    return `<div class="panel focus-bar"><b>Focus mode</b> <span class="muted">Just today \u2014 everything else is hidden.</span><button data-focus-toggle class="ghost-btn">Exit focus</button></div>
-  ${dailyWorkspacePanel()}`;
-  }
-  return `${weatherPanel()}
+  return `${weatherLineHtml()}
   ${pinnedPanel()}
-  ${dailyWorkspacePanel()}
-  ${familyPanel()}
   ${upcomingPanel()}
-  <div class="dash-row${readingQueuePanel() ? "" : " dash-row-single"}">${inboxPanel()}${readingQueuePanel()}</div>
-  <div class="panel"><form data-dash-search class="form"><input name="q" placeholder="Search DashBen…" style="flex:1"><button>Search</button></form></div>
+  ${familyPanel()}
   ${conflicts.length ? `<div class="panel"><h3>Sync conflicts (${conflicts.length}) — server row kept</h3>` + conflicts.map((c) => {
     let srv = null;
     try { srv = c.server_row_json ? JSON.parse(c.server_row_json) : null; } catch {}
@@ -1377,9 +1506,6 @@ function pinnedPanel() {
   return rows.length ? `<div class="panel"><h3>Pinned</h3>${rows.join("")}</div>` : "";
 }
 
-// Focus mode (ac): a local setting, like the collapsed sidebar.
-function focusOn() { try { return !!JSON.parse(localStorage.getItem("pkm-local-settings") || "{}").focusMode; } catch { return false; } }
-function setFocusMode(on) { try { const s = JSON.parse(localStorage.getItem("pkm-local-settings") || "{}"); s.focusMode = on; localStorage.setItem("pkm-local-settings", JSON.stringify(s)); } catch {} }
 
 // Reading queue (ad): oldest not-yet-read items, top of the pile.
 function readingQueuePanel() {
@@ -2148,6 +2274,17 @@ function bindPopupForms(root = $("#popup-root")) {
       if (list && !list.querySelector("[data-sub-row]")) list.innerHTML = "<p class='muted'>No subtasks.</p>";
       if (form) persistSubtasks(form);
     });
+    // Enter in the New-subtask box adds the subtask (stamp as): a
+    // delegated capture-phase handler with a keyCode fallback, because
+    // the per-input binding misses keys some Android IMEs deliver
+    // without a clean key value (focus just jumped to the next field).
+    root.addEventListener("keydown", (e) => {
+      const inp = e.target.closest?.("[data-sub-new]");
+      if (!inp) return;
+      if (e.key !== "Enter" && e.keyCode !== 13) return;
+      e.preventDefault();
+      inp.closest(".inline-add")?.querySelector("[data-add-sub-btn]")?.click();
+    }, true);
     root.addEventListener("change", (e) => {
       const row = e.target.closest("[data-sub-row]");
       if (!row || e.target.type !== "checkbox") return;
@@ -2279,11 +2416,45 @@ function bindPopupForms(root = $("#popup-root")) {
     e.preventDefault();
     input.closest(".inline-add")?.querySelector("[data-add-sub-btn]")?.click();
   }));
-  $$("[data-fab-capture]", root).forEach((f) => f.addEventListener("submit", (e) => {
+  $$("[data-fab-capture]", root).forEach((f) => f.addEventListener("submit", async (e) => {
     e.preventDefault();
     const d = new FormData(f);
-    state.store.captureInbox({ title: d.get("title") || "", body: d.get("body") });
+    const bodyText = (d.get("body") || "").trim();
+    const files = d.getAll("photo").filter((x) => x && typeof x === "object" && "size" in x && x.size > 0);
+    if (!bodyText && !files.length) return;
+    // Same smart routing as the Inbox tab capture (stamp bo): a bare
+    // link files to Reading, "task:" makes a task — unless files or a
+    // title say it belongs in the inbox.
+    if (!files.length && !(d.get("title") || "").trim() && routeCapture(bodyText) !== "inbox") { closePopup(); render(); saveBytes(); return; }
+    const item = state.store.captureInbox({ title: d.get("title") || "", body: bodyText || "Photo" });
+    for (const file of files) {
+      try { const att = await fileToAttachment(file); state.store.addAttachment("inbox_items", item.id, att.mime, att.data, att.name ?? null); }
+      catch { alert("An attachment could not be added."); }
+    }
     closePopup(); render(); saveBytes();
+  }));
+  $$("[data-fab-task]", root).forEach((f) => f.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const title = (new FormData(f).get("title") || "").trim();
+    if (!title) return;
+    const parsed = parseQuickTask(title);
+    state.store.createTask({ title: parsed.title, due: parsed.due ?? todayToronto(), priority: parsed.priority, project: "General" });
+    closePopup(); render(); saveBytes(); showToast("Task added");
+  }));
+  $$("[data-fab-note]", root).forEach((f) => f.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const text = (new FormData(f).get("jot") || "").trim();
+    if (!text) return;
+    try { await appendDailyLine(todayToronto(), text); } catch (err) { alert(err.message); return; }
+    closePopup(); render(); saveBytes(); showToast("Added to today's daily note");
+  }));
+  $$("[data-fab-schedule]", root).forEach((f) => f.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const d = new FormData(f);
+    const time = d.get("time"), text = (d.get("text") || "").trim();
+    if (!time || !text) return;
+    try { await appendDailyLine(todayToronto(), `${time} — ${text}`); } catch (err) { alert(err.message); return; }
+    closePopup(); render(); saveBytes(); showToast("Added to today's schedule");
   }));
   $$("[data-move-category]", root).forEach((f) => f.addEventListener("submit", (e) => {
     e.preventDefault();
@@ -2458,50 +2629,143 @@ function bindPopupForms(root = $("#popup-root")) {
 }
 
 function attachPersistentListeners() {
+  // Sync on return (stamp bz): coming back to the app/tab pulls
+  // anything that changed elsewhere instead of sitting stale until
+  // the next edit or manual sync. Throttled; doSync self-guards.
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden || !state.booted || !state.transport?.token) return;
+    if (state.lastResumeSync && Date.now() - state.lastResumeSync < 20000) return;
+    state.lastResumeSync = Date.now();
+    doSync();
+  });
   // Swipe left on a task row toggles it done. The row's checkbox and
   // popup still work if a swipe never fires; a detected swipe kills
   // the synthetic tap click so the popup does not open.
-  let swRow = null, swX = null, swMoved = false;
+  let swRow = null, swX = null, swY = null, swMoved = false, swAxis = null;
+  // Reveal-and-confirm swipe (stamp bn): a slide no longer fires the
+  // action. Past 56px the row snaps open and a labelled button sits
+  // in the vacated strip; only pressing that button acts. Any other
+  // tap dismisses. (Ben: firing on release still felt too sensitive.)
+  let swOpenRow = null, swZone = null, swKillClick = false, swOpenedAt = 0;
+  function closeSwipe() {
+    if (!swOpenRow) return;
+    const r = swOpenRow; swOpenRow = null;
+    r.style.transition = "transform .18s";
+    r.style.transform = "";
+    setTimeout(() => { r.style.transition = ""; }, 200);
+    r.querySelector(".swipe-act")?.remove();
+  }
+  function makeSwipeZone(row, dir) {
+    const task = state.store.getRow("tasks", row.dataset.task);
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "swipe-act " + (dir > 0 ? "snooze" : "done");
+    b.dataset.swipeAct = dir > 0 ? "snooze" : "done";
+    b.textContent = dir > 0 ? "🌙 +1 day" : (task?.done ? "↩ Undo" : "✓ Done");
+    b.style[dir > 0 ? "left" : "right"] = "0";
+    row.appendChild(b);
+    return b;
+  }
   $("#main").addEventListener("touchstart", (e) => {
+    if (e.target.closest?.("[data-swipe-act]")) return; // the confirm tap itself
     const row = e.target.closest?.("[data-task]");
+    if (swOpenRow) {
+      const wasOpen = swOpenRow;
+      closeSwipe();
+      if (row === wasOpen) { swKillClick = true; swRow = null; swX = null; return; }
+    }
     if (!row || e.touches.length !== 1) { swRow = null; swX = null; return; }
-    swRow = row; swX = e.touches[0].clientX; swMoved = false;
+    row.style.transition = "";
+    swRow = row; swX = e.touches[0].clientX; swY = e.touches[0].clientY; swMoved = false; swAxis = null; swZone = null;
   }, { passive: true });
   $("#main").addEventListener("touchmove", (e) => {
     if (!swRow || swX === null) return;
     const dx = e.touches[0].clientX - swX;
-    swRow.style.transform = `translateX(${Math.max(-80, Math.min(80, dx))}px)`;
-    if (Math.abs(dx) > 12) swMoved = true;
+    const dy = e.touches[0].clientY - swY;
+    // Axis lock (stamp as): a mostly-vertical gesture is a scroll, not
+    // a swipe. Horizontal intent needs a 16px dead zone with dx
+    // clearly dominant before the row starts moving at all.
+    if (swAxis === null) {
+      if (Math.abs(dy) > 24 && Math.abs(dy) > Math.abs(dx)) { swRow.style.transform = ""; swZone?.remove(); swZone = null; swRow = null; swX = null; return; }
+      if (Math.abs(dx) > 16 && Math.abs(dx) > Math.abs(dy)) swAxis = "x";
+      else return;
+    }
+    const clamped = Math.max(-110, Math.min(110, dx));
+    swRow.style.transform = `translateX(${clamped}px)`;
+    // The action zone stays pinned at the row's original edge
+    // (counter-translated) so the content slides away from it.
+    const dir = dx >= 0 ? 1 : -1;
+    if (!swZone || (swZone.dataset.swipeAct === "snooze") !== (dir > 0)) { swZone?.remove(); swZone = makeSwipeZone(swRow, dir); }
+    swZone.style.transform = `translateX(${-clamped}px)`;
+    swMoved = true;
+  }, { passive: true });
+  // Stickiness (stamp br): the synthetic click a WebView fires right
+  // after the swipe's touchend used to land on the just-opened row
+  // and dismiss it instantly — the row never stayed open to press.
+  // Swallow non-button clicks for a short window after opening, and
+  // reset cleanly if the browser cancels the gesture.
+  $("#main").addEventListener("click", (e) => {
+    if (swOpenRow && Date.now() - swOpenedAt < 450 && !e.target.closest?.("[data-swipe-act]")) { e.preventDefault(); e.stopPropagation(); }
+  }, true);
+  document.addEventListener("scroll", () => closeSwipe(), { capture: true, passive: true });
+  $("#main").addEventListener("touchcancel", () => {
+    if (swRow) { swRow.style.transform = ""; swZone?.remove(); }
+    swRow = null; swX = null; swY = null; swMoved = false; swAxis = null; swZone = null;
   }, { passive: true });
   $("#main").addEventListener("touchend", (e) => {
+    if (swKillClick) { e.preventDefault(); swKillClick = false; return; }
     if (!swRow) return;
     const m = /translateX\((-?[\d.]+)px\)/.exec(swRow.style.transform || "");
     const dx = m ? parseFloat(m[1]) : 0;
-    swRow.style.transform = "";
-    if (swMoved && dx <= -60) {
-      e.preventDefault();
-      swRow.querySelector("[data-tick]")?.click();
-    } else if (swMoved && dx >= 60) {
-      e.preventDefault();
-      const id = swRow.querySelector("[data-tick]")?.dataset.tick ?? swRow.dataset.task;
-      const task = id ? state.store.getRow("tasks", id) : null;
-      if (task && !task.done) {
-        const today = todayToronto();
-        const base = task.due_date && task.due_date > today ? task.due_date : today;
-        state.store.updateProps("tasks", id, { due_date: ymdAdd(base, 1) });
-        render(); saveBytes();
-      }
+    const row = swRow, zone = swZone, wasMoved = swMoved;
+    swRow = null; swX = null; swY = null; swMoved = false; swAxis = null; swZone = null;
+    // (Stamp bt: wasMoved is captured BEFORE the reset — the bn code
+    // tested swMoved after zeroing it, so the open branch was dead
+    // and every swipe snapped shut on release.)
+    if (wasMoved && Math.abs(dx) >= 56) {
+      e.preventDefault(); // kill the synthetic tap so it can't dismiss or open
+      const dir = dx > 0 ? 1 : -1;
+      const z = zone ?? makeSwipeZone(row, dir);
+      row.style.transition = "transform .18s";
+      row.style.transform = `translateX(${dir * 96}px)`;
+      z.style.transition = "transform .18s";
+      z.style.transform = `translateX(${-dir * 96}px)`;
+      setTimeout(() => { row.style.transition = ""; z.style.transition = ""; }, 200);
+      swOpenRow = row; swOpenedAt = Date.now();
+    } else {
+      row.style.transform = "";
+      zone?.remove();
     }
-    swRow = null; swX = null; swMoved = false;
   }, { passive: false });
   $("#main").addEventListener("click", async (e) => {
+    const swAct = e.target.closest("[data-swipe-act]");
+    if (swAct) {
+      const id = swAct.closest("[data-task]")?.dataset.task;
+      closeSwipe(); buzz();
+      if (id) {
+        const t = state.store.getRow("tasks", id);
+        if (t) {
+          if (swAct.dataset.swipeAct === "done") {
+            if (!t.done) state.store.completeTask(id, todayToronto());
+            else state.store.updateProps("tasks", id, { done: 0 });
+          } else if (!t.done) {
+            const today = todayToronto();
+            const base = t.due_date && t.due_date > today ? t.due_date : today;
+            state.store.updateProps("tasks", id, { due_date: ymdAdd(base, 1) });
+          }
+          render(); saveBytes();
+        }
+      }
+      return;
+    }
+    if (swOpenRow) { if (Date.now() - swOpenedAt < 450) return; closeSwipe(); return; }
     const tick = e.target.closest("[data-tick]");
     if (tick) {
       const id = tick.dataset.tick;
       const row = state.store.getRow("tasks", id);
       if (!row.done) state.store.completeTask(id, todayToronto());
       else state.store.updateProps("tasks", id, { done: 0 });
-      render(); saveBytes();
+      buzz(); render(); saveBytes();
       return;
     }
     const readingDone = e.target.closest("[data-reading-done]");
@@ -2528,13 +2792,6 @@ function attachPersistentListeners() {
     if (calRetry) { loadCalRange(true); return; }
     const famBtn = e.target.closest("[data-fam-refresh]");
     if (famBtn) { loadFamilyCalendar(true); return; }
-    const focusBtn = e.target.closest("[data-focus-toggle]");
-    if (focusBtn) {
-      setFocusMode(!focusOn());
-      state.itemView = null; state.tab = "dashboard"; saveTab();
-      render();
-      return;
-    }
     const mdDl = e.target.closest("[data-md-download]");
     if (mdDl) { const v = parsePageRef(mdDl.dataset.mdDownload); const row = v.type === "custom" ? state.store.getRow("custom_objects", v.id) : state.store.getRow(v.type, v.id); if (row) downloadBytes(`${slugify(row.title)}.md`, new TextEncoder().encode(objectToMarkdown(v.type, row)), "text/markdown"); return; }
     const pinOpen = e.target.closest("[data-pin-open]");
@@ -2624,10 +2881,8 @@ function attachPersistentListeners() {
 
 // --- Boot ---
 async function boot() {
-  console.log("[dashben-boot] start");
   loadSettings();
   await loadSecureToken();
-  console.log("[dashben-boot] token done");
   // The WASM binary ships as base64 text (vendor/sql-wasm.wasm.b64)
   // because the repo push tooling only accepts UTF-8 files, so the
   // binary .wasm itself is never committed. Decoded here and handed
@@ -2635,10 +2890,8 @@ async function boot() {
   const b64 = await (await fetch("./vendor/sql-wasm.wasm.b64")).text();
   const bin = Uint8Array.from(atob(b64.trim()), (c) => c.charCodeAt(0));
   const SQL = await initSqlJs({ wasmBinary: bin });
-  console.log("[dashben-boot] wasm ready");
   const schema = await (await fetch(SCHEMA_URL)).text();
   const bytes = await loadBytes();
-  console.log("[dashben-boot] bytes ready", bytes ? bytes.length : null);
   let fresh = false;
   if (bytes) {
     state.db = new SqlJsDb(SQL, bytes);
@@ -2651,7 +2904,7 @@ async function boot() {
   state.store = new LocalStore(state.engine);
   state.transport = new HttpTransport(state.base, state.token);
   state.booted = !fresh || !!bytes;
-  console.log("[dashben-boot] db ready");
+  state.bootMs = Math.round((typeof performance !== "undefined" ? performance.now() : 0) - BOOT_T0);
   try { state.db.exec(`CREATE TABLE IF NOT EXISTS attachments (id TEXT PRIMARY KEY, owner_type TEXT NOT NULL, owner_id TEXT NOT NULL, mime TEXT NOT NULL, data TEXT NOT NULL, created_at TEXT, updated_at TEXT, archived INTEGER NOT NULL DEFAULT 0)`); } catch {}
   try { const cols = state.db.prepare(`PRAGMA table_info(attachments)`).all(); if (cols.length && !cols.some((c) => c.name === "name")) state.db.exec(`ALTER TABLE attachments ADD COLUMN name TEXT`); } catch {}
   ensureSearchIndex();
@@ -2734,8 +2987,22 @@ async function boot() {
     const item = e.target.closest?.("[data-palette-idx]");
     if (item) runPaletteEntry(Number(item.dataset.paletteIdx));
   });
-  $("#nav-more").addEventListener("click", () => $("#sidebar").classList.toggle("open"));
-  $("#fab-capture").addEventListener("click", () => openPopup("Capture", `<form data-fab-capture class="form"><input name="title" placeholder="Title (optional)"><textarea name="body" rows="4" placeholder="Capture…" required></textarea><p class="popup-actions"><button type="submit" class="primary-btn">Capture</button><button type="button" data-close-popup class="ghost-btn">Cancel</button></p></form>`));
+  // (stamp bm: the bottom-bar More button is gone — the drawer opens from the header #menu-btn.)
+  // FAB menu (stamp bg): the + button opens a small action menu —
+  // Capture (inbox capture), Task (quick add), Quick Note (jot into
+  // today's daily note). Tapping anywhere else dismisses it.
+  const fabMenu = $("#fab-menu");
+  const hideFabMenu = () => { if (fabMenu) fabMenu.hidden = true; };
+  $("#fab-capture").addEventListener("click", (e) => { e.stopPropagation(); if (fabMenu) fabMenu.hidden = !fabMenu.hidden; });
+  document.addEventListener("click", (e) => {
+    const act = e.target.closest?.("[data-fab-menu]")?.dataset.fabMenu;
+    if (!act) { if (!e.target.closest?.("#fab-menu") && !e.target.closest?.("#fab-capture")) hideFabMenu(); return; }
+    hideFabMenu();
+    if (act === "capture") openPopup("Capture", `<form data-fab-capture class="form"><input name="title" placeholder="Title (optional)"><textarea name="body" rows="4" placeholder="Capture…"></textarea><input type="file" name="photo" accept="image/*,.pdf,.txt,.md,.csv,.doc,.docx,.rtf" multiple><p class="popup-actions"><button type="submit" class="primary-btn">Capture</button><button type="button" data-close-popup class="ghost-btn">Cancel</button></p></form>`);
+    else if (act === "task") { openPopup("Quick add task", `<form data-fab-task class="form"><input name="title" placeholder="New task — try 'Fri P1'" required style="flex:1"><p class="popup-actions"><button type="submit" class="primary-btn">Add task</button><button type="button" data-close-popup class="ghost-btn">Cancel</button></p></form>`); setTimeout(() => $("#popup-root input[name=title]")?.focus(), 40); }
+    else if (act === "schedule") { openPopup("Add to schedule", `<form data-fab-schedule class="form"><input type="time" name="time" required><input name="text" placeholder="e.g. Meeting with…" required style="flex:1"><p class="popup-actions"><button type="submit" class="primary-btn">Add to schedule</button><button type="button" data-close-popup class="ghost-btn">Cancel</button></p></form>`); setTimeout(() => $("#popup-root input[name=text]")?.focus(), 40); }
+    else if (act === "note") { openPopup("Quick note", `<form data-fab-note class="form"><textarea name="jot" rows="3" placeholder="Jot a note for today…" required style="flex:1"></textarea><p class="popup-actions"><button type="submit" class="primary-btn">Jot it down</button><button type="button" data-close-popup class="ghost-btn">Cancel</button></p></form>`); setTimeout(() => $("#popup-root textarea[name=jot]")?.focus(), 40); }
+  });
   // "Auto (system)" theme follows the OS; re-apply when it flips.
   window.matchMedia("(prefers-color-scheme: light)").addEventListener("change", applyTheme);
   // Pull-to-refresh (shell only, additive: Sync now still works if a
@@ -2763,7 +3030,12 @@ async function boot() {
   // edits and pulls anything that landed server-side while offline.
   window.addEventListener("online", () => { render(); if (state.booted) doSync(); });
   window.addEventListener("offline", render);
-  document.addEventListener("visibilitychange", () => { if (!document.hidden) captureSharedText(); });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) { shellHiddenAt = Date.now(); return; }
+    captureSharedText();
+    if (shellHiddenAt && Date.now() - shellHiddenAt > 60000) maybeLockApp();
+    shellHiddenAt = 0;
+  });
   attachPersistentListeners();
   attachExtraListeners();
   // Reload lands on the tab that was open, not always the dashboard.
@@ -2778,13 +3050,15 @@ async function boot() {
   initNav();
   loadFamilyCalendar();
   render();
-  console.log("[dashben-boot] rendered");
+  document.body?.classList.add("booted");
   await captureSharedText();
   // Auto-sync on launch when we already have local state; on a fresh
   // database, first sync runs on the first manual Sync press (so a
   // missing token doesn't block first paint).
   if (!fresh) await doSync();
   void initReminders();
+  processPendingNotifActions();
+  maybeLockApp();
 }
 
 boot().catch((e) => {
@@ -2792,7 +3066,7 @@ boot().catch((e) => {
 });
 
 // --- Parity P2/P3/P4/P6: Daily, Management, custom types, FTS, themes ---
-const DEFAULT_TABS = ["dashboard", "daily", "calendar", "review", "tasks", "notes", "projects", "reading", "people", "inbox", "search", "management"];
+const DEFAULT_TABS = ["dashboard", "daily", "calendar", "tasks", "notes", "projects", "reading", "people", "inbox", "search", "management"]; // Review tab removed on mobile (stamp bc)
 const TAB_LABELS = { dashboard: "Dashboard", daily: "Daily", calendar: "Calendar", review: "Review", tasks: "Tasks", notes: "Notes", projects: "Projects", reading: "Reading", people: "People", inbox: "Inbox", search: "Search", management: "Management" };
 const MANAGED_FIELD_LIST = [
   ["tasks", "priority"], ["tasks", "project"], ["notes", "type"], ["people", "role"],
@@ -2907,11 +3181,11 @@ function renderDaily() {
     const { schedule, notes } = splitSchedule(note.body_markdown ?? "");
     body = `<div class="panel"><h3>Schedule</h3>${schedule.length ? schedule.map((l) => `<p>${esc(l)}</p>`).join("") : "<p class='muted'>No schedule entries yet (lines starting with a time, like 9:00 — Meeting).</p>"}</div>
     <div class="panel"><h3>Notes</h3>${notes.join("\n").trim() ? notes.map((l) => `<p>${esc(l)}</p>`).join("") : "<p class='muted'>No notes yet.</p>"}</div>
-    <form data-daily-schedule="${date}" class="form"><input type="time" name="time" required><input name="text" placeholder="Schedule entry, e.g. Meeting with…" style="flex:1" required><button>Add to schedule</button></form>
-    <form data-daily-jot="${date}" class="form"><textarea name="jot" rows="3" placeholder="Jot a note…" style="flex:1"></textarea><button>Jot it down</button></form>
+    ${familyPanel()}
     <p><button data-open="notes:${note.id}">Edit daily note</button></p>`;
   } else {
-    body = `<p class="muted">No daily note for this date yet.</p><p><button data-create-daily="${date}" class="primary-btn">Create daily note for ${date}</button></p>`;
+    body = `<p class="muted">No daily note for this date yet.</p>
+    ${familyPanel()}<p><button data-create-daily="${date}" class="primary-btn">Create daily note for ${date}</button></p>`;
   }
   return `<form data-daily-nav class="form">
     <button type="button" data-daily-shift="-1"><span class="nav-arrow">← </span>Prev</button>
@@ -2919,10 +3193,9 @@ function renderDaily() {
     <button type="button" data-daily-go>Go</button>
     <button type="button" data-daily-shift="1">Next <span class="nav-arrow">→</span></button>
     <button type="button" data-daily-shift="0">Today</button>
-    <button type="button" data-print-daily class="ghost-btn">Print</button>
   </form>
   ${dayContextPanel(date)}
-  <div class="panel"><h3>${date === todayToronto() ? "Carried over" : "Overdue"} (${overdue.length})</h3>${date === todayToronto() && overdue.length ? ` <button data-carry-all class="ghost-btn">All → today</button>` : ""}${overdue.length ? overdue.map((t) => taskRow(t, { carry: date === todayToronto() })).join("") : "<p class='muted'>Nothing overdue.</p>"}</div>
+  <div class="panel"><h3>Overdue (${overdue.length})</h3>${date === todayToronto() && overdue.length ? ` <button data-carry-all class="ghost-btn">All → today</button>` : ""}${overdue.length ? overdue.map((t) => taskRow(t, { carry: date === todayToronto() })).join("") : "<p class='muted'>Nothing overdue.</p>"}</div>
   <div class="panel"><h3>Due Today (${todos.length})</h3>${date === todayToronto() && todos.length ? `<p><button data-push-all class="ghost-btn">All → tomorrow</button></p>` : ""}${todos.length ? todos.map(taskRow).join("") : "<p class='muted'>Nothing due this day.</p>"}</div>
   ${body}`;
 }
@@ -2939,8 +3212,34 @@ function weatherIcon(code) {
   if (code >= 95) return { icon: "⛈️", condition: "Thunderstorm" };
   return { icon: "🌡️", condition: "Unknown" };
 }
+// Haptics (stamp bz): a tiny tick on confirm actions; silently a
+// no-op where the platform has no vibrator (desktop browsers).
+function buzz() { try { navigator.vibrate?.(12); } catch { /* unsupported */ } }
+
+const WX_CACHE_KEY = "dashben-weather";
+function wxCacheSave(data) {
+  try { localStorage.setItem(WX_CACHE_KEY, JSON.stringify({ at: Date.now(), data })); } catch { /* storage full/blocked */ }
+}
+function wxCacheLoad() {
+  if (state.weather) return;
+  try {
+    const raw = localStorage.getItem(WX_CACHE_KEY);
+    if (!raw) return;
+    const { at, data } = JSON.parse(raw);
+    if (data && data.current && data.daily) { state.weather = data; state.weatherStale = at || null; }
+  } catch { /* ignore a bad cache */ }
+}
 async function fetchWeather() {
-  if (state.weather || state.weatherTried) return;
+  // Weather cache + retry (stamps by + bz): the last good forecast
+  // is kept in localStorage; a cold start or a failed fetch shows
+  // the cached copy (flagged stale) instead of nothing, and a
+  // failure retries at most once a minute until fresh data lands.
+  if (state.weatherFetching) return;
+  wxCacheLoad();
+  if (state.weather && !state.weatherStale) return;
+  if (state.weatherTriedAt && Date.now() - state.weatherTriedAt < 60000) return;
+  state.weatherFetching = true;
+  state.weatherTriedAt = Date.now();
   state.weatherTried = true;
   try {
     // Same request production uses (today + next 3 days).
@@ -2948,12 +3247,15 @@ async function fetchWeather() {
     const res = await fetch(url);
     if (!res.ok) throw new Error("weather fetch failed");
     state.weather = await res.json();
-  } catch { state.weather = null; }
+    state.weatherStale = null;
+    wxCacheSave(state.weather);
+  } catch { /* keep any cached copy on screen */ }
+  state.weatherFetching = false;
   if (state.tab === "dashboard" || state.tab === "daily") render();
 }
 function weatherPanel() {
   if (!state.weather) {
-    if (state.weatherTried) return `<div class="panel weather-panel"><h3>Weather — Mitchell, Ontario</h3><p class="muted">Weather unavailable right now — reload to try again.</p></div>`;
+    if (state.weatherTried) { fetchWeather(); return `<div class="panel weather-panel"><h3>Weather — Mitchell, Ontario</h3><p class="muted">Weather unavailable right now — retrying automatically.</p></div>`; }
     fetchWeather();
     return `<div class="panel weather-panel"><h3>Weather — Mitchell, Ontario</h3><p class="muted">Loading…</p></div>`;
   }
@@ -2981,22 +3283,41 @@ function weatherPanel() {
       const base = i * 24;
       const hourLabel = (h) => `${((h + 11) % 12) + 1} ${h < 12 ? "AM" : "PM"}`;
       const nowH = i === 0 ? new Date().getHours() : -1;
+      // Rolling window (stamp bu, Ben): for today the 8 chunks start
+      // at the current 3-hour window and run 24h forward (spilling
+      // into tomorrow) instead of covering the calendar day from
+      // midnight. Other days keep their calendar-day chunks.
+      const startH = i === 0 ? Math.floor(nowH / 3) * 3 : 0;
       const tiles = [];
       for (let c = 0; c < 8; c++) {
-        const hs = [base + c * 3, base + c * 3 + 1, base + c * 3 + 2];
+        const hs = [base + startH + c * 3, base + startH + c * 3 + 1, base + startH + c * 3 + 2];
         const temps = hs.map((k) => hours.temperature_2m?.[k]).filter((v) => v !== undefined && v !== null);
         if (!temps.length) continue;
         const avg = Math.round(temps.reduce((a, b) => a + b, 0) / temps.length);
         const pop = Math.max(...hs.map((k) => hours.precipitation_probability?.[k] ?? 0));
         const mid = weatherIcon(hours.weather_code?.[hs[1]] ?? -1);
-        const isNow = nowH >= c * 3 && nowH < c * 3 + 3;
-        tiles.push(`<div class="wd-chunk${isNow ? " now" : ""}"><span class="wd-lab">${hourLabel(c * 3)}</span><span class="wd-ico">${mid.icon}</span><span class="wd-val">${avg}°</span><span class="wd-lab">🌧️ ${pop}%</span></div>`);
+        const isNow = i === 0 && c === 0;
+        tiles.push(`<div class="wd-chunk${isNow ? " now" : ""}"><span class="wd-lab">${hourLabel((startH + c * 3) % 24)}</span><span class="wd-ico">${mid.icon}</span><span class="wd-val">${avg}°</span><span class="wd-lab">🌧️ ${pop}%</span></div>`);
       }
       if (tiles.length) chunks = `<div class="wd-chunks">${tiles.join("")}</div>`;
     }
-    return `<div class="weather-detail"><div class="wd-head"><span class="wd-icon">${icon}</span><div><strong>${label}, ${monthDay}</strong><div class="muted">${condition}</div></div><div class="wd-temps">${Math.round(days.temperature_2m_max[i])}°<span class="muted"> / ${Math.round(days.temperature_2m_min[i])}°</span></div></div><div class="wd-grid">${stat("🌡️", `${Math.round(days.temperature_2m_max[i])}°`, "High")}${stat("❄️", `${Math.round(days.temperature_2m_min[i])}°`, "Low")}${stat("🌧️", `${days.precipitation_probability_max?.[i] ?? "?"}%`, "Rain chance")}${stat("💧", `${days.precipitation_sum?.[i] ?? "?"} mm`, "Precipitation")}${stat("💨", `${days.wind_speed_10m_max?.[i] ?? "?"} km/h`, "Wind")}${stat("🌅", hm(days.sunrise?.[i]), "Sunrise")}${stat("🌇", hm(days.sunset?.[i]), "Sunset")}</div>${chunks}</div>`;
+    // Next sun event (shell only, stamp bu): a single tile showing
+    // whichever of sunrise/sunset comes next, instead of two tiles
+    // (the two-tile version left the stats grid one tile ragged).
+    const sunStat = (() => {
+      if (i === 0) {
+        const now = new Date();
+        const rise = days.sunrise?.[0] ? new Date(days.sunrise[0]) : null;
+        const set = days.sunset?.[0] ? new Date(days.sunset[0]) : null;
+        if (rise && now < rise) return stat("🌅", hm(days.sunrise[0]), "Sunrise");
+        if (set && now < set) return stat("🌇", hm(days.sunset[0]), "Sunset");
+        if (days.sunrise?.[1]) return stat("🌅", hm(days.sunrise[1]), "Sunrise");
+      }
+      return stat("🌅", hm(days.sunrise?.[i]), "Sunrise");
+    })();
+    return `<div class="weather-detail"><div class="wd-head"><span class="wd-icon">${icon}</span><div><strong>${label}, ${monthDay}</strong><div class="muted">${condition}</div></div><div class="wd-temps">${Math.round(days.temperature_2m_max[i])}°<span class="muted"> / ${Math.round(days.temperature_2m_min[i])}°</span></div></div><div class="wd-grid">${stat("🌡️", `${Math.round(days.temperature_2m_max[i])}°`, "High")}${stat("❄️", `${Math.round(days.temperature_2m_min[i])}°`, "Low")}${stat("🌧️", `${days.precipitation_probability_max?.[i] ?? "?"}%`, "Rain chance")}${stat("💧", `${days.precipitation_sum?.[i] ?? "?"} mm`, "Precipitation")}${stat("💨", `${days.wind_speed_10m_max?.[i] ?? "?"} km/h`, "Wind")}${sunStat}</div>${chunks}</div>`;
   })() : "";
-  return `<div class="panel weather-panel"><h3>Weather — Mitchell, Ontario</h3><p class="muted">${Math.round(state.weather.current.temperature_2m)}° now</p><div class="weather-grid">${cards}</div>${detail}</div>`;
+  return `<div class="panel weather-panel"><h3>Weather — Mitchell, Ontario</h3>${state.weatherStale ? `<p class="muted">Offline copy — retrying automatically.</p>` : ""}<p class="muted">${Math.round(state.weather.current.temperature_2m)}° now</p><div class="weather-grid">${cards}</div>${detail}</div>`;
 }
 function dailyWorkspacePanel() {
   const today = todayToronto();
@@ -3006,18 +3327,18 @@ function dailyWorkspacePanel() {
   let inner = "";
   if (note) {
     const { schedule, notes } = splitSchedule(note.body_markdown ?? "");
-    inner = `<div class="panel"><h3>Todos</h3>${overdue.length ? `<button data-carry-all class="ghost-btn">All overdue → today</button> ` : ""}${dueToday.length ? `<button data-push-all class="ghost-btn">All today → tomorrow</button> ` : ""}${overdue.length ? `<h4>Carried over (${overdue.length})</h4>${overdue.map((t) => taskRow(t, { carry: true, snooze: true })).join("")}<h4>Due today</h4>` : ""}${dueToday.length ? dueToday.map((t) => taskRow(t, { snooze: true })).join("") : "<p class='muted'>Nothing due today.</p>"}</div>
+    inner = `<div class="panel"><h3>Todos</h3>${overdue.length ? `<button data-carry-all class="ghost-btn">All overdue → today</button> ` : ""}${dueToday.length ? `<button data-push-all class="ghost-btn">All today → tomorrow</button> ` : ""}${overdue.length ? `<h4>Overdue (${overdue.length})</h4>${overdue.map((t) => taskRow(t, { carry: true, snooze: true })).join("")}<h4>Due today</h4>` : ""}${dueToday.length ? dueToday.map((t) => taskRow(t, { snooze: true })).join("") : "<p class='muted'>Nothing due today.</p>"}</div>
     <form data-dash-task class="form"><input name="title" placeholder="New task" required style="flex:1"><button class="primary-btn">+ New task</button></form>
     <h4>Schedule</h4>${schedule.length ? schedule.map((l) => `<p>${esc(l)}</p>`).join("") : "<p class='muted'>No schedule yet.</p>"}
     <h4>Notes</h4>${notes.join("\n").trim() ? notes.map((l) => `<p>${esc(l)}</p>`).join("") : "<p class='muted'>No notes yet.</p>"}
     <form data-daily-jot="${today}" class="form"><input name="jot" placeholder="Jot a note…" style="flex:1"><button>Add note</button></form>
     <p><button data-open="notes:${note.id}">Open full note</button></p>`;
   } else {
-    inner = `<div class="panel"><h3>Todos</h3>${overdue.length ? `<button data-carry-all class="ghost-btn">All overdue → today</button> ` : ""}${dueToday.length ? `<button data-push-all class="ghost-btn">All today → tomorrow</button> ` : ""}${overdue.length ? `<h4>Carried over (${overdue.length})</h4>${overdue.map((t) => taskRow(t, { carry: true, snooze: true })).join("")}<h4>Due today</h4>` : ""}${dueToday.length ? dueToday.map((t) => taskRow(t, { snooze: true })).join("") : "<p class='muted'>Nothing due today.</p>"}</div>
+    inner = `<div class="panel"><h3>Todos</h3>${overdue.length ? `<button data-carry-all class="ghost-btn">All overdue → today</button> ` : ""}${dueToday.length ? `<button data-push-all class="ghost-btn">All today → tomorrow</button> ` : ""}${overdue.length ? `<h4>Overdue (${overdue.length})</h4>${overdue.map((t) => taskRow(t, { carry: true, snooze: true })).join("")}<h4>Due today</h4>` : ""}${dueToday.length ? dueToday.map((t) => taskRow(t, { snooze: true })).join("") : "<p class='muted'>Nothing due today.</p>"}</div>
     <form data-dash-task class="form"><input name="title" placeholder="New task" required style="flex:1"><button class="primary-btn">+ New task</button></form>
     <p class="muted">No daily note for today yet.</p><p><button data-create-daily="${today}" class="primary-btn">Create today's daily note</button></p>`;
   }
-  return `<div class="panel"><h3>Daily Note</h3><p><button data-daily-tab>Open Daily tab →</button> <button data-focus-toggle class="ghost-btn">${focusOn() ? "Exit focus" : "Focus"}</button></p>${dayProgressHtml()}${inner}</div>`;
+  return `<div class="panel"><h3>Daily Note</h3><p><button data-daily-tab>Open Daily tab →</button></p>${dayProgressHtml()}${inner}</div>`;
 }
 function upcomingPanel() {
   const today = todayToronto();
@@ -3027,7 +3348,9 @@ function upcomingPanel() {
   const dueTomorrow = openTasks().filter((t) => t.due_date === tomorrow);
   const dueWeek = openTasks().filter((t) => t.due_date && t.due_date > tomorrow && t.due_date <= weekEnd);
   const section = (label, list) => `<h4>${label} (${list.length})</h4>${list.length ? list.map((t) => taskRow(t, { snooze: true })).join("") : "<p class='muted'>None.</p>"}`;
+  const dueToday = openTasks().filter((t) => t.due_date === today);
   return `<div class="panel"><h3>Upcoming</h3>
+  ${section("Due Today", dueToday)}
   ${section("Due Tomorrow", dueTomorrow)}
   ${section("Due This Week", dueWeek)}</div>`;
 }
@@ -3187,6 +3510,7 @@ function renderManagement() {
   const knownTabs = allTabIds();
   const order = [...prefs.order.filter((id) => knownTabs.includes(id)), ...knownTabs.filter((id) => !prefs.order.includes(id))];
   return `<div class="panel"><h3>Sync</h3><p class="muted">Your data syncs with pkm.ben-cloud.net. Saving a token starts a sync — delete any test items first, since later syncs upload local changes.</p>
+  <p class="muted">Local database: ${state.db ? Math.round(state.db.exportBytes().length / 1024) : 0} KB${state.bootMs ? ` · started in ${state.bootMs} ms` : ""}</p>
   <div class="token-card"><label for="sync-token-input">Sync token</label>
   <input id="sync-token-input" type="password" autocomplete="off" placeholder="SYNC_TOKEN">
   <button data-token-save class="ghost-btn">Save token</button>
@@ -3194,6 +3518,8 @@ function renderManagement() {
   <span class="muted">${state.token ? "Token saved" : "No token set"}</span></div>
   <p class="muted">Due reminders: <b>${state.store.getRow("ui_prefs", "reminders")?.value === "off" ? "Off" : "On"}</b> \u2014 a 9 a.m. nudge on each due day, plus a morning digest while tasks are overdue.</p>
   <p><button data-reminder-toggle class="ghost-btn">${state.store.getRow("ui_prefs", "reminders")?.value === "off" ? "Turn reminders on" : "Turn reminders off"}</button></p></div>
+  <div class="panel"><h3>App lock</h3><p class="muted">Require fingerprint or device PIN to open DashBen (off by default; locks again after a minute in the background). Current: <b>${appLockOn() ? "On" : "Off"}</b></p>
+  <p><button data-applock-toggle class="ghost-btn">${appLockOn() ? "Turn app lock off" : "Turn app lock on"}</button></p></div>
   <div class="panel"><h3>Backup</h3><p class="muted">Download a full copy of the local database (.db) — the same format the app loads. Keep it somewhere safe as offline insurance.</p><p><button data-export-db class="primary-btn">Export database</button></p><p><button data-export-md class="primary-btn">Export Markdown (.zip)</button></p></div>
   <div class="panel"><h3>Field values</h3><p class="muted">Selectable values for every field on every object type. Renaming a value renames it on every row using it. Deleting a value that is in use is blocked.</p>
   ${MANAGED_FIELD_LIST.map(([ot, f]) => `<h4>${ot}.${f}</h4>
@@ -3270,9 +3596,9 @@ function customEditorHtml(slug, id, forPage) {
     <form data-edit-custom="${slug}:${id}" id="custom-form" class="form popup-form">
       <div class="cf-field"><label class="cf-label">Title</label><input name="title" value="${esc(row.title)}" required></div>
       ${fields.map(fieldInput).join("")}
-      <button class="primary-btn">Save</button> <button>Save and close</button>
+      ${forPage ? `<button class="primary-btn">Save</button> ` : ""}<button>Close</button>
     </form>
-    ${forPage ? "" : `<p><button data-archive-custom="${id}">Archive</button> <button data-close-popup class="ghost-btn">Close</button></p>`}`;
+    ${forPage ? "" : `<p><button data-archive-custom="${id}">Archive</button> </p>`}`;
 }
 
 function openCustomPopup(slug, id) {
@@ -3305,7 +3631,6 @@ function bindExtraForms() {
   $$("[data-push-all]", main).forEach((b) => b.addEventListener("click", () => { const td = todayToronto(); allRows("tasks").filter((t) => !t.archived && !t.done && t.due_date === td).forEach((t) => state.store.updateProps("tasks", t.id, { due_date: ymdAdd(td, 1) })); render(); saveBytes(); }));
   $$("[data-tpl-add]", main).forEach((f) => f.addEventListener("submit", (e) => { e.preventDefault(); const d = new FormData(f); const name = (d.get("name") || "").trim(); if (!name) return; setTemplates([...getTemplates(), { id: "tpl-" + Date.now().toString(36), kind: d.get("kind") || "note", name, title: (d.get("title") || "").trim(), body: d.get("body") || "" }]); render(); saveBytes(); }));
   $$("[data-tpl-del]", main).forEach((b) => b.addEventListener("click", () => { setTemplates(getTemplates().filter((t) => t.id !== b.dataset.tplDel)); render(); saveBytes(); }));
-  $$("[data-print-daily]", main).forEach((b) => b.addEventListener("click", () => window.print()));
   $$("[data-inbox-bulk-toggle]", main).forEach((b) => b.addEventListener("click", () => { state.inboxBulk = !state.inboxBulk; if (!state.inboxBulk) state.inboxSel = new Set(); render(); }));
   $$("[data-inbox-sel]", main).forEach((c) => c.addEventListener("change", () => { const s = (state.inboxSel ??= new Set()); if (c.checked) s.add(c.dataset.inboxSel); else s.delete(c.dataset.inboxSel); render(); }));
   $$("[data-inbox-bulk-clear]", main).forEach((b) => b.addEventListener("click", () => { state.inboxSel = new Set(); render(); }));
@@ -3691,6 +4016,20 @@ function attachExtraListeners() {
       render(); saveBytes();
       return;
     }
+    const lockToggle = e.target.closest("[data-applock-toggle]");
+    if (lockToggle) {
+      if (appLockOn()) { setAppLock(false); render(); }
+      else if (NativeLock) {
+        try {
+          const avail = await withTimeout(NativeLock.isAvailable({}), 5000, "lock.avail").catch(() => null);
+          if (!avail?.available) { lockToggle.textContent = "No fingerprint/PIN set up on this phone"; return; }
+          const r = await withTimeout(NativeLock.authenticate({}), 120000, "lock.auth").catch(() => null);
+          if (r?.ok) setAppLock(true);
+        } catch { /* best-effort */ }
+        render();
+      }
+      return;
+    }
     const pageEdit = e.target.closest("[data-page-edit]");
     if (pageEdit) {
       const v = parsePageRef(pageEdit.dataset.pageEdit);
@@ -3780,7 +4119,7 @@ function attachExtraListeners() {
       const prefs = getTabPrefs();
       prefs.order = order;
       state.store.setTabPrefs(prefs);
-      await saveBytes();
+      await saveBytes(true);
       location.reload();
       return;
     }

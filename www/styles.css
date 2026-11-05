@@ -170,7 +170,12 @@ footer { padding: 12px 0; font-size: 13px; }
   button, input, select, textarea { min-height: 44px; }
   .popup-backdrop { align-items: flex-end; padding: 0; }
   .popup-card { border-radius: 20px 20px 0 0; max-height: 88vh; overflow-y: auto; padding: 20px 16px calc(20px + env(safe-area-inset-bottom)); }
-  .popup-actions { position: sticky; bottom: 0; background: var(--panel); padding-top: 12px; }
+  /* Stamp bs: the sticky action bar must sit flush with the sheet's
+     bottom edge — sticking at bottom:0 left it short by the card's
+     bottom padding (20px + safe-area), a gap band that scrolled
+     content showed through. Pull the stuck position down by exactly
+     that padding and cancel it in flow with the negative margin. */
+  .popup-actions { position: sticky; bottom: calc(-20px - env(safe-area-inset-bottom)); background: var(--panel); padding-top: 12px; padding-bottom: calc(10px + env(safe-area-inset-bottom)); margin-bottom: calc(-20px - env(safe-area-inset-bottom)); }
   .panel.weather-panel, .panel:has([data-dash-search]) { display: none; }
 }
 @media (max-width: 700px) { .dash-row { grid-template-columns: 1fr; } }
@@ -293,8 +298,6 @@ main h2 { letter-spacing: -0.015em; font-weight: 600; }
 .tab-badge { background: var(--danger); color: #fff; border-radius: 999px; font-size: 10.5px; font-weight: 700; padding: 1px 6px; margin-left: auto; }
 .pin-type { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; min-width: 64px; }
 .bulk-bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; margin-bottom: 12px; }
-.focus-bar { display: flex; gap: 10px; align-items: center; }
-.focus-bar button { margin-left: auto; }
 
 /* --- Stamp 2026-11-04af: Markdown body editor --- */
 .md-editor { border: 1px solid var(--input-line, var(--line)); border-radius: 10px; overflow: hidden; }
@@ -366,10 +369,123 @@ main h2 { letter-spacing: -0.015em; font-weight: 600; }
 .attach-file-row { margin: 6px 0; }
 .attach-file { text-decoration: underline dotted; }
 .bulk-bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-@media print {
-  .sidebar, .topbar, #popup-root, #toast-root, #palette-root, #lightbox-root, .bottom-nav { display: none !important; }
-  body, .panel, .row, .content { background: #fff !important; color: #000 !important; }
-  * { border-color: #bbb !important; box-shadow: none !important; text-shadow: none !important; }
-  .content { margin: 0 !important; padding: 0 !important; }
-  .panel { break-inside: avoid; }
+
+/* Shell chrome (stamp aq): no grey tap flash, app-tinted selection. */
+* { -webkit-tap-highlight-color: transparent; }
+::selection { background: rgba(94, 106, 210, .45); }
+
+/* Phone density pass (stamp ar): compact row actions, sane checkboxes,
+   a tab badge that sits on its icon, and clearance for the capture FAB. */
+@media (max-width: 768px) {
+  input[type="checkbox"] { min-height: 0; }
+  .row { row-gap: 4px; }
+  .row .ghost-btn { min-height: 0; padding: 3px 8px; font-size: 12.5px; }
+  .row .due { font-size: 12.5px; }
+  .panel [data-carry-all], .panel [data-push-all] { min-height: 0; padding: 4px 10px; font-size: 12.5px; margin-bottom: 6px; }
+  .day-progress .done-today { font-size: 13px; line-height: 1.45; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  #bottom-nav .tab-btn { position: relative; }
+  #bottom-nav .tab-badge { position: absolute; top: 0; right: calc(50% - 24px); margin: 0; padding: 0 5px; font-size: 10px; line-height: 16px; }
+  .content { padding-bottom: calc(156px + env(safe-area-inset-bottom)); }
 }
+
+/* Phone slimming (stamp au, shell only): presence cuts Ben approved —
+   badges off, done-list off, row action buttons and metadata off,
+   Daily "On this day" panel off; one-line weather styling. */
+.wx-line { padding: 10px 14px; font-size: 15px; margin-bottom: 16px; }
+@media (max-width: 768px) {
+  .topbar .badge { display: none; }
+  .day-progress .done-today { display: none; }
+  .row [data-snooze-days], .row [data-carry-today] { display: none; }
+  .row .project-pill { display: none; } /* subtask indicators restored (stamp be) */
+  .day-context { display: none; }
+}
+
+/* Boot finish (stamp aw, shell only): one soft fade as the first
+   render lands, instead of the splash cutting straight to content. */
+body.booted .content { animation: hatchFade 0.3s ease both; }
+
+/* Link form stays on one line on phones (stamp bb): the add-link
+   search field and its button were stacking full-width. */
+@media (max-width: 768px) {
+  form[data-add-link] { flex-direction: row; align-items: center; }
+  form[data-add-link] input { flex: 1; width: auto; min-width: 0; }
+  form[data-add-link] button { flex-shrink: 0; }
+}
+
+/* No sideways page (stamp bd): a long unbroken line in a Daily note
+   (or any panel) used to widen the whole layout, which also made the
+   fixed bottom bar drift. Clip horizontal overflow at the root and
+   let panel text break anywhere rather than stretch the page. */
+@media (max-width: 768px) {
+  html, body { overflow-x: clip; }
+  .panel p, .panel li { overflow-wrap: anywhere; }
+}
+
+/* FAB action menu + More-menu dedupe (stamp bg) */
+#fab-menu { display: none; }
+@media (max-width: 768px) {
+  #fab-menu { position: fixed; right: 16px; bottom: calc(150px + env(safe-area-inset-bottom)); z-index: 41; background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 6px; flex-direction: column; min-width: 196px; box-shadow: 0 10px 32px rgba(0,0,0,.5); }
+  #fab-menu:not([hidden]) { display: flex; }
+  #fab-menu button { display: flex; align-items: center; gap: 11px; background: transparent; border: 0; color: var(--text); font-size: 15px; padding: 11px 12px; border-radius: 10px; text-align: left; min-height: 44px; }
+  #fab-menu button:active { background: var(--panel-2); }
+  #fab-menu svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 1.8; flex-shrink: 0; }
+  /* The More drawer repeats nothing the bottom bar already pins. */
+  .sidebar .tab-btn[data-tab="dashboard"], .sidebar .tab-btn[data-tab="tasks"],
+  .sidebar .tab-btn[data-tab="daily"], .sidebar .tab-btn[data-tab="notes"] { display: none; }
+}
+
+/* Weather line expands on tap (stamp bh) */
+.wx-line { cursor: pointer; }
+.wx-chev { float: right; color: var(--muted); }
+.wx-open { display: block; padding-top: 10px; }
+
+/* Family calendar rows restyled (stamp bi): the title gets its own
+   full line instead of being squeezed between time and location;
+   time and location sit underneath, small and muted. */
+@media (max-width: 768px) {
+  .row:has(.fam-time) { display: grid; grid-template-columns: 1fr auto; column-gap: 10px; row-gap: 1px; align-items: baseline; padding-top: 8px; padding-bottom: 8px; }
+  .row:has(.fam-time) .row-title { grid-column: 1 / -1; font-weight: 600; font-size: 14.5px; white-space: normal; }
+  .row:has(.fam-time) .fam-time { grid-column: 1; font-size: 12.5px; color: var(--muted); white-space: nowrap; }
+  .row:has(.fam-time) > .muted { grid-column: 2; font-size: 12.5px; text-align: right; }
+}
+
+/* Reading rows restyled (stamp bl): same disease as the family
+   calendar — the title was squeezed between the source and a wide
+   status select. Title gets its own full line; source and a compact
+   status select sit underneath. */
+@media (max-width: 768px) {
+  .row:has(> select[data-reading-status]) { display: grid; grid-template-columns: 1fr auto; column-gap: 10px; row-gap: 4px; align-items: center; padding-top: 9px; padding-bottom: 9px; }
+  .row:has(> select[data-reading-status]) .row-title { grid-column: 1 / -1; font-weight: 600; white-space: normal; }
+  .row:has(> select[data-reading-status]) > .muted { grid-column: 1; font-size: 12.5px; }
+  .row:has(> select[data-reading-status]) > select { grid-column: 2; min-height: 34px; font-size: 13.5px; width: auto; }
+  .row:has(> select[data-reading-status]):not(:has(> .muted)) > select { grid-column: 1; justify-self: start; }
+}
+
+/* More swapped for Calendar (stamp bm): the drawer now opens from
+   the header menu button — un-hide it on phones — and Calendar joins
+   the drawer dedupe list since it is pinned to the bar now. */
+@media (max-width: 768px) {
+  #menu-btn { display: inline-flex; }
+  .sidebar .tab-btn[data-tab="calendar"] { display: none; }
+}
+
+/* Reveal-and-confirm swipe (stamp bn) */
+.row[data-task] { position: relative; touch-action: pan-y; }
+.swipe-act { position: absolute; top: 0; bottom: 0; width: 96px; border: 0; color: #fff; font-size: 12.5px; font-weight: 600; z-index: 2; display: flex; align-items: center; justify-content: center; padding: 0 6px; text-align: center; }
+.swipe-act.done { background: #2f9e44; }
+.swipe-act.snooze { background: var(--primary); }
+
+/* Complete weather grids (stamp bp): the day stats are 7 — force
+   three columns and let the last stat (sunset) span the full row
+   instead of dangling; the 8 hourly chunks go four-across so they
+   land as two full rows of four. */
+@media (max-width: 768px) {
+  .wd-grid { grid-template-columns: repeat(3, 1fr); }
+  .wd-chunks { grid-template-columns: repeat(4, 1fr); }
+}
+
+/* App lock (stamp ca) */
+#lock-screen { position: fixed; inset: 0; z-index: 200; background: var(--bg); display: flex; align-items: center; justify-content: center; padding: 24px; }
+.lock-card { text-align: center; display: flex; flex-direction: column; gap: 12px; align-items: center; }
+.lock-title { font-size: 22px; font-weight: 700; }
+body.app-locked #main, body.app-locked #bottom-nav, body.app-locked header { visibility: hidden; }
