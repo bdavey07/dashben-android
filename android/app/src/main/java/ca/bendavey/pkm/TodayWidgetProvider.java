@@ -96,6 +96,30 @@ public class TodayWidgetProvider extends AppWidgetProvider {
                 int[] ids = mgr.getAppWidgetIds(new ComponentName(ctx, TodayWidgetProvider.class));
                 if (ids.length > 0) mgr.notifyAppWidgetViewDataChanged(ids, R.id.w_list);
             } catch (Exception e) { /* pending overlay is best-effort */ }
+        } else if ("uncheck".equals(zone) && id != null && !id.isEmpty()) {
+            // Stamp cw: undo a tick inside its linger window — drop the id
+            // from the pending set and its timestamp, then redraw.
+            try {
+                SharedPreferences prefs = ctx.getSharedPreferences("dashben", Context.MODE_PRIVATE);
+                LinkedHashSet<String> set = new LinkedHashSet<>();
+                String raw = prefs.getString("pending_done", "");
+                if (raw != null && !raw.isEmpty()) for (String x : raw.split(",")) if (!x.isEmpty() && !x.equals(id)) set.add(x);
+                StringBuilder sb = new StringBuilder();
+                String rawAt = prefs.getString("pending_done_at", "");
+                if (rawAt != null && !rawAt.isEmpty()) {
+                    for (String pair : rawAt.split(",")) {
+                        int colon = pair.lastIndexOf(':');
+                        if (colon > 0 && !pair.substring(0, colon).equals(id)) {
+                            if (sb.length() > 0) sb.append(',');
+                            sb.append(pair);
+                        }
+                    }
+                }
+                prefs.edit().putString("pending_done", String.join(",", set)).putString("pending_done_at", sb.toString()).apply();
+                AppWidgetManager mgr = AppWidgetManager.getInstance(ctx);
+                int[] ids = mgr.getAppWidgetIds(new ComponentName(ctx, TodayWidgetProvider.class));
+                if (ids.length > 0) mgr.notifyAppWidgetViewDataChanged(ids, R.id.w_list);
+            } catch (Exception e) { /* undo is best-effort */ }
         } else if ("body".equals(zone) && id != null && !id.isEmpty()) {
             ctx.startActivity(openIntent(ctx, "task-open", id));
         } else if ("open".equals(zone)) {

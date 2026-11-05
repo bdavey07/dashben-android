@@ -3,7 +3,7 @@
 // browser's localStorage (from earlier setup) and is never sent
 // anywhere except the sync host.
 import { SqlJsDb } from "./db-adapter.mjs";
-import { SyncEngine } from "./sync-engine.mjs";
+import { SyncEngine, SYNC_TABLES } from "./sync-engine.mjs";
 import { LocalStore, recurrenceSummary, parseRecurrence } from "./local-store.mjs";
 import { HttpTransport } from "./transport.mjs";
 
@@ -534,6 +534,39 @@ async function doFullSync() {
   }
   render();
   saveBytes();
+}
+
+// Stamp cw: one-tap sync health check. Compares every synced table's
+// local row count against the server's snapshot count, and reports the
+// outbox (edits waiting to upload), recorded conflicts, and the last
+// successful sync. A mismatch with a non-empty outbox usually just
+// means unpushed edits; a mismatch with an empty outbox means drift.
+async function runHealthCheck() {
+  const count = (t) => { try { return state.db.prepare(`SELECT COUNT(*) AS c FROM "${t}"`).all()[0]?.c ?? null; } catch { return null; } };
+  const outbox = count("sync_outbox");
+  const conflicts = count("sync_conflicts");
+  const rows = [];
+  let mismatches = 0, errors = 0;
+  for (const t of SYNC_TABLES) {
+    const lc = count(t);
+    let sc = null;
+    try {
+      let cursor = null, total = 0, guard = 0;
+      do { const page = await state.transport.snapshot(t, cursor); total += (page.rows ?? []).length; cursor = page.next_cursor; } while (cursor && ++guard < 60);
+      sc = total;
+    } catch { errors++; }
+    if (sc === null) { rows.push(`<p class="muted">${esc(t)}: this device ${lc ?? "?"} \u00b7 server unreachable</p>`); continue; }
+    const ok = lc === sc;
+    if (!ok) mismatches++;
+    rows.push(`<p class="muted">${esc(t)}: this device ${lc ?? "?"} \u00b7 server ${sc} ${ok ? "\u2713" : "\u26a0"}</p>`);
+  }
+  const verdict = errors
+    ? `Could not reach the server for ${errors} table(s) \u2014 check the connection and token.`
+    : (mismatches === 0 && (outbox ?? 0) === 0 && (conflicts ?? 0) === 0)
+      ? "In sync \u2014 every table matches the server, nothing waiting to upload, no conflicts."
+      : "Differences found \u2014 if edits are waiting, Sync now; if they persist with an empty outbox, Re-download everything rebuilds from the server.";
+  state.healthHtml = `<div class="health-box"><p><b>Health check</b> <span class="muted">${new Date().toLocaleTimeString()}</span></p><p>${verdict}</p><p class="muted">Waiting to upload: ${outbox ?? "?"} \u00b7 Conflicts: ${conflicts ?? "?"} \u00b7 Last sync: ${state.lastSync ?? "not yet this session"}</p>${rows.join("")}</div>`;
+  render();
 }
 
 // Shell: collect one pending share-sheet send (if any) into the
@@ -1303,6 +1336,18 @@ function initNav() {
 }
 
 // --- Tab renders ---
+// Stamp cw: the first-run connect screen. Its card reuses .token-card
+// and the existing [data-token-save] handler, so Connect goes through
+// exactly the same save path as Management.
+function tokenScreenHtml() {
+  return `<div class="token-screen"><div class="panel"><h3>Connect DashBen</h3>
+  <p class="muted">Enter your sync token and the app pulls your tasks, notes, and everything else from pkm.ben-cloud.net.</p>
+  ${state.lastError ? `<p class="muted">\u26a0 ${esc(state.lastError)}</p>` : ""}
+  <div class="token-card"><label for="sync-token-input">Sync token</label>
+  <input id="sync-token-input" type="text" style="-webkit-text-security: disc;" autocomplete="off" data-1p-ignore="true" data-lpignore="true" placeholder="SYNC_TOKEN">
+  <p><button data-token-save class="primary-btn">Connect</button></p></div></div></div>`;
+}
+
 function render() {
   if (state.searchDirty) { rebuildSearchIndex(); state.searchDirty = false; }
   if (document.body?.classList.contains("boot-preview")) { document.body.classList.remove("boot-preview"); document.body.classList.add("boot-faded"); }
@@ -1322,6 +1367,7 @@ function render() {
     }
   });
   const main = $("#main");
+  if (state.needsToken) { main.innerHTML = tokenScreenHtml(); return; }
   if (state.itemView) main.innerHTML = renderItemPage(state.itemView);
   else if (state.tab === "dashboard") main.innerHTML = renderDashboard();
   else if (state.tab === "tasks") main.innerHTML = renderTasks();
@@ -3065,6 +3111,9 @@ async function boot() {
   resolveNativePlugins();
   loadSettings();
   await loadSecureToken();
+  // Stamp cw: with no token the app opens on a connect screen instead
+  // of an empty Daily tab (render() gates on this flag).
+  state.needsToken = !state.token;
   // The WASM binary ships as base64 text (vendor/sql-wasm.wasm.b64)
   // because the repo push tooling only accepts UTF-8 files, so the
   // binary .wasm itself is never committed. Decoded here and handed
@@ -3709,6 +3758,7 @@ function renderManagement() {
   <button data-token-save class="ghost-btn">Save token</button>
   <button data-full-sync class="ghost-btn">Re-download everything</button>
   <span class="muted">${state.token ? "Token saved" : "No token set"}</span></div>
+  <p><button data-health-check class="ghost-btn">Health check</button> <span class="muted">Compares this device with the server, table by table.</span></p>${state.healthHtml ?? ""}
   <p class="muted">Due reminders: <b>${state.store.getRow("ui_prefs", "reminders")?.value === "off" ? "Off" : "On"}</b> \u2014 a 9 a.m. nudge on each due day, plus a morning digest while tasks are overdue.</p>
   <p><button data-reminder-toggle class="ghost-btn">${state.store.getRow("ui_prefs", "reminders")?.value === "off" ? "Turn reminders on" : "Turn reminders off"}</button></p></div>
   <div class="panel"><h3>App lock</h3><p class="muted">Require fingerprint or device PIN to open DashBen (off by default; locks again after a minute in the background). Current: <b>${appLockOn() ? "On" : "Off"}</b></p>
@@ -4175,6 +4225,8 @@ function attachExtraListeners() {
     if (pageBack) { state.itemView = null; render(); return; }
     const fullSync = e.target.closest("[data-full-sync]");
     if (fullSync) { await doFullSync(); return; }
+    const healthBtn = e.target.closest("[data-health-check]");
+    if (healthBtn) { healthBtn.disabled = true; healthBtn.textContent = "Checking\u2026"; await runHealthCheck(); return; }
     const exportBtn = e.target.closest("[data-export-db]");
     if (exportBtn) { await exportDb(); return; }
     const exportMdBtn = e.target.closest("[data-export-md]");
@@ -4190,7 +4242,12 @@ function attachExtraListeners() {
         else { const ls = JSON.parse(localStorage.getItem("pkm-local-settings") || "{}"); ls.token = value; localStorage.setItem("pkm-local-settings", JSON.stringify(ls)); }
         state.token = value;
         if (state.transport) state.transport.token = value;
-        await doSync();
+        // Stamp cw: a token saved onto an EMPTY app pulls the full
+        // snapshot (incremental sync can never deliver rows that
+        // predate the change log); otherwise a normal sync is fine.
+        const emptyLocal = (() => { try { return ["tasks", "notes", "people", "reading_items", "inbox_items", "projects"].every((t) => (allRows(t) ?? []).length === 0); } catch { return false; } })();
+        if (emptyLocal) await doFullSync(); else await doSync();
+        if (!state.lastError) state.needsToken = false;
       } catch { /* save/sync failure shows via status line + header on next render */ }
       render(); saveBytes();
       return;

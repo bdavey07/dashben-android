@@ -170,6 +170,9 @@ public class WidgetListService extends RemoteViewsService {
                 v.setOnClickFillInIntent(R.id.w_rcheck, new Intent().putExtra("zone", "check").putExtra("id", it.id));
                 v.setOnClickFillInIntent(R.id.w_rroot, new Intent().putExtra("zone", "body").putExtra("id", it.id));
             } else {
+                // Stamp cw: during the linger window the filled checkbox is
+                // an UNDO — tapping it cancels the pending tick.
+                if (it.done && !it.id.isEmpty()) v.setOnClickFillInIntent(R.id.w_rcheck, new Intent().putExtra("zone", "uncheck").putExtra("id", it.id));
                 v.setOnClickFillInIntent(R.id.w_rroot, new Intent().putExtra("zone", "open"));
             }
             return v;
