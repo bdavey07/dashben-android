@@ -219,17 +219,28 @@ function buildWidgetSnapshot() {
   }
   return { at: Date.now(), overdueCount: overdue.length, todayCount: dueToday.length, rows, family, weather };
 }
+let lastSnapAttempt = 0;
+function writeWidgetSnapshotThrottled() {
+  const now = Date.now();
+  if (now - lastSnapAttempt < 2500) return;
+  lastSnapAttempt = now;
+  void writeWidgetSnapshot();
+}
 async function writeWidgetSnapshot() {
-  if (!NativeFS) return;
+  try { localStorage.setItem("dashben-widget-status", `attempted @ ${new Date().toLocaleTimeString("en-CA", { hour: "numeric", minute: "2-digit" })}`); } catch { /* ignore */ }
+  if (!NativeFS) { try { localStorage.setItem("dashben-widget-status", "attempted \u2014 file plugin missing"); } catch { /* ignore */ } return; }
   try {
     const snap = buildWidgetSnapshot();
     const { at, ...rest } = snap;
     const restJson = JSON.stringify(rest);
     if (restJson === lastWidgetJson) return;
-    lastWidgetJson = restJson;
     await withTimeout(NativeFS.writeFile({ path: "widget.json", data: bytesToB64(new TextEncoder().encode(JSON.stringify(snap))), directory: "DATA" }), 5000, "fs.widget");
+    lastWidgetJson = restJson; // only gate after a write that landed (stamp cd)
+    try { localStorage.setItem("dashben-widget-status", `ok @ ${new Date().toLocaleTimeString("en-CA", { hour: "numeric", minute: "2-digit" })}`); } catch { /* ignore */ }
     if (NativeWidget) await withTimeout(NativeWidget.refresh({}), 5000, "widget.refresh").catch(() => null);
-  } catch { /* widgets are best-effort */ }
+  } catch (e) {
+    try { localStorage.setItem("dashben-widget-status", `FAILED: ${e?.message ?? e}`); } catch { /* ignore */ }
+  }
 }
 function queueWidgetSnapshot() {
   if (widgetSnapTimer) clearTimeout(widgetSnapTimer);
@@ -1235,6 +1246,8 @@ function initNav() {
 // --- Tab renders ---
 function render() {
   if (state.searchDirty) { rebuildSearchIndex(); state.searchDirty = false; }
+  if (document.body?.classList.contains("boot-preview")) document.body.classList.remove("boot-preview");
+  writeWidgetSnapshotThrottled();
   $("#sync-status").textContent = statusLine();
   $("#net-badge").textContent = navigator.onLine ? "Online" : "Offline";
   renderSidebar();
@@ -1402,6 +1415,11 @@ function weatherLineHtml() {
 }
 
 function renderDashboard() {
+  const html = renderDashboardInner();
+  if (state.booted && !state.itemView) cacheBootHtml(html);
+  return html;
+}
+function renderDashboardInner() {
   const conflicts = state.engine.listConflicts();
   return `${weatherLineHtml()}
   ${pinnedPanel()}
@@ -2949,7 +2967,27 @@ function attachPersistentListeners() {
 }
 
 // --- Boot ---
+
+// Instant boot paint (stamp ce): the last rendered dashboard is
+// cached and repainted the moment boot starts, so the app opens on
+// real content instead of a second of "Loading local database\u2026".
+// The preview is inert (pointer-events off via body.boot-preview)
+// and the first live render replaces it.
+function paintBootPreview() {
+  try {
+    const html = localStorage.getItem("dashben-boot-html");
+    if (!html) return;
+    const main = document.querySelector("#main");
+    if (main) { main.innerHTML = html; document.body.classList.add("boot-preview"); }
+  } catch { /* preview is optional */ }
+}
+let bootHtmlTimer = null;
+function cacheBootHtml(html) {
+  if (bootHtmlTimer) return;
+  bootHtmlTimer = setTimeout(() => { bootHtmlTimer = null; try { localStorage.setItem("dashben-boot-html", html); } catch { /* quota */ } }, 400);
+}
 async function boot() {
+  paintBootPreview();
   loadSettings();
   await loadSecureToken();
   // The WASM binary ships as base64 text (vendor/sql-wasm.wasm.b64)
@@ -4114,12 +4152,13 @@ function attachExtraListeners() {
     if (wCheck) {
       const out = wCheck.closest(".panel")?.querySelector("[data-widget-status]");
       try {
-        let fileInfo = "no snapshot file yet \u2014 open the app once after adding the widget";
-        try { const st = await NativeFS.stat({ path: "widget.json", directory: "DATA" }); fileInfo = `snapshot written ${new Date(st.mtime).toLocaleTimeString("en-CA", { hour: "numeric", minute: "2-digit" })}`; } catch { /* missing */ }
-        let last = null;
-        try { last = localStorage.getItem("dashben-last-widget-action"); } catch { /* ignore */ }
+        let fileInfo = "no snapshot file yet";
+        try { const st = await NativeFS.stat({ path: "widget.json", directory: "DATA" }); fileInfo = `snapshot file present, written ${new Date(st.mtime).toLocaleTimeString("en-CA", { hour: "numeric", minute: "2-digit" })}`; } catch { /* missing */ }
+        let jsStatus = null, prov = null, last = null;
+        try { jsStatus = localStorage.getItem("dashben-widget-status"); last = localStorage.getItem("dashben-last-widget-action"); } catch { /* ignore */ }
+        try { const rf = await NativeFS.readFile({ path: "widget-provider.txt", directory: "DATA" }); prov = new TextDecoder().decode(b64ToBytes(rf.data)); } catch { /* provider never ran */ }
         if (NativeWidget) await NativeWidget.refresh({}).catch(() => null);
-        if (out) out.textContent = `Widgets: ${fileInfo}${last ? ` \u00B7 last widget tap received: ${last}` : " \u00B7 no widget tap received yet"}. Widgets refreshed just now.`;
+        if (out) out.textContent = `Widgets: ${fileInfo} \u00B7 app write: ${jsStatus ?? "not attempted"} \u00B7 widget side: ${prov ? prov.replace(/^\d+ /, "") : "never ran"} \u00B7 last tap received: ${last ?? "none"}.`;
       } catch { if (out) out.textContent = "Widgets: check failed."; }
       return;
     }

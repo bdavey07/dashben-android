@@ -489,3 +489,6 @@ body.booted .content { animation: hatchFade 0.3s ease both; }
 .lock-card { text-align: center; display: flex; flex-direction: column; gap: 12px; align-items: center; }
 .lock-title { font-size: 22px; font-weight: 700; }
 body.app-locked #main, body.app-locked #bottom-nav, body.app-locked header { visibility: hidden; }
+
+/* Instant boot paint (stamp ce) */
+body.boot-preview #main { pointer-events: none; }

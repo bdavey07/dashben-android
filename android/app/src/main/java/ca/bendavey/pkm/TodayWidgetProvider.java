@@ -58,10 +58,19 @@ public class TodayWidgetProvider extends AppWidgetProvider {
         return new String(out.toByteArray(), StandardCharsets.UTF_8);
     }
 
+    private void witness(Context ctx, String note) {
+        try {
+            java.io.FileOutputStream out = new java.io.FileOutputStream(new File(ctx.getFilesDir(), "widget-provider.txt"));
+            out.write(((System.currentTimeMillis()) + " " + note).getBytes(StandardCharsets.UTF_8));
+            out.close();
+        } catch (Exception e) { /* witness is best-effort */ }
+    }
+
     private RemoteViews build(Context ctx) {
         RemoteViews v = new RemoteViews(ctx.getPackageName(), R.layout.widget_today);
         v.setOnClickPendingIntent(R.id.w_root, pending(ctx, 100, openIntent(ctx, "open", null)));
         String counts = "Open DashBen to sync";
+        String seen = "ran, snapshot missing";
         String weather = "", family = "", updated = "";
         int shown = 0;
         try {
@@ -90,10 +99,12 @@ public class TodayWidgetProvider extends AppWidgetProvider {
                         shown++;
                     }
                 }
+                seen = "ran, snapshot found, rows=" + shown + ", overdue=" + oc + ", today=" + tc;
                 long at = s.optLong("at", 0);
                 if (at > 0) updated = "Updated " + new SimpleDateFormat("h:mm a", Locale.CANADA).format(new Date(at));
             }
-        } catch (Exception e) { /* placeholder stays */ }
+        } catch (Exception e) { seen = "ran, error: " + e.getMessage(); }
+        witness(ctx, seen);
         for (int i = shown; i < ROW_IDS.length; i++) v.setViewVisibility(ROW_IDS[i], View.GONE);
         v.setTextViewText(R.id.w_counts, counts);
         v.setTextViewText(R.id.w_weather, weather);
