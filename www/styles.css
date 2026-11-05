@@ -596,3 +596,7 @@ body.boot-faded #main { animation: bootfade 160ms ease-out; }
 .feed-divider::before, .feed-divider::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
 #feed-btn { position: relative; }
 .feed-badge { position: absolute; top: -5px; right: -5px; background: var(--danger); color: #fff; border-radius: 999px; font-size: 10.5px; line-height: 1.5; padding: 0 5px; pointer-events: none; }
+
+/* Stamp dv: completed-on-demand. */
+.done-box { margin-top: 10px; }
+.done-list { margin-top: 8px; }

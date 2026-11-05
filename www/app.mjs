@@ -1827,15 +1827,17 @@ function wireSmartInput(form) {
   refresh();
 }
 
-// Day progress (y): done-today vs everything due up to today.
-function dayProgressHtml() {
-  const today = todayToronto();
-  const doneToday = allRows("tasks").filter((t) => t.done && !t.archived && (t.updated_at ?? "").slice(0, 10) === today);
-  const openDue = openTasks().filter((t) => t.due_date && t.due_date <= today);
-  const total = doneToday.length + openDue.length;
-  if (!total) return "";
-  const pct = Math.round((doneToday.length / total) * 100);
-  return `<div class="day-progress"><b>${doneToday.length} of ${total} done today</b><div class="progress"><span style="width:${pct}%"></span></div>${doneToday.length ? `<p class="muted done-today">${doneToday.map((t) => `\u2713 ${esc(t.title)}`).join(" \u00b7 ")}</p>` : ""}</div>`;
+// Completed items on demand (stamp dv): replaces the always-on day
+// progress bar + done-today titles. The button reveals the day's
+// completed tasks (by completion date); rows are live — unticking
+// one puts it back.
+function completedDayHtml(day, bare = false) {
+  const done = allRows("tasks").filter((t) => t.done && !t.archived && (t.updated_at ?? "").slice(0, 10) === day);
+  if (!done.length) return "";
+  const openNow = state.showDoneDay === day;
+  const rows = openNow ? done.map((t) => taskRow(t)).join("") : "";
+  if (bare) return `<div class="done-box"><button data-show-done="${day}" class="ghost-btn">${openNow ? "Hide completed" : `Show completed (${done.length})`}</button>${openNow ? `<div class="done-list">${rows}</div>` : ""}</div>`;
+  return `<div class="panel"><h3>Completed</h3><button data-show-done="${day}" class="ghost-btn">${openNow ? "Hide" : `Show (${done.length})`}</button>${rows}</div>`;
 }
 
 // Pins (aa): synced ui_prefs list of page refs, shown on the dashboard.
@@ -2376,6 +2378,7 @@ function renderProjects() {
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(r);
   }
+  for (const l of groups.values()) l.sort((a, b) => a.title.localeCompare(b.title)); // stamp du: A-Z inside groups (was updated_at order — the list reshuffled after every edit)
   const ordered = orderedGroupKeys([...groups.keys()], "projects.category", { last: ["No category"] }).map((k) => [k, groups.get(k)]);
   return `<div style="display:flex;justify-content:flex-end;align-items:center"><button data-new-project class="primary-btn">New project</button></div>
   ${ordered.map(([g, list]) => `<details class="group" open><summary>${esc(g)} (${list.length})</summary>${list.map((r) => `<div class="row" data-project="${r.id}"><span class="row-title">${esc(r.title)}</span>${r.status ? `<span class="project-pill">${esc(r.status)}</span>` : ""}${r.category ? `<span class="muted">${esc(r.category)}</span>` : ""}</div>`).join("")}</details>`).join("") || "<p class='muted'>Nothing here yet.</p>"}`;
@@ -3892,6 +3895,7 @@ function renderDaily() {
   ${dayContextPanel(date)}
   <div class="panel"><h3>Overdue (${overdue.length})</h3>${date === todayToronto() && overdue.length ? ` <button data-carry-all class="ghost-btn">All → today</button>` : ""}${overdue.length ? overdue.map((t) => taskRow(t, { carry: date === todayToronto() })).join("") : "<p class='muted'>Nothing overdue.</p>"}</div>
   <div class="panel"><h3>Due Today (${todos.length})</h3>${date === todayToronto() && todos.length ? `<p><button data-push-all class="ghost-btn">All → tomorrow</button></p>` : ""}${todos.length ? todos.map(taskRow).join("") : "<p class='muted'>Nothing due this day.</p>"}</div>
+  ${completedDayHtml(date)}
   ${body}`;
 }
 
@@ -4034,7 +4038,7 @@ function dailyWorkspacePanel() {
     <form data-dash-task class="form"><span class="hl-wrap"><span class="hl-back"></span><input class="hl-input" name="title" placeholder="New task" required></span>${quickProjectSelect()}<button class="primary-btn">+ New task</button><span class="parse-chips"></span></form>
     <p class="muted">No daily note for today yet.</p><p><button data-create-daily="${today}" class="primary-btn">Create today's daily note</button></p>`;
   }
-  return `<div class="panel"><h3>Daily Note</h3><p><button data-daily-tab>Open Daily tab →</button></p>${dayProgressHtml()}${inner}</div>`;
+  return `<div class="panel"><h3>Daily Note</h3><p><button data-daily-tab>Open Daily tab →</button></p>${completedDayHtml(todayToronto(), true)}${inner}</div>`;
 }
 function upcomingPanel() {
   const today = todayToronto();
@@ -4711,6 +4715,8 @@ function attachExtraListeners() {
     }, true);
   }
   $("#main").addEventListener("click", async (e) => {
+    const showDone = e.target.closest("[data-show-done]");
+    if (showDone) { const d = showDone.dataset.showDone; state.showDoneDay = state.showDoneDay === d ? null : d; render(); return; }
     const feedSave = e.target.closest("[data-feed-save]");
     if (feedSave) { const it = feedSeed().items[Number(feedSave.dataset.feedSave)]; if (it) { state.store.createReading({ title: it.title, url: it.link }); state.searchDirty = true; showToast("Saved to Reading"); render(); saveBytes(); } return; }
     const feedOpen = e.target.closest("[data-feed-open]");
