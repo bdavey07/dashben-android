@@ -581,3 +581,7 @@ body.boot-faded #main { animation: bootfade 160ms ease-out; }
    (a plain .form wrapper stacks its children in a column there). */
 .cal-mode-toggle { display: flex; flex-direction: row; gap: 8px; margin: 4px 0 10px; }
 .cal-mode-toggle .toggle-btn { flex: 1; border-radius: 999px; padding: 9px 12px; min-height: 44px; }
+
+/* Stamp do: header feed shortcut (mobile quick access to the river). */
+#feed-btn svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 1.8; display: block; }
+#feed-btn.on { color: var(--primary-light); border-color: var(--primary); }

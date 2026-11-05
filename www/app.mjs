@@ -1371,6 +1371,7 @@ function render() {
       } else if (badge) badge.remove();
     }
   });
+  const feedBtn = $("#feed-btn"); if (feedBtn) feedBtn.classList.toggle("on", state.tab === "feed");
   const main = $("#main");
   if (state.needsToken) { main.innerHTML = tokenScreenHtml(); return; }
   if (state.itemView) main.innerHTML = renderItemPage(state.itemView);
@@ -3576,6 +3577,7 @@ async function boot() {
     else if (e.key === "ArrowRight") { lbState.idx = (lbState.idx + 1) % lbState.list.length; renderLightbox(); }
   });
   $("#palette-btn")?.addEventListener("click", () => openPalette());
+  $("#feed-btn")?.addEventListener("click", () => { state.tab = "feed"; state.itemView = null; saveTab(); render(); });
   $("#toast-root")?.addEventListener("click", (e) => {
     if (e.target.closest("[data-toast-undo]")) { const u = toastUndo; toastUndo = null; if (u) u(); }
   });
