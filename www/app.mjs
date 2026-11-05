@@ -1063,7 +1063,7 @@ function taskEditorHtml(id, forPage) {
       <h4>Tags</h4>${tagsForm("tasks", id)}
     </form>
     ${linksBlock("tasks", id)}
-    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Close</button><button data-duplicate-task="${t.id}" class="ghost-btn">Duplicate</button><button data-archive-task="${t.id}" class="danger-btn">Archive task</button></p>`}`;
+    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Close</button><button data-send-tony="tasks:${t.id}" class="ghost-btn">Send to Tony</button><button data-duplicate-task="${t.id}" class="ghost-btn">Duplicate</button><button data-archive-task="${t.id}" class="danger-btn">Archive task</button></p>`}`;
 }
 
 function openTaskPopup(id) {
@@ -1085,7 +1085,7 @@ function noteEditorHtml(id, forPage) {
       <h4>Body</h4>${bodyFieldHtml("notes", id, n.body_markdown, n.body_version)}
     </form>
     ${linksBlock("notes", id)}
-    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Close</button><button data-duplicate-note="${n.id}" class="ghost-btn">Duplicate</button><button data-archive-note="${n.id}" class="danger-btn">Archive note</button></p>`}`;
+    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Close</button><button data-share-tony="notes:${n.id}" class="ghost-btn">Share with Tony</button><button data-duplicate-note="${n.id}" class="ghost-btn">Duplicate</button><button data-archive-note="${n.id}" class="danger-btn">Archive note</button></p>`}`;
 }
 
 function openNotePopup(id) {
@@ -1175,7 +1175,7 @@ function inboxEditorHtml(id, forPage) {
       <div class="cf-field"><label class="cf-label">Title</label><input name="title" value="${esc(item.title)}"></div>
       <h4>Body</h4>${bodyFieldHtml("inbox_items", id, item.body_markdown, item.body_version)}
     </form>
-    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Close</button><button data-move-personal="${id}">Move to Personal Notes</button> <button data-archive-inbox="${id}" class="danger-btn">Archive</button> </p>`}`;
+    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Close</button><button data-move-personal="${id}">Move to Personal Notes</button><button data-send-tony="inbox:${id}" class="ghost-btn">Send to Tony</button> <button data-archive-inbox="${id}" class="danger-btn">Archive</button> </p>`}`;
 }
 
 function openInboxPopup(id) {
@@ -1234,7 +1234,7 @@ function pageSubtasks(subtasksJson) {
     ${subs.map((x) => `<div class="row"><input type="checkbox" disabled ${x.done ? "checked" : ""}><span>${esc(x.text)}</span></div>`).join("") || "<p class='muted'>No subtasks.</p>"}`;
 }
 function pageActions(view, extra) {
-  return `<div class="page-actions"><button data-page-back class="ghost-btn">Back</button>${extra || ""}${view.type === "tasks" ? `<button data-duplicate-task="${view.id}" class="ghost-btn">Duplicate</button>` : view.type === "notes" ? `<button data-duplicate-note="${view.id}" class="ghost-btn">Duplicate</button>` : ""}<button data-pin-toggle="${viewRef(view)}" class="ghost-btn">${isPinned(viewRef(view)) ? "Unpin" : "Pin"}</button><button data-md-download="${viewRef(view)}" class="ghost-btn">Download .md</button><button data-page-archive="${viewRef(view)}" class="danger-btn">Archive</button></div>`;
+  return `<div class="page-actions"><button data-page-back class="ghost-btn">Back</button>${extra || ""}${view.type === "tasks" ? `<button data-send-tony="tasks:${view.id}" class="ghost-btn">Send to Tony</button><button data-duplicate-task="${view.id}" class="ghost-btn">Duplicate</button>` : view.type === "notes" ? `<button data-share-tony="notes:${view.id}" class="ghost-btn">Share with Tony</button><button data-duplicate-note="${view.id}" class="ghost-btn">Duplicate</button>` : ""}<button data-pin-toggle="${viewRef(view)}" class="ghost-btn">${isPinned(viewRef(view)) ? "Unpin" : "Pin"}</button><button data-md-download="${viewRef(view)}" class="ghost-btn">Download .md</button><button data-page-archive="${viewRef(view)}" class="danger-btn">Archive</button></div>`;
 }
 function renderItemPage(view) {
   const { type, id, slug } = view;
@@ -1281,7 +1281,7 @@ function renderItemPage(view) {
   if (type === "inbox_items") {
     const item = state.store.getRow("inbox_items", id);
     if (!item) return `<div class="page-actions"><button data-page-back class="ghost-btn">Back</button></div><p class="muted">This item no longer exists.</p>`;
-    return `<div class="page-actions"><button data-page-back class="ghost-btn">Back</button><button data-page-move="${id}">Move to Personal Notes</button><button data-md-download="${viewRef(view)}" class="ghost-btn">Download .md</button><button data-page-archive="${viewRef(view)}" class="danger-btn">Archive</button></div>
+    return `<div class="page-actions"><button data-page-back class="ghost-btn">Back</button><button data-page-move="${id}">Move to Personal Notes</button><button data-send-tony="inbox:${id}" class="ghost-btn">Send to Tony</button><button data-md-download="${viewRef(view)}" class="ghost-btn">Download .md</button><button data-page-archive="${viewRef(view)}" class="danger-btn">Archive</button></div>
       <div class="notebook">${inboxEditorHtml(id, true)}</div>`;
   }
   if (type === "custom") {
@@ -2486,6 +2486,50 @@ function refreshOpenPopup() {
   else openPopupByRef(v.type, v.id);
 }
 
+
+// --- Send to Tony (stamp dw) -------------------------------------------
+// Tasks and inbox items can be handed to Tony: a snapshot is appended
+// to the synced ui_prefs queue "tony_outbox" (a poller on Tony's side
+// drains it into the Sent to Tony chat), and the item is archived out
+// of Ben's PKM with an Undo that also pulls the queue entry back.
+// Notes are SHARED the same way but stay in the PKM.
+function tonyOutbox() {
+  try { const v = JSON.parse(state.store.getRow("ui_prefs", "tony_outbox")?.value ?? "[]"); return Array.isArray(v) ? v : []; } catch { return []; }
+}
+function writeTonyOutbox(list) {
+  const ts = new Date().toISOString();
+  state.engine.localWrite("ui_prefs", { key: "tony_outbox", value: JSON.stringify(list), updated_at: ts }, { baseUpdatedAt: state.store.getRow("ui_prefs", "tony_outbox")?.updated_at ?? null });
+}
+function queueForTony(kind, row) {
+  const entry = { qid: "q" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8), kind, title: row.title ?? "", body: row.body_markdown ?? "", queued_at: new Date().toISOString(), meta: {} };
+  if (kind === "task") entry.meta = { due: row.due_date ?? "", priority: row.priority ?? "", project: row.project ?? "", subtasks: row.subtasks ?? "" };
+  if (kind === "note") entry.meta = { date: row.date ?? "", type: row.type ?? "" };
+  const list = tonyOutbox(); list.push(entry); writeTonyOutbox(list);
+  return entry;
+}
+function unqueueForTony(qid) { writeTonyOutbox(tonyOutbox().filter((e) => e.qid !== qid)); }
+function doSendTony(ref) {
+  const v = parsePageRef(ref);
+  const table = v.type === "inbox" ? "inbox_items" : v.type;
+  const row = state.store.getRow(table, v.id);
+  if (!row) return;
+  const entry = queueForTony(v.type === "inbox" ? "inbox" : "task", row);
+  state.store.archiveObject(table, v.id);
+  state.searchDirty = true;
+  toastUndo = () => { unqueueForTony(entry.qid); try { state.store.unarchiveObject(table, v.id); } catch {} state.searchDirty = true; const root = document.querySelector("#toast-root"); if (root) root.innerHTML = ""; render(); saveBytes(); };
+  showToast(`<span>Sent \u201c${esc(row.title)}\u201d to Tony</span><button data-toast-undo class="primary-btn">Undo</button>`);
+  if (state.itemView && state.itemView.id === v.id) state.itemView = null;
+  closePopup(); render(); saveBytes();
+}
+function doShareTony(ref) {
+  const v = parsePageRef(ref);
+  const row = state.store.getRow("notes", v.id);
+  if (!row) return;
+  queueForTony("note", row);
+  showToast(`<span>Shared \u201c${esc(row.title)}\u201d with Tony</span>`);
+  saveBytes();
+}
+
 // --- Toasts, archive undo, database export (stamp 2026-11-04j) ---
 let toastTimer = null;
 let toastUndo = null;
@@ -3505,6 +3549,10 @@ function attachPersistentListeners() {
     if (skip) { state.store.skipTaskOccurrence(skip.dataset.skip, todayToronto()); closePopup(); render(); saveBytes(); return; }
     const stop = e.target.closest("[data-stop]");
     if (stop) { state.store.stopRecurrence(stop.dataset.stop); render(); saveBytes(); openTaskPopup(stop.dataset.stop); return; }
+    const sendT = e.target.closest("[data-send-tony]");
+    if (sendT) { doSendTony(sendT.dataset.sendTony); return; }
+    const shareT = e.target.closest("[data-share-tony]");
+    if (shareT) { doShareTony(shareT.dataset.shareTony); return; }
     const arch = e.target.closest("[data-archive-task],[data-archive-note],[data-archive-person],[data-archive-project],[data-archive-reading],[data-archive-inbox]");
     if (arch) {
       const table = arch.dataset.archiveTask ? "tasks" : arch.dataset.archiveNote ? "notes" : arch.dataset.archivePerson ? "people" : arch.dataset.archiveProject ? "projects" : arch.dataset.archiveReading ? "reading_items" : "inbox_items";
@@ -4717,6 +4765,10 @@ function attachExtraListeners() {
   $("#main").addEventListener("click", async (e) => {
     const showDone = e.target.closest("[data-show-done]");
     if (showDone) { const d = showDone.dataset.showDone; state.showDoneDay = state.showDoneDay === d ? null : d; render(); return; }
+    const sendT = e.target.closest("[data-send-tony]");
+    if (sendT) { doSendTony(sendT.dataset.sendTony); return; }
+    const shareT = e.target.closest("[data-share-tony]");
+    if (shareT) { doShareTony(shareT.dataset.shareTony); return; }
     const feedSave = e.target.closest("[data-feed-save]");
     if (feedSave) { const it = feedSeed().items[Number(feedSave.dataset.feedSave)]; if (it) { state.store.createReading({ title: it.title, url: it.link }); state.searchDirty = true; showToast("Saved to Reading"); render(); saveBytes(); } return; }
     const feedOpen = e.target.closest("[data-feed-open]");
