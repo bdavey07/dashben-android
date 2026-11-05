@@ -14,7 +14,9 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.List;
 import java.util.Set;
 
@@ -47,10 +49,20 @@ public class WidgetListService extends RemoteViewsService {
         public void onDataSetChanged() {
             items.clear();
             Set<String> pendingDone = new HashSet<>();
+            Map<String, Long> doneAt = new HashMap<>();
             try {
                 SharedPreferences prefs = ctx.getSharedPreferences("dashben", Context.MODE_PRIVATE);
                 String raw = prefs.getString("pending_done", "");
                 if (raw != null && !raw.isEmpty()) for (String id : raw.split(",")) if (!id.isEmpty()) pendingDone.add(id);
+                String rawAt = prefs.getString("pending_done_at", "");
+                if (rawAt != null && !rawAt.isEmpty()) {
+                    for (String pair : rawAt.split(",")) {
+                        int colon = pair.lastIndexOf(':');
+                        if (colon > 0) {
+                            try { doneAt.put(pair.substring(0, colon), Long.parseLong(pair.substring(colon + 1))); } catch (Exception ignored) { }
+                        }
+                    }
+                }
             } catch (Exception e) { /* overlay is optional */ }
             try {
                 File f = new File(ctx.getFilesDir(), "widget.json");
@@ -67,6 +79,11 @@ public class WidgetListService extends RemoteViewsService {
                         it.meta = r.optString("meta", "");
                         it.overdue = "overdue".equals(r.optString("kind"));
                         it.done = pendingDone.contains(it.id);
+                        // Stamp cv: once the linger window (TodayWidgetProvider
+                        // .DONE_LINGER_MS, kept in step at 4000) has passed, a
+                        // ticked row leaves the list entirely.
+                        Long at = doneAt.get(it.id);
+                        if (it.done && at != null && System.currentTimeMillis() - at >= 4000L) continue;
                         items.add(it);
                     }
                 }

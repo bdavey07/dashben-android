@@ -1,6 +1,8 @@
 package ca.bendavey.pkm;
 
+import android.app.AlarmManager;
 import android.app.PendingIntent;
+import android.os.SystemClock;
 import android.appwidget.AppWidgetManager;
 import android.appwidget.AppWidgetProvider;
 import android.content.ComponentName;
@@ -29,6 +31,10 @@ import java.util.Locale;
 // store on next open/sync; a row tap opens the task in the app.
 public class TodayWidgetProvider extends AppWidgetProvider {
     static final String ITEM_ACTION = "ca.bendavey.pkm.WIDGET_ITEM";
+    static final String REFRESH_ACTION = "ca.bendavey.pkm.WIDGET_REFRESH";
+    // A ticked row shows its done state for this long, then the factory
+    // drops it from the list (the alarm below re-runs the factory then).
+    static final long DONE_LINGER_MS = 4000;
 
     @Override
     public void onUpdate(Context context, AppWidgetManager mgr, int[] ids) {
@@ -38,6 +44,14 @@ public class TodayWidgetProvider extends AppWidgetProvider {
     @Override
     public void onReceive(Context ctx, Intent intent) {
         super.onReceive(ctx, intent);
+        if (REFRESH_ACTION.equals(intent.getAction())) {
+            try {
+                AppWidgetManager mgr = AppWidgetManager.getInstance(ctx);
+                int[] ids = mgr.getAppWidgetIds(new ComponentName(ctx, TodayWidgetProvider.class));
+                if (ids.length > 0) mgr.notifyAppWidgetViewDataChanged(ids, R.id.w_list);
+            } catch (Exception e) { /* best effort */ }
+            return;
+        }
         if (!ITEM_ACTION.equals(intent.getAction())) return;
         String zone = intent.getStringExtra("zone");
         String id = intent.getStringExtra("id");
@@ -48,7 +62,36 @@ public class TodayWidgetProvider extends AppWidgetProvider {
                 String raw = prefs.getString("pending_done", "");
                 if (raw != null && !raw.isEmpty()) for (String x : raw.split(",")) if (!x.isEmpty()) set.add(x);
                 set.add(id);
-                prefs.edit().putString("pending_done", String.join(",", set)).apply();
+                // Stamp when it was ticked, pruning stamps over an hour old,
+                // and wake the factory once the linger window has passed.
+                long nowMs = System.currentTimeMillis();
+                java.util.LinkedHashMap<String, Long> stamps = new java.util.LinkedHashMap<>();
+                String rawAt = prefs.getString("pending_done_at", "");
+                if (rawAt != null && !rawAt.isEmpty()) {
+                    for (String pair : rawAt.split(",")) {
+                        int colon = pair.lastIndexOf(':');
+                        if (colon > 0) {
+                            try {
+                                long ts = Long.parseLong(pair.substring(colon + 1));
+                                if (nowMs - ts < 3600000L) stamps.put(pair.substring(0, colon), ts);
+                            } catch (Exception ignored) { }
+                        }
+                    }
+                }
+                stamps.put(id, nowMs);
+                StringBuilder sb = new StringBuilder();
+                for (java.util.Map.Entry<String, Long> e : stamps.entrySet()) {
+                    if (sb.length() > 0) sb.append(',');
+                    sb.append(e.getKey()).append(':').append(e.getValue());
+                }
+                prefs.edit().putString("pending_done", String.join(",", set)).putString("pending_done_at", sb.toString()).apply();
+                try {
+                    AlarmManager am = (AlarmManager) ctx.getSystemService(Context.ALARM_SERVICE);
+                    Intent ri = new Intent(ctx, TodayWidgetProvider.class);
+                    ri.setAction(REFRESH_ACTION);
+                    PendingIntent rpi = PendingIntent.getBroadcast(ctx, 600, ri, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+                    if (am != null) am.set(AlarmManager.ELAPSED_REALTIME, SystemClock.elapsedRealtime() + DONE_LINGER_MS + 250, rpi);
+                } catch (Exception ignored) { /* the row still clears on the next natural refresh */ }
                 AppWidgetManager mgr = AppWidgetManager.getInstance(ctx);
                 int[] ids = mgr.getAppWidgetIds(new ComponentName(ctx, TodayWidgetProvider.class));
                 if (ids.length > 0) mgr.notifyAppWidgetViewDataChanged(ids, R.id.w_list);
