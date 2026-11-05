@@ -1445,7 +1445,7 @@ async function loadFamilyCalendar(force = false) {
 // category views over it, and edits the source list into the synced
 // ui_prefs 'feed_sources' row (store.getFeedSources/setFeedSources).
 function feedSeed() {
-  if (!state.feed) state.feed = { status: "idle", items: [], sources: [], errors: [], fetchedAt: 0, category: "All", loading: false, seen: null, lastOpen: 0, prevOpen: null };
+  if (!state.feed) state.feed = { status: "idle", items: [], sources: [], errors: [], fetchedAt: 0, category: "All", loading: false, seen: null, lastOpen: 0, prevOpen: null, muted: null };
   return state.feed;
 }
 
@@ -1462,10 +1462,23 @@ function persistFeedSeen() {
   state.store.setFeedSeen({ links: [...(f.seen ?? [])].slice(-400), open: f.lastOpen ?? 0 });
   saveBytes();
 }
+function feedMutedList() {
+  const f = feedSeed();
+  if (!f.muted) f.muted = state.store.getFeedMuted();
+  return f.muted;
+}
+function feedMutedHit(i, muted) {
+  if (!muted?.length) return false;
+  const title = (i.title ?? "").toLowerCase();
+  const sum = (i.summary ?? "").toLowerCase();
+  const src = (i.source ?? "").toLowerCase();
+  return muted.some((m) => { const t = String(m).trim().toLowerCase(); return !!t && (title.includes(t) || sum.includes(t) || src === t); });
+}
 function feedNewCount() {
   const f = feedSeed(); feedSeenSet();
   if (!f.items.length || !f.lastOpen) return 0;
-  return f.items.filter((i) => i.published && Date.parse(i.published) > f.lastOpen && !f.seen.has(i.link)).length;
+  const muted = feedMutedList();
+  return f.items.filter((i) => i.published && Date.parse(i.published) > f.lastOpen && !f.seen.has(i.link) && !feedMutedHit(i, muted)).length;
 }
 function updateFeedBadge() {
   const n = feedNewCount();
@@ -1517,7 +1530,10 @@ function renderFeed() {
   if (f.prevOpen === null || f.prevOpen === undefined) { f.prevOpen = f.lastOpen; f.lastOpen = Date.now(); persistFeedSeen(); updateFeedBadge(); }
   const cats = ["All", ...new Set(f.sources.map((x) => x.category))];
   if (!cats.includes(f.category)) f.category = "All";
-  const items = f.category === "All" ? f.items : f.items.filter((i) => i.category === f.category);
+  const muted = feedMutedList();
+  const visible = f.items.filter((i) => !feedMutedHit(i, muted));
+  const hiddenCount = f.items.length - visible.length;
+  const items = f.category === "All" ? visible : visible.filter((i) => i.category === f.category);
   const savedUrls = new Set(allRows("reading_items").filter((r) => !r.archived && r.url).map((r) => r.url));
   let rowsHtml = "";
   let sawNew = false; let broke = false;
@@ -1529,10 +1545,10 @@ function renderFeed() {
     const saved = savedUrls.has(i.link);
     rowsHtml += `<div class="feed-row${f.seen.has(i.link) ? " feed-read" : ""}"><div class="feed-meta"><span class="badge">${esc(i.source)}</span><span class="muted">${esc(i.category)}${i.published ? ` · ${feedAgo(i.published)}` : ""}</span><span class="feed-acts">${saved ? `<span class="feed-saved">Saved ✓</span>` : `<button data-feed-save="${ix}" class="ghost-btn feed-save">Save</button>`}</span></div><a class="feed-title" data-feed-open="${ix}" href="${esc(i.link)}" target="_blank" rel="noopener">${esc(i.title)}</a>${i.summary ? `<p class="feed-sum">${esc(i.summary)}</p>` : ""}</div>`;
   }
-  return `<div class="feed-head"><div class="feed-chips">${cats.map((c) => `<button data-feed-cat="${esc(c)}" class="chip${c === f.category ? " chip-on" : ""}">${esc(c)}</button>`).join("")}</div><div class="feed-actions"><button data-feed-sources class="ghost-btn">Sources</button> <button data-feed-refresh class="ghost-btn">Refresh</button></div></div>
+  return `<div class="feed-head"><div class="feed-chips">${cats.map((c) => { const n = visible.filter((i) => (c === "All" || i.category === c) && i.published && f.prevOpen && Date.parse(i.published) > f.prevOpen && !f.seen.has(i.link)).length; return `<button data-feed-cat="${esc(c)}" class="chip${c === f.category ? " chip-on" : ""}">${esc(c)}${n ? `<span class="chip-n">${n}</span>` : ""}</button>`; }).join("")}</div><div class="feed-actions"><button data-feed-sources class="ghost-btn">Sources</button> <button data-feed-refresh class="ghost-btn">Refresh</button></div></div>
   ${f.status === "error" ? `<div class="panel"><p>Couldn't load the feed. <button data-feed-refresh class="ghost-btn">Retry</button></p></div>` : (f.status === "idle" || (f.loading && !f.items.length)) ? "<p class='muted'>Loading the river…</p>" : rowsHtml || "<p class='muted'>Nothing in this view yet.</p>"}
   ${f.errors?.length ? `<p class="muted">Couldn't fetch: ${f.errors.map((e) => esc(e.source)).join(", ")}</p>` : ""}
-  ${f.fetchedAt ? `<p class="muted">Updated ${feedAgo(new Date(f.fetchedAt).toISOString())}${f.status === "stale" ? " · showing the last good copy" : ""}</p>` : ""}`;
+  ${f.fetchedAt ? `<p class="muted">Updated ${feedAgo(new Date(f.fetchedAt).toISOString())}${f.status === "stale" ? " · showing the last good copy" : ""}${hiddenCount ? ` · ${hiddenCount} hidden by mutes` : ""}</p>` : ""}`;
 }
 
 // The working source list for the editor: Ben's saved list when one
@@ -1563,7 +1579,8 @@ function openFeedSources() {
     <div class="cf-field" data-feed-catnew hidden><label class="cf-label">New category</label><input name="categoryNew"></div>
     <p class="popup-actions"><button class="primary-btn">Add source</button></p>
   </form>
-  ${custom ? `<p><button data-feed-src-reset class="ghost-btn">Reset to the starter pack</button></p>` : ""}`, "feed:sources");
+  ${custom ? `<p><button data-feed-src-reset class="ghost-btn">Reset to the starter pack</button></p>` : ""}
+  <div class="feed-mute"><p><b>Muted words &amp; sources</b></p><p class="muted">One per line. A story hides when a muted word appears in its title or summary — or when the word exactly matches a source name, which mutes that whole source. Syncs to every client.</p><form data-feed-mute-form class="form"><textarea name="muted" rows="4" placeholder="one per line">${esc(feedMutedList().join("\n"))}</textarea><p class="popup-actions"><button class="primary-btn">Save mutes</button></p></form></div>`, "feed:sources");
 }
 
 function torontoYmdOf(iso) {
@@ -2688,6 +2705,16 @@ function bindPopupForms(root = $("#popup-root")) {
     state.feedReload = true;
     openFeedSources();
     showToast("Back to the starter pack");
+  }));
+  $$("[data-feed-mute-form]", root).forEach((f) => f.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const lines = String(new FormData(f).get("muted") ?? "").split("\n").map((x) => x.trim()).filter(Boolean);
+    state.store.setFeedMuted(lines);
+    feedSeed().muted = lines;
+    showToast("Mute list saved");
+    saveBytes();
+    openFeedSources();
+    render();
   }));
   $$("[data-feed-source-add]", root).forEach((f) => {
     const sel = f.querySelector("[name=category]");

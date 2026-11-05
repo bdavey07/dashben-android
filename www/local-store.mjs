@@ -618,6 +618,20 @@ export class LocalStore {
     this.engine.localWrite("ui_prefs", { key: "feed_seen", value: JSON.stringify(seen), updated_at: ts }, { baseUpdatedAt: this.getRow("ui_prefs", "feed_seen")?.updated_at ?? null });
   }
 
+  // Feed mute list (stamp ds): plain strings; a story is hidden when a
+  // muted word appears in its title/summary, or exactly matches its
+  // source name. Synced via ui_prefs "feed_muted".
+  getFeedMuted() {
+    const raw = this.getRow("ui_prefs", "feed_muted")?.value;
+    if (!raw) return [];
+    try { const v = JSON.parse(raw); return Array.isArray(v) ? v.filter((x) => typeof x === "string") : []; } catch { return []; }
+  }
+
+  setFeedMuted(list) {
+    const ts = new Date().toISOString();
+    this.engine.localWrite("ui_prefs", { key: "feed_muted", value: JSON.stringify(list ?? []), updated_at: ts }, { baseUpdatedAt: this.getRow("ui_prefs", "feed_muted")?.updated_at ?? null });
+  }
+
   setFeedSources(list) {
     const ts = new Date().toISOString();
     this.engine.localWrite("ui_prefs", { key: "feed_sources", value: list ? JSON.stringify(list) : "", updated_at: ts }, { baseUpdatedAt: this.getRow("ui_prefs", "feed_sources")?.updated_at ?? null });
