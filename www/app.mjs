@@ -1100,7 +1100,7 @@ function personEditorHtml(id, forPage) {
   return `
     <form data-edit-person="${p.id}" id="${fid}" class="form popup-form">
       <div class="cf-field"><label class="cf-label">Name</label><input name="title" value="${esc(p.title)}" required></div>
-      <div class="cf-field"><label class="cf-label">Role</label>${selectHtml("role", vocabOptions("people", "role", p.role), p.role)}<div style="margin-top:8px">${newValueHtml("roleNew", "New role")}</div></div>
+      <div class="cf-field"><label class="cf-label">Role</label><select name="role"><option value="">—</option>${vocabOptions("people", "role", p.role).map((v) => `<option value="${esc(v)}" ${v === p.role ? "selected" : ""}>${esc(v)}</option>`).join("")}<option value="__new__">New role…</option></select><div style="margin-top:8px"><input name="roleNew" placeholder="New role" hidden></div></div>
       <h4>Body</h4>${bodyFieldHtml("people", id, p.body_markdown, p.body_version)}
     </form>
     ${items.length ? `<h4>Linked items</h4>${items.map((x) => `<div class="row"><span class="badge">${esc(x.type)}</span><span class="row-title" data-open="${x.type}:${x.row.id}">${esc(x.row.title)}</span></div>`).join("")}` : ""}
@@ -1530,6 +1530,7 @@ function renderDashboard() {
   ${pinnedPanel()}
   ${upcomingPanel()}
   ${familyPanel()}
+  ${inboxPanel()}
   ${conflicts.length ? `<div class="panel"><h3>Sync conflicts (${conflicts.length}) — server row kept</h3>` + conflicts.map((c) => {
     let srv = null;
     try { srv = c.server_row_json ? JSON.parse(c.server_row_json) : null; } catch {}
@@ -1988,7 +1989,8 @@ function openPersonCreatePopup() {
   openPopup("New person", `
     <form data-create-person-popup class="form">
       <input name="title" placeholder="Person name" required>
-      <select name="role"><option value="">Role</option>${vocabValues("people", "role").map((r) => `<option>${r}</option>`).join("")}</select>
+      <select name="role"><option value="">Role</option>${vocabValues("people", "role").map((r) => `<option>${r}</option>`).join("")}<option value="__new__">New role…</option></select>
+      <input name="roleNew" placeholder="New role" hidden>
       <button>Add person</button>
     </form>`);
 }
@@ -2818,7 +2820,7 @@ function bindPopupForms(root = $("#popup-root")) {
     e.preventDefault();
     const id = f.dataset.editPerson;
     const d = new FormData(f);
-    const role = d.get("roleNew")?.trim() || d.get("role") || null;
+    const role = d.get("role") === "__new__" ? (d.get("roleNew")?.trim() || null) : (d.get("role") || null);
     try {
       await saveBody("people", id, d.get("body"));
       state.store.updateProps("people", id, { title: d.get("title"), role });
@@ -2842,7 +2844,7 @@ function bindPopupForms(root = $("#popup-root")) {
   }));
   // "New …" dropdown options reveal their text field on the three
   // detail edit forms (task project, note type, project category).
-  [["[data-edit-task]", "project", "projectNew"], ["[data-edit-note]", "type", "typeNew"], ["[data-edit-project]", "category", "categoryNew"]].forEach(([formSel, selName, newName]) => {
+  [["[data-edit-task]", "project", "projectNew"], ["[data-edit-note]", "type", "typeNew"], ["[data-edit-project]", "category", "categoryNew"], ["[data-edit-person]", "role", "roleNew"]].forEach(([formSel, selName, newName]) => {
     $$(formSel, root).forEach((f) => {
       const sel = f.querySelector(`[name="${selName}"]`);
       const nw = f.querySelector(`[name="${newName}"]`);
@@ -3876,8 +3878,6 @@ function renderManagement() {
   <p><button data-reminder-toggle class="ghost-btn">${state.store.getRow("ui_prefs", "reminders")?.value === "off" ? "Turn reminders on" : "Turn reminders off"}</button></p></div>
   <div class="panel"><h3>App lock</h3><p class="muted">Require fingerprint or device PIN to open DashBen (off by default; locks again after a minute in the background). Current: <b>${appLockOn() ? "On" : "Off"}</b></p>
   <p><button data-applock-toggle class="ghost-btn">${appLockOn() ? "Turn app lock off" : "Turn app lock on"}</button></p></div>
-  <div class="panel"><h3>Widgets</h3><p class="muted" data-widget-status>Snapshot and tap channel for the home-screen widgets.</p>
-  <p><button data-widget-check class="ghost-btn">Check widgets</button></p></div>
   <div class="panel"><h3>Backup</h3><p class="muted">Download a full copy of the local database (.db) — the same format the app loads. Keep it somewhere safe as offline insurance.</p><p><button data-export-db class="primary-btn">Export database</button></p><p><button data-export-md class="primary-btn">Export Markdown (.zip)</button></p></div>
   <div class="panel"><h3>Field values</h3><p class="muted">Selectable values for every field on every object type. Renaming a value renames it on every row using it. Deleting a value that is in use is blocked.</p>
   ${MANAGED_FIELD_LIST.map(([ot, f]) => `<h4>${ot}.${f}</h4>
@@ -4297,12 +4297,18 @@ function bindExtraPopupForms(root = $("#popup-root")) {
       closePopup(); render(); saveBytes();
     });
   });
-  $$("[data-create-person-popup]", root).forEach((f) => f.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const d = new FormData(f);
-    state.store.createPerson({ title: d.get("title"), role: d.get("role") || null });
-    closePopup(); render(); saveBytes();
-  }));
+  $$("[data-create-person-popup]", root).forEach((f) => {
+    const roleSel = f.querySelector("[name=role]");
+    if (roleSel) roleSel.addEventListener("change", () => { f.querySelector("[name=roleNew]").hidden = roleSel.value !== "__new__"; });
+    f.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const d = new FormData(f);
+      const role = d.get("role") === "__new__" ? ((d.get("roleNew") || "").trim() || null) : (d.get("role") || null);
+      state.store.createPerson({ title: d.get("title"), role });
+      if (role && !vocabValues("people", "role").includes(role)) state.store.addFieldValue("people", "role", role);
+      closePopup(); render(); saveBytes();
+    });
+  });
   $$("[data-create-reading-popup]", root).forEach((f) => bindLinkTitle(f));
   $$("[data-create-reading-popup]", root).forEach((f) => f.addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -4393,22 +4399,6 @@ function attachExtraListeners() {
         } catch { /* best-effort */ }
         render();
       }
-      return;
-    }
-    const wCheck = e.target.closest("[data-widget-check]");
-    if (wCheck) {
-      const out = wCheck.closest(".panel")?.querySelector("[data-widget-status]");
-      try {
-        let fileInfo = "no snapshot file yet";
-        try { const st = await NativeFS.stat({ path: "widget.json", directory: "DATA" }); fileInfo = `snapshot file present, written ${new Date(st.mtime).toLocaleTimeString("en-CA", { hour: "numeric", minute: "2-digit" })}`; } catch { /* missing */ }
-        let jsStatus = null, prov = null, last = null;
-        try { jsStatus = localStorage.getItem("dashben-widget-status"); last = localStorage.getItem("dashben-last-widget-action"); } catch { /* ignore */ }
-        try { const rf = await NativeFS.readFile({ path: "widget-provider.txt", directory: "DATA" }); prov = new TextDecoder().decode(b64ToBytes(rf.data)); } catch { /* provider never ran */ }
-        resolveNativePlugins();
-        if (NativeWidget) await NativeWidget.refresh({}).catch(() => null);
-        const bridge = `bridge ${window.Capacitor ? "live" : "ABSENT"} \u00B7 FS ${NativeFS ? "ok" : "missing"} \u00B7 SS ${NativeSS ? "ok" : "missing"} \u00B7 Share ${NativeShare ? "ok" : "missing"} \u00B7 Notify ${NativeNotify ? "ok" : "missing"} \u00B7 Lock ${NativeLock ? "ok" : "missing"} \u00B7 Widget ${NativeWidget ? "ok" : "missing"}`;
-        if (out) out.textContent = `Widgets: ${fileInfo} \u00B7 app write: ${jsStatus ?? "not attempted"} \u00B7 widget side: ${prov ? prov.replace(/^\d+ /, "") : "never ran"} \u00B7 last tap received: ${last ?? "none"} \u00B7 ${bridge}.`;
-      } catch { if (out) out.textContent = "Widgets: check failed."; }
       return;
     }
     const pageEdit = e.target.closest("[data-page-edit]");
