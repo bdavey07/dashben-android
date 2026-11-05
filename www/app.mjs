@@ -1685,6 +1685,7 @@ function renderDashboard() {
     const title = srv?.title ? `: ${esc(srv.title)}` : "";
     return `<p class="conflict">${esc(c.table_name)} ${esc(c.row_id)}${title} <span class="muted">${esc(c.created_at ?? "")}</span> <button data-conflict-dismiss="${c.id}">Dismiss</button></p>`;
   }).join("") + `</div>` : ""}
+  <div class="panel"><form data-dash-search class="form"><input name="q" placeholder="Search DashBen…" style="flex:1"><button>Search</button></form></div>
 `;
 }
 
@@ -3660,7 +3661,7 @@ async function boot() {
   state.searchDirty = true;
   applyTheme();
   // Tabs
-  $$(".tab-btn").forEach((b) => b.addEventListener("click", () => { $("#sidebar").classList.remove("open"); state.tab = b.dataset.tab; state.itemView = null; saveTab(); render(); }));
+  $$(".tab-btn").forEach((b) => b.addEventListener("click", () => { $("#sidebar").classList.remove("open"); if (b.dataset.tab === state.tab && !state.itemView && b.closest("#bottom-nav")) { window.scrollTo({ top: 0, behavior: "smooth" }); return; } state.tab = b.dataset.tab; state.itemView = null; saveTab(); render(); }));
   $("#sync-btn").addEventListener("click", doSync);
   $("#menu-btn").addEventListener("click", () => $("#sidebar").classList.toggle("open"));
   $("#collapse-btn")?.addEventListener("click", () => {
@@ -4248,7 +4249,7 @@ function renderCalendar() {
   <div class="cal-grid">${grid}</div>
   ${range?.status === "error" ? `<p class="muted">Couldn't load the calendar. <button data-cal-retry class="ghost-btn">Retry</button></p>` : range?.status !== "ok" ? "<p class='muted'>Loading\u2026</p>" : ""}
   </div>
-  <div class="panel"><h3>${esc(selLabel)}</h3><div class="cal-mode-toggle"><button data-cal-mode="events" class="toggle-btn ${dayMode === "events" ? "active" : ""}">Events (${selList.length})</button><button data-cal-mode="tasks" class="toggle-btn ${dayMode === "tasks" ? "active" : ""}">Tasks (${selTasks.length})</button></div>${dayMode === "events" ? (selList.length ? selList.map((e) => `<div class="row"><span class="fam-time">${esc(famTimeLabel(e))}</span><span class="row-title">${esc(e.title)}</span>${e.location ? `<span class="muted">${esc(e.location)}</span>` : ""}</div>`).join("") : "<p class='muted'>No events this day.</p>") : (selTasks.length ? selTasks.map((t) => `<div class="row"><span class="fam-time">Task</span><span class="row-title cal-task-link" data-open="tasks:${t.id}">${esc(t.title)}</span></div>`).join("") : "<p class='muted'>No tasks due this day.</p>")}</div>`;
+  <div class="panel"><h3>${esc(selLabel)}</h3><div class="cal-mode-toggle"><button data-cal-mode="events" class="toggle-btn ${dayMode === "events" ? "active" : ""}">Events (${selList.length})</button><button data-cal-mode="tasks" class="toggle-btn ${dayMode === "tasks" ? "active" : ""}">Tasks (${selTasks.length})</button></div>${dayMode === "events" ? (selList.length ? selList.map((e) => `<div class="row"><span class="fam-time">${esc(famTimeLabel(e))}</span><span class="row-title">${esc(e.title)}</span>${e.location ? `<span class="muted">${esc(e.location)}</span>` : ""}</div>`).join("") : "<p class='muted'>No events this day.</p>") : (selTasks.length ? selTasks.map((t) => `<div class="row"><input type="checkbox" data-tick="${t.id}"><span class="row-title cal-task-link" data-open="tasks:${t.id}">${esc(t.title)}</span></div>`).join("") : "<p class='muted'>No tasks due this day.</p>")}</div>`;
 }
 
 // Management sections keep their open/closed state across renders
