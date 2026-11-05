@@ -402,7 +402,6 @@ main h2 { letter-spacing: -0.015em; font-weight: 600; }
 
 /* Boot finish (stamp aw, shell only): one soft fade as the first
    render lands, instead of the splash cutting straight to content. */
-body.booted .content { animation: hatchFade 0.3s ease both; }
 
 /* Link form stays on one line on phones (stamp bb): the add-link
    search field and its button were stacking full-width. */
@@ -492,3 +491,6 @@ body.app-locked #main, body.app-locked #bottom-nav, body.app-locked header { vis
 
 /* Instant boot paint (stamp ce) */
 body.boot-preview #main { pointer-events: none; }
+
+body.boot-faded #main { animation: bootfade 160ms ease-out; }
+@keyframes bootfade { from { opacity: .5; } to { opacity: 1; } }

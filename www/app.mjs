@@ -25,11 +25,34 @@ const Cap = typeof window !== "undefined" ? window.Capacitor : null;
 // registerPlugin is proxied, but a bridge oddity at module load must
 // never kill the whole script before boot() runs — hence safePlugin.
 function safePlugin(name) {
-  try { return Cap ? Cap.registerPlugin(name) : null; } catch { return null; }
+  // No bundler here, so @capacitor/core's registerPlugin does not
+  // exist in the page. The native side injects ready-made plugin
+  // objects at Capacitor.Plugins.<name> (JSExport) — use those.
+  // (Stamps cb–cg chased a phantom "bridge timing" bug that was
+  // actually this missing function; every native feature silently
+  // fell back to web storage, and the widgets starved.)
+  try {
+    if (!Cap) return null;
+    if (Cap.Plugins && Cap.Plugins[name]) return Cap.Plugins[name];
+    if (typeof Cap.registerPlugin === "function") return Cap.registerPlugin(name);
+    return null;
+  } catch { return null; }
 }
-const NativeFS = safePlugin("Filesystem");
-const NativeSS = safePlugin("SecureStoragePlugin");
-const NativeShare = safePlugin("ShareIntent");
+let NativeFS = safePlugin("Filesystem");
+// The native bridge can lag module evaluation; proxies captured
+// too early come back null and every native feature silently falls
+// back (stamp cf — this is why the widget snapshot never wrote).
+// Re-resolve at boot, when the bridge is certainly up.
+function resolveNativePlugins() {
+  NativeFS ??= safePlugin("Filesystem");
+  NativeSS ??= safePlugin("SecureStoragePlugin");
+  NativeShare ??= safePlugin("ShareIntent");
+  NativeNotify ??= safePlugin("LocalNotifications");
+  NativeLock ??= safePlugin("AppLock");
+  NativeWidget ??= safePlugin("WidgetBridge");
+}
+let NativeSS = safePlugin("SecureStoragePlugin");
+let NativeShare = safePlugin("ShareIntent");
 // A native bridge call must never hang boot: race every native call
 // against a timeout so a wedged plugin falls back instead of
 // freezing the loading screen. (Added Nov 3 after APK #2 stuck on
@@ -62,7 +85,7 @@ window.__dashbenExportDb = async (name, bytes) => {
 // morning digest while anything is overdue. Recomputed at boot and
 // after every sync (via window.__dashbenAfterSync). On by default;
 // Management > Sync turns them off (ui_prefs "reminders" = "off").
-const NativeNotify = safePlugin("LocalNotifications");
+let NativeNotify = safePlugin("LocalNotifications");
 let remindersBusy = false;
 function remindersOn() { return state.store?.getRow("ui_prefs", "reminders")?.value !== "off"; }
 function setRemindersPref(on) {
@@ -154,7 +177,7 @@ async function initReminders() {
 // "dashben-applock". Locks on app start and after >60 s in the
 // background. Native side: AppLockPlugin (framework BiometricPrompt
 // with device-credential fallback).
-const NativeLock = safePlugin("AppLock");
+let NativeLock = safePlugin("AppLock");
 function appLockOn() { try { return localStorage.getItem("dashben-applock") === "1"; } catch { return false; } }
 function setAppLock(on) { try { localStorage.setItem("dashben-applock", on ? "1" : "0"); } catch { /* ignore */ } }
 let unlockBusy = false;
@@ -187,7 +210,7 @@ let shellHiddenAt = 0;
 // Today widget renders it and asks for a redraw via WidgetBridge.
 // Read-only by design \u2014 widget taps open the app (task taps land
 // on the task popup through the ShareIntent widget channel).
-const NativeWidget = safePlugin("WidgetBridge");
+let NativeWidget = safePlugin("WidgetBridge");
 let lastWidgetJson = "", widgetSnapTimer = null;
 function famWhenLabel(e, today) {
   const day = e.allDay ? e.start : torontoYmdOf(e.start);
@@ -228,6 +251,7 @@ function writeWidgetSnapshotThrottled() {
 }
 async function writeWidgetSnapshot() {
   try { localStorage.setItem("dashben-widget-status", `attempted @ ${new Date().toLocaleTimeString("en-CA", { hour: "numeric", minute: "2-digit" })}`); } catch { /* ignore */ }
+  if (!NativeFS) NativeFS = safePlugin("Filesystem");
   if (!NativeFS) { try { localStorage.setItem("dashben-widget-status", "attempted \u2014 file plugin missing"); } catch { /* ignore */ } return; }
   try {
     const snap = buildWidgetSnapshot();
@@ -1246,7 +1270,7 @@ function initNav() {
 // --- Tab renders ---
 function render() {
   if (state.searchDirty) { rebuildSearchIndex(); state.searchDirty = false; }
-  if (document.body?.classList.contains("boot-preview")) document.body.classList.remove("boot-preview");
+  if (document.body?.classList.contains("boot-preview")) { document.body.classList.remove("boot-preview"); document.body.classList.add("boot-faded"); }
   writeWidgetSnapshotThrottled();
   $("#sync-status").textContent = statusLine();
   $("#net-badge").textContent = navigator.onLine ? "Online" : "Offline";
@@ -1280,6 +1304,7 @@ function render() {
   bindMainForms();
   bindExtraForms();
   if (state.itemView) { bindPopupForms($("#main")); bindExtraPopupForms($("#main")); }
+  if (state.booted && !state.itemView && state.tab === "daily") cacheBootHtml(JSON.stringify({ tab: state.tab, html: main.innerHTML }));
   pushNav();
 }
 
@@ -1415,11 +1440,6 @@ function weatherLineHtml() {
 }
 
 function renderDashboard() {
-  const html = renderDashboardInner();
-  if (state.booted && !state.itemView) cacheBootHtml(html);
-  return html;
-}
-function renderDashboardInner() {
   const conflicts = state.engine.listConflicts();
   return `${weatherLineHtml()}
   ${pinnedPanel()}
@@ -2716,6 +2736,15 @@ function bindPopupForms(root = $("#popup-root")) {
 }
 
 function attachPersistentListeners() {
+  // Password managers: keep autofill out of every field (stamp cg).
+  document.addEventListener("focusin", (e) => {
+    const el = e.target;
+    if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA")) {
+      el.setAttribute("autocomplete", "off");
+      el.setAttribute("data-1p-ignore", "true");
+      el.setAttribute("data-lpignore", "true");
+    }
+  });
   // Sync on return (stamp bz): coming back to the app/tab pulls
   // anything that changed elsewhere instead of sitting stale until
   // the next edit or manual sync. Throttled; doSync self-guards.
@@ -2975,8 +3004,12 @@ function attachPersistentListeners() {
 // and the first live render replaces it.
 function paintBootPreview() {
   try {
-    const html = localStorage.getItem("dashben-boot-html");
-    if (!html) return;
+    const raw = localStorage.getItem("dashben-boot-html");
+    if (!raw) return;
+    let tab = "dashboard", html = raw;
+    try { const j = JSON.parse(raw); if (j && j.html) { tab = j.tab || "dashboard"; html = j.html; } } catch { /* legacy plain-html cache */ }
+    const want = "daily"; // the app always opens on Daily (stamp cg)
+    if (tab !== want) return;
     const main = document.querySelector("#main");
     if (main) { main.innerHTML = html; document.body.classList.add("boot-preview"); }
   } catch { /* preview is optional */ }
@@ -2988,6 +3021,7 @@ function cacheBootHtml(html) {
 }
 async function boot() {
   paintBootPreview();
+  resolveNativePlugins();
   loadSettings();
   await loadSecureToken();
   // The WASM binary ships as base64 text (vendor/sql-wasm.wasm.b64)
@@ -3150,7 +3184,7 @@ async function boot() {
   // Reload lands on the tab that was open, not always the dashboard.
   try {
     const s = JSON.parse(localStorage.getItem("pkm-local-settings") || "{}");
-    if (s.tab && allTabIds().includes(s.tab)) state.tab = s.tab;
+    state.tab = "daily"; // Ben: always open on the Daily tab (stamp cg)
   } catch {}
   try {
     const s0 = JSON.parse(localStorage.getItem("pkm-local-settings") || "{}");
@@ -4157,8 +4191,10 @@ function attachExtraListeners() {
         let jsStatus = null, prov = null, last = null;
         try { jsStatus = localStorage.getItem("dashben-widget-status"); last = localStorage.getItem("dashben-last-widget-action"); } catch { /* ignore */ }
         try { const rf = await NativeFS.readFile({ path: "widget-provider.txt", directory: "DATA" }); prov = new TextDecoder().decode(b64ToBytes(rf.data)); } catch { /* provider never ran */ }
+        resolveNativePlugins();
         if (NativeWidget) await NativeWidget.refresh({}).catch(() => null);
-        if (out) out.textContent = `Widgets: ${fileInfo} \u00B7 app write: ${jsStatus ?? "not attempted"} \u00B7 widget side: ${prov ? prov.replace(/^\d+ /, "") : "never ran"} \u00B7 last tap received: ${last ?? "none"}.`;
+        const bridge = `bridge ${window.Capacitor ? "live" : "ABSENT"} \u00B7 FS ${NativeFS ? "ok" : "missing"} \u00B7 SS ${NativeSS ? "ok" : "missing"} \u00B7 Share ${NativeShare ? "ok" : "missing"} \u00B7 Notify ${NativeNotify ? "ok" : "missing"} \u00B7 Lock ${NativeLock ? "ok" : "missing"} \u00B7 Widget ${NativeWidget ? "ok" : "missing"}`;
+        if (out) out.textContent = `Widgets: ${fileInfo} \u00B7 app write: ${jsStatus ?? "not attempted"} \u00B7 widget side: ${prov ? prov.replace(/^\d+ /, "") : "never ran"} \u00B7 last tap received: ${last ?? "none"} \u00B7 ${bridge}.`;
       } catch { if (out) out.textContent = "Widgets: check failed."; }
       return;
     }
