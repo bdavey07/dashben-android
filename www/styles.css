@@ -545,7 +545,7 @@ body.boot-faded #main { animation: bootfade 160ms ease-out; }
 
 /* Stamp df: vocab values are list rows, not stacked forms. Display
    mode shows the value + Edit/Delete; Edit swaps in the input. */
-.mgmt-vrow { display: flex; align-items: center; gap: 6px; flex-wrap: nowrap; margin: 0 0 6px; padding: 5px 6px 5px 12px; background: rgba(127, 135, 160, .07); border: 1px solid var(--line); border-radius: 8px; }
+.mgmt-body .mgmt-vrow { display: flex; flex-direction: row; align-items: center; gap: 6px; flex-wrap: nowrap; margin: 0 0 6px; padding: 5px 6px 5px 12px; background: rgba(127, 135, 160, .07); border: 1px solid var(--line); border-radius: 8px; }
 .mgmt-vname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mgmt-vrow input[name=new] { display: none; }
 .mgmt-vrow .vrow-save, .mgmt-vrow .vrow-cancel { display: none; }
@@ -554,8 +554,10 @@ body.boot-faded #main { animation: bootfade 160ms ease-out; }
 .mgmt-vrow.editing .mgmt-vname, .mgmt-vrow.editing .vrow-edit, .mgmt-vrow.editing .vrow-del { display: none; }
 .mgmt-vrow button { flex: 0 0 auto; width: auto; min-height: 38px; padding: 4px 10px; }
 .mgmt-vrow input[name=value] { flex: 1; min-width: 0; width: auto; }
-/* Every inline form inside Management stays on one line (groups too). */
-.mgmt-body .form.inline { flex-wrap: nowrap; }
+/* Every inline form inside Management stays on one line (groups too).
+   The global mobile rule stacks .form children in a column — these
+   rows opt back out, the same way [data-daily-nav] does. */
+.mgmt-body .form.inline { flex-direction: row; flex-wrap: nowrap; align-items: center; }
 .mgmt-body .form.inline input { width: auto; flex: 1; min-width: 0; }
 .mgmt-body .form.inline button { flex: 0 0 auto; width: auto; }
 .mgmt-body .form.inline select { width: auto; flex: 0 1 auto; min-width: 0; }
