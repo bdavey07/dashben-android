@@ -600,3 +600,20 @@ body.boot-faded #main { animation: bootfade 160ms ease-out; }
 /* Stamp dv: completed-on-demand. */
 .done-box { margin-top: 10px; }
 .done-list { margin-top: 8px; }
+
+/* Stamp dx: popup buttons — one action-bar system. Every button in a
+   popup action bar gets the same height and padding; ghost buttons
+   become real outlined buttons inside the bar (text-only ghosts were
+   the jank — naked text floating between boxed buttons); the danger
+   action separates to the far right; small screens get even tiles
+   instead of a ragged wrap. */
+.popup-actions { gap: 10px; }
+.popup-actions button, .popup-actions-top button { min-height: 38px; padding: 7px 14px; display: inline-flex; align-items: center; justify-content: center; }
+.popup-actions .ghost-btn, .popup-actions-top .ghost-btn { background: var(--panel); border-color: var(--line); color: var(--text); text-decoration: none; }
+.popup-actions .ghost-btn:hover, .popup-actions-top .ghost-btn:hover { border-color: var(--primary); text-decoration: none; }
+.popup-actions .danger-btn, .popup-actions-top .danger-btn { margin-left: auto; }
+.popup-head-actions button { min-height: 34px; padding: 6px 12px; display: inline-flex; align-items: center; }
+@media (max-width: 768px) {
+  .popup-actions button, .popup-actions-top button { flex: 1 1 30%; }
+  .popup-actions .danger-btn, .popup-actions-top .danger-btn { margin-left: 0; }
+}
