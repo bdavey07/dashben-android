@@ -234,13 +234,29 @@ function buildWidgetSnapshot() {
       .sort((a, b) => (a.allDay ? a.start + "T00:00:00" : a.start) < (b.allDay ? b.start + "T00:00:00" : b.start) ? -1 : 1)[0];
     if (next) family = { title: next.title, when: famWhenLabel(next, today) };
   } catch { /* family is optional in the snapshot */ }
+  let schedule = [];
+  try {
+    const note = dailyNoteFor(today);
+    if (note) schedule = splitSchedule(note.body_markdown ?? "").schedule.slice(0, 4).map((l) => l.trim());
+  } catch { /* schedule is optional in the snapshot */ }
   let weather = "";
   if (state.weather) {
     const days = state.weather.daily;
     const { icon, condition } = weatherIcon(days.weathercode?.[0] ?? -1);
     weather = `${icon} ${Math.round(days.temperature_2m_max?.[0] ?? 0)}\u00B0 / ${Math.round(days.temperature_2m_min?.[0] ?? 0)}\u00B0 \u00B7 ${condition} \u00B7 ${Math.round(state.weather.current.temperature_2m)}\u00B0 now \u00B7 Mitchell`;
   }
-  return { at: Date.now(), overdueCount: overdue.length, todayCount: dueToday.length, rows, family, weather };
+  let wx = null;
+  if (state.weather) {
+    const cur = state.weather.current ?? {}, d = state.weather.daily ?? {};
+    wx = {
+      temp: `${Math.round(cur.temperature_2m ?? 0)}\u00B0`,
+      feels: cur.apparent_temperature != null ? `${Math.round(cur.apparent_temperature)}\u00B0` : "\u2014",
+      wind: cur.wind_speed_10m != null ? `${Math.round(cur.wind_speed_10m)} km/h` : "\u2014",
+      pop: d.precipitation_probability_max?.[0] != null ? `${Math.round(d.precipitation_probability_max[0])}%` : "\u2014",
+      psum: d.precipitation_sum?.[0] != null ? `${Math.round(d.precipitation_sum[0] * 10) / 10} mm` : "\u2014",
+    };
+  }
+  return { at: Date.now(), overdueCount: overdue.length, todayCount: dueToday.length, rows, family, weather, schedule, wx };
 }
 let lastSnapAttempt = 0;
 function writeWidgetSnapshotThrottled() {
@@ -3392,7 +3408,7 @@ async function fetchWeather() {
   state.weatherTried = true;
   try {
     // Same request production uses (today + next 3 days).
-    const url = "https://api.open-meteo.com/v1/forecast?latitude=43.4635&longitude=-81.18748&current=temperature_2m&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum,wind_speed_10m_max,sunrise,sunset&hourly=temperature_2m,weather_code,precipitation_probability&timezone=America%2FToronto&forecast_days=4";
+    const url = "https://api.open-meteo.com/v1/forecast?latitude=43.4635&longitude=-81.18748&current=temperature_2m,apparent_temperature,wind_speed_10m&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum,wind_speed_10m_max,sunrise,sunset&hourly=temperature_2m,weather_code,precipitation_probability&timezone=America%2FToronto&forecast_days=4";
     const res = await fetch(url);
     if (!res.ok) throw new Error("weather fetch failed");
     state.weather = await res.json();

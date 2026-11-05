@@ -26,6 +26,12 @@ import java.util.Locale;
 // the ShareIntent plugin's widget-action channel).
 public class TodayWidgetProvider extends AppWidgetProvider {
     static final int[] ROW_IDS = { R.id.w_row1, R.id.w_row2, R.id.w_row3, R.id.w_row4, R.id.w_row5, R.id.w_row6 };
+    static final int[] ROWC_IDS = { R.id.w_rowc1, R.id.w_rowc2, R.id.w_rowc3, R.id.w_rowc4, R.id.w_rowc5, R.id.w_rowc6 };
+    static final int[] META_IDS = { R.id.w_meta1, R.id.w_meta2, R.id.w_meta3, R.id.w_meta4, R.id.w_meta5, R.id.w_meta6 };
+    static final int[] CHECK_IDS = { R.id.w_check1, R.id.w_check2, R.id.w_check3, R.id.w_check4, R.id.w_check5, R.id.w_check6 };
+    static final int[] SROWC_IDS = { R.id.w_srowc1, R.id.w_srowc2, R.id.w_srowc3, R.id.w_srowc4 };
+    static final int[] STIME_IDS = { R.id.w_stime1, R.id.w_stime2, R.id.w_stime3, R.id.w_stime4 };
+    static final int[] STEXT_IDS = { R.id.w_stext1, R.id.w_stext2, R.id.w_stext3, R.id.w_stext4 };
 
     @Override
     public void onUpdate(Context context, AppWidgetManager mgr, int[] ids) {
@@ -81,6 +87,15 @@ public class TodayWidgetProvider extends AppWidgetProvider {
                 counts = oc > 0 ? ("\u26A0 " + oc + " overdue \u00B7 " + tc + " due today")
                         : (tc > 0 ? (tc + " due today") : "All clear today");
                 weather = s.optString("weather", "");
+                JSONObject wxo = s.optJSONObject("wx");
+                if (wxo != null) {
+                    v.setTextViewText(R.id.w_wx_temp, wxo.optString("temp", "\u2014"));
+                    v.setTextViewText(R.id.w_wx_feels, wxo.optString("feels", "\u2014"));
+                    v.setTextViewText(R.id.w_wx_wind, wxo.optString("wind", "\u2014"));
+                    v.setTextViewText(R.id.w_wx_pop, wxo.optString("pop", "\u2014"));
+                    v.setTextViewText(R.id.w_wx_psum, wxo.optString("psum", "\u2014"));
+                    v.setViewVisibility(R.id.w_wx, View.VISIBLE);
+                }
                 JSONObject fam = s.optJSONObject("family");
                 if (fam != null) family = "\uD83D\uDCC5 " + fam.optString("when", "") + " \u2014 " + fam.optString("title", "");
                 JSONArray rows = s.optJSONArray("rows");
@@ -88,14 +103,14 @@ public class TodayWidgetProvider extends AppWidgetProvider {
                     for (int i = 0; i < rows.length() && i < ROW_IDS.length; i++) {
                         JSONObject r = rows.getJSONObject(i);
                         boolean od = "overdue".equals(r.optString("kind"));
-                        String text = (od ? "\u25CF " : "\u25CB ") + r.optString("text", "");
-                        String meta = r.optString("meta", "");
-                        if (!meta.isEmpty()) text += "  \u00B7 " + meta;
-                        v.setTextViewText(ROW_IDS[i], text);
-                        v.setTextColor(ROW_IDS[i], Color.parseColor(od ? "#f0a3a3" : "#e8e9ee"));
-                        v.setViewVisibility(ROW_IDS[i], View.VISIBLE);
+                        v.setTextViewText(ROW_IDS[i], r.optString("text", ""));
+                        v.setTextColor(ROW_IDS[i], Color.parseColor(od ? "#f2a49b" : "#f5efe6"));
+                        v.setTextViewText(META_IDS[i], r.optString("meta", ""));
+                        v.setTextColor(META_IDS[i], Color.parseColor(od ? "#f2a49b" : "#a89e92"));
+                        v.setImageViewResource(CHECK_IDS[i], od ? R.drawable.widget_check_overdue : R.drawable.widget_check);
+                        v.setViewVisibility(ROWC_IDS[i], View.VISIBLE);
                         String rid = r.optString("id", "");
-                        if (!rid.isEmpty()) v.setOnClickPendingIntent(ROW_IDS[i], pending(ctx, 200 + i, openIntent(ctx, "task-open", rid)));
+                        if (!rid.isEmpty()) v.setOnClickPendingIntent(ROWC_IDS[i], pending(ctx, 200 + i, openIntent(ctx, "task-open", rid)));
                         shown++;
                     }
                 }
@@ -105,10 +120,35 @@ public class TodayWidgetProvider extends AppWidgetProvider {
             }
         } catch (Exception e) { seen = "ran, error: " + e.getMessage(); }
         witness(ctx, seen);
-        for (int i = shown; i < ROW_IDS.length; i++) v.setViewVisibility(ROW_IDS[i], View.GONE);
+        for (int i = shown; i < ROWC_IDS.length; i++) v.setViewVisibility(ROWC_IDS[i], View.GONE);
+        int sShown = 0;
+        try {
+            File f2 = new File(ctx.getFilesDir(), "widget.json");
+            if (f2.exists()) {
+                JSONArray sched = new JSONObject(readFile(f2)).optJSONArray("schedule");
+                if (sched != null) {
+                    for (int i = 0; i < sched.length() && i < SROWC_IDS.length; i++) {
+                        String line = sched.optString(i, "");
+                        String time = "", text = line;
+                        String[] seps = { " \u2014 ", " \u2013 ", " - " };
+                        for (String sep : seps) {
+                            int k = line.indexOf(sep);
+                            if (k > 0) { time = line.substring(0, k); text = line.substring(k + sep.length()); break; }
+                        }
+                        v.setTextViewText(STIME_IDS[i], time);
+                        v.setTextViewText(STEXT_IDS[i], text);
+                        v.setViewVisibility(SROWC_IDS[i], View.VISIBLE);
+                        sShown++;
+                    }
+                }
+            }
+        } catch (Exception e) { /* schedule is optional */ }
+        for (int i = sShown; i < SROWC_IDS.length; i++) v.setViewVisibility(SROWC_IDS[i], View.GONE);
+        v.setViewVisibility(R.id.w_sched_label, sShown > 0 ? View.VISIBLE : View.GONE);
         v.setTextViewText(R.id.w_counts, counts);
-        v.setTextViewText(R.id.w_weather, weather);
-        v.setViewVisibility(R.id.w_weather, weather.isEmpty() ? View.GONE : View.VISIBLE);
+        v.setOnClickPendingIntent(R.id.w_btn_capture, pending(ctx, 400, openIntent(ctx, "capture", null)));
+        v.setOnClickPendingIntent(R.id.w_btn_task, pending(ctx, 401, openIntent(ctx, "task", null)));
+        v.setOnClickPendingIntent(R.id.w_btn_note, pending(ctx, 402, openIntent(ctx, "note", null)));
         v.setTextViewText(R.id.w_family, family);
         v.setViewVisibility(R.id.w_family, family.isEmpty() ? View.GONE : View.VISIBLE);
         v.setTextViewText(R.id.w_updated, updated);

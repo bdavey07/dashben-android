@@ -5,7 +5,7 @@
     android:layout_height="match_parent"
     android:orientation="horizontal"
     android:background="@drawable/widget_bg"
-    android:padding="8dp">
+    android:padding="10dp">
 
     <TextView
         android:id="@+id/w_cap_capture"
@@ -13,8 +13,9 @@
         android:layout_height="match_parent"
         android:layout_weight="1"
         android:text="＋ Capture"
-        android:textColor="#ffffff"
+        android:textColor="#f5efe6"
         android:textSize="13sp"
+        android:textStyle="bold"
         android:gravity="center"
         android:background="@drawable/widget_btn_bg"
         android:layout_marginEnd="6dp" />
@@ -25,8 +26,9 @@
         android:layout_height="match_parent"
         android:layout_weight="1"
         android:text="✓ New task"
-        android:textColor="#ffffff"
+        android:textColor="#f5efe6"
         android:textSize="13sp"
+        android:textStyle="bold"
         android:gravity="center"
         android:background="@drawable/widget_btn_bg"
         android:layout_marginEnd="6dp" />
@@ -37,8 +39,9 @@
         android:layout_height="match_parent"
         android:layout_weight="1"
         android:text="✎ Quick note"
-        android:textColor="#ffffff"
+        android:textColor="#f5efe6"
         android:textSize="13sp"
+        android:textStyle="bold"
         android:gravity="center"
         android:background="@drawable/widget_btn_bg" />
 </LinearLayout>
