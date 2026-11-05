@@ -3858,63 +3858,79 @@ function renderCalendar() {
   <div class="panel"><h3>${esc(selLabel)}</h3>${selList.length || selTasks.length ? selList.map((e) => `<div class="row"><span class="fam-time">${esc(famTimeLabel(e))}</span><span class="row-title">${esc(e.title)}</span>${e.location ? `<span class="muted">${esc(e.location)}</span>` : ""}</div>`).join("") + selTasks.map((t) => `<div class="row"><span class="fam-time">Task</span><span class="row-title cal-task-link" data-open="tasks:${t.id}">${esc(t.title)}</span></div>`).join("") : "<p class='muted'>Nothing scheduled.</p>"}</div>`;
 }
 
+// Management sections keep their open/closed state across renders
+// (stamp de): render() rebuilds the tab on every action, so without
+// this the accordion would snap shut after every tap.
+const mgmtOpen = new Set(["sync"]);
+
 function renderManagement() {
   const prefs = getTabPrefs();
   const allTags = state.db.prepare("SELECT DISTINCT tag FROM object_tags ORDER BY tag").all().map((r) => r.tag);
   const types = state.db.prepare("SELECT * FROM custom_object_types ORDER BY name").all();
   const currentTheme = state.store.getRow("ui_prefs", "theme")?.value ?? "ember";
+  const themeLabel = THEMES.find(([v]) => v === currentTheme)?.[1] ?? currentTheme;
   const ungrouped = allTabIds().filter((id) => !prefs.groups.some((g) => (g.tabs ?? []).includes(id)));
   const knownTabs = allTabIds();
   const order = [...prefs.order.filter((id) => knownTabs.includes(id)), ...knownTabs.filter((id) => !prefs.order.includes(id))];
-  return `<div class="panel"><h3>Sync</h3><p class="muted">Your data syncs with pkm.ben-cloud.net. Saving a token starts a sync — delete any test items first, since later syncs upload local changes.</p>
-  <p class="muted">Local database: ${state.db ? Math.round(state.db.exportBytes().length / 1024) : 0} KB${state.bootMs ? ` · started in ${state.bootMs} ms` : ""}</p>
+  const remindersOff = state.store.getRow("ui_prefs", "reminders")?.value === "off";
+  const dbKb = state.db ? Math.round(state.db.exportBytes().length / 1024) : 0;
+  const sec = (key, title, sub, body) => `<details class="mgmt-sec" data-mgmt-sec="${key}"${mgmtOpen.has(key) ? " open" : ""}><summary><span class="mgmt-title">${title}</span><span class="mgmt-state">${sub}</span><span class="mgmt-chev">\u25b8</span></summary><div class="mgmt-body">${body}</div></details>`;
+  return `<h2 class="mgmt-h">Management</h2>
+  ${sec("sync", "Sync", state.token ? `Connected \u00b7 ${dbKb} KB` : `No token \u00b7 ${dbKb} KB`, `
+  <p class="muted">Your data syncs with pkm.ben-cloud.net. Saving a token starts a sync \u2014 delete any test items first, since later syncs upload local changes.${state.bootMs ? ` Started in ${state.bootMs} ms.` : ""}</p>
   <div class="token-card"><label for="sync-token-input">Sync token</label>
   <input id="sync-token-input" type="text" style="-webkit-text-security: disc;" autocomplete="off" data-1p-ignore="true" data-lpignore="true" placeholder="SYNC_TOKEN">
-  <button data-token-save class="ghost-btn">Save token</button>
+  <div class="mgmt-btnrow"><button data-token-save class="ghost-btn">Save token</button>
   <button data-full-sync class="ghost-btn">Re-download everything</button>
-  <span class="muted">${state.token ? "Token saved" : "No token set"}</span></div>
-  <p><button data-health-check class="ghost-btn">Health check</button> <span class="muted">Compares this device with the server, table by table.</span></p>${state.healthHtml ?? ""}
-  <p class="muted">Due reminders: <b>${state.store.getRow("ui_prefs", "reminders")?.value === "off" ? "Off" : "On"}</b> \u2014 a 9 a.m. nudge on each due day, plus a morning digest while tasks are overdue.</p>
-  <p><button data-reminder-toggle class="ghost-btn">${state.store.getRow("ui_prefs", "reminders")?.value === "off" ? "Turn reminders on" : "Turn reminders off"}</button></p></div>
-  <div class="panel"><h3>App lock</h3><p class="muted">Require fingerprint or device PIN to open DashBen (off by default; locks again after a minute in the background). Current: <b>${appLockOn() ? "On" : "Off"}</b></p>
-  <p><button data-applock-toggle class="ghost-btn">${appLockOn() ? "Turn app lock off" : "Turn app lock on"}</button></p></div>
-  <div class="panel"><h3>Backup</h3><p class="muted">Download a full copy of the local database (.db) — the same format the app loads. Keep it somewhere safe as offline insurance.</p><p><button data-export-db class="primary-btn">Export database</button></p><p><button data-export-md class="primary-btn">Export Markdown (.zip)</button></p></div>
-  <div class="panel"><h3>Field values</h3><p class="muted">Selectable values for every field on every object type. Renaming a value renames it on every row using it. Deleting a value that is in use is blocked.</p>
-  ${MANAGED_FIELD_LIST.map(([ot, f]) => `<h4>${ot}.${f}</h4>
-    ${vocabValues(ot, f).map((v) => `<form data-fv-rename class="form inline"><input type="hidden" name="objectType" value="${ot}"><input type="hidden" name="field" value="${f}"><input type="hidden" name="old" value="${esc(v)}"><input name="new" value="${esc(v)}"><button>Rename</button><button type="button" data-fv-delete="${ot}|${f}|${esc(v)}">Delete</button></form>`).join("")}
-    <form data-fv-add class="form inline"><input type="hidden" name="objectType" value="${ot}"><input type="hidden" name="field" value="${f}"><input name="value" placeholder="New value"><button>Add</button></form>`).join("")}</div>
-  <div class="panel"><h3>Tags</h3><p class="muted">Renaming a tag renames it on every item using it; deleting removes it from every item using it.</p>
-  ${allTags.map((t) => `<form data-tag-rename class="form inline"><input type="hidden" name="old" value="${esc(t)}"><input name="new" value="${esc(t)}"><button>Rename</button><button type="button" data-tag-delete="${esc(t)}">Delete</button></form>`).join("") || "<p class='muted'>No tags yet.</p>"}</div>
-  <div class="panel"><h3>Theme</h3><p class="muted">Current: ${esc(THEMES.find(([v]) => v === currentTheme)?.[1] ?? currentTheme)}</p>
-  ${THEMES.map(([v, label]) => `<button data-theme-btn="${v}" ${v === currentTheme ? "disabled" : ""}>${label}</button>`).join(" ")}</div>
-  <div class="panel"><h3>Tab groups</h3>
-  ${prefs.groups.map((g) => `<div><form data-group-rename class="form inline"><input type="hidden" name="id" value="${g.id}"><input name="label" value="${esc(g.label)}"><button>Rename</button><button type="button" data-group-delete="${g.id}">Delete group</button></form>
+  <span class="muted">${state.token ? "Token saved" : "No token set"}</span></div></div>
+  <div class="mgmt-row"><div class="mgmt-rowtext"><span class="mgmt-label">Health check</span><span class="muted">Compares this device with the server, table by table.</span></div><button data-health-check class="ghost-btn">Run</button></div>${state.healthHtml ?? ""}`)}
+  ${sec("alerts", "Reminders & lock", `Reminders ${remindersOff ? "off" : "on"} \u00b7 Lock ${appLockOn() ? "on" : "off"}`, `
+  <div class="mgmt-row"><div class="mgmt-rowtext"><span class="mgmt-label">Due reminders \u2014 <b>${remindersOff ? "Off" : "On"}</b></span><span class="muted">A 9 a.m. nudge on each due day, plus a morning digest while tasks are overdue.</span></div><button data-reminder-toggle class="ghost-btn">${remindersOff ? "Turn on" : "Turn off"}</button></div>
+  <div class="mgmt-row"><div class="mgmt-rowtext"><span class="mgmt-label">App lock \u2014 <b>${appLockOn() ? "On" : "Off"}</b></span><span class="muted">Require fingerprint or device PIN to open DashBen. Locks again after a minute in the background.</span></div><button data-applock-toggle class="ghost-btn">${appLockOn() ? "Turn off" : "Turn on"}</button></div>`)}
+  ${sec("appearance", "Appearance", esc(themeLabel), `
+  <p class="muted">Current theme: <b>${esc(themeLabel)}</b></p>
+  <div class="theme-grid">${THEMES.map(([v, label]) => `<button data-theme-btn="${v}" ${v === currentTheme ? "disabled" : ""}>${label}</button>`).join("")}</div>`)}
+  ${sec("tabs", "Tabs", `${order.length} tabs \u00b7 ${prefs.groups.length} groups`, `
+  <h4 class="mgmt-sub">Order</h4><p class="muted">Drag tabs to reorder them, then save.</p>
+  <ul data-tab-order-list>${order.map((tid) => `<li draggable="true" data-tab-order-item="${tid}">\u2630 ${esc(tabLabel(tid))}</li>`).join("")}</ul>
+  <p><button data-tab-order-save class="ghost-btn">Save order</button></p>
+  <h4 class="mgmt-sub">Groups</h4>
+  ${prefs.groups.map((g) => `<div class="mgmt-group"><form data-group-rename class="form inline"><input type="hidden" name="id" value="${g.id}"><input name="label" value="${esc(g.label)}"><button>Rename</button><button type="button" data-group-delete="${g.id}">Delete group</button></form>
     ${(g.tabs ?? []).map((tid) => `<p class="muted" style="margin-left:16px">${esc(tabLabel(tid))} <button data-group-remove-tab="${g.id}|${tid}">Remove</button></p>`).join("")}</div>`).join("") || "<p class='muted'>No groups yet.</p>"}
   <form data-group-create class="form inline"><input name="label" placeholder="New group name" required><button>Create group</button></form>
-  <p><button data-reset-tabs>Reset tabs</button></p>
-  <h4>Ungrouped tabs</h4>
-  ${ungrouped.map((tid) => `<form data-group-add-tab class="form inline"><span>${esc(tabLabel(tid))}</span><input type="hidden" name="tab" value="${tid}"><select name="group">${prefs.groups.map((g) => `<option value="${g.id}">${esc(g.label)}</option>`).join("")}</select><button ${prefs.groups.length ? "" : "disabled"}>Add to group</button></form>`).join("")}</div>
-  <div class="panel"><h3>Tab order</h3><p class="muted">Drag tabs to reorder them, then save.</p>
-  <ul data-tab-order-list>${order.map((tid) => `<li draggable="true" data-tab-order-item="${tid}">☰ ${esc(tabLabel(tid))}</li>`).join("")}</ul>
-  <p><button data-tab-order-save>Save</button></p></div>
-  <div class="panel"><h3>Templates</h3><p class="muted">Prefilled skeletons offered in the New task / New note forms. Stored in the app and synced like everything else.</p>
-  ${getTemplates().map((t) => `<p class="tpl-row"><strong>${esc(t.name)}</strong> <span class="muted">${esc(t.kind)}</span> <button data-tpl-del="${t.id}" class="ghost-btn">Delete</button></p>`).join("")}
+  <p><button data-reset-tabs class="ghost-btn">Reset tabs</button></p>
+  <h4 class="mgmt-sub">Ungrouped tabs</h4>
+  ${ungrouped.map((tid) => `<form data-group-add-tab class="form inline"><span>${esc(tabLabel(tid))}</span><input type="hidden" name="tab" value="${tid}"><select name="group">${prefs.groups.map((g) => `<option value="${g.id}">${esc(g.label)}</option>`).join("")}</select><button ${prefs.groups.length ? "" : "disabled"}>Add to group</button></form>`).join("") || "<p class='muted'>Every tab is in a group.</p>"}`)}
+  ${sec("vocab", "Vocabularies", `${MANAGED_FIELD_LIST.length} fields \u00b7 ${allTags.length} tags`, `
+  <p class="muted">Selectable values for every field. Renaming a value renames it on every row using it; deleting a value that is in use is blocked.</p>
+  ${MANAGED_FIELD_LIST.map(([ot, f]) => `<h4 class="mgmt-sub">${ot}.${f}</h4>
+    ${vocabValues(ot, f).map((v) => `<form data-fv-rename class="form inline mgmt-vrow"><input type="hidden" name="objectType" value="${ot}"><input type="hidden" name="field" value="${f}"><input type="hidden" name="old" value="${esc(v)}"><input name="new" value="${esc(v)}"><button>Rename</button><button type="button" data-fv-delete="${ot}|${f}|${esc(v)}">Delete</button></form>`).join("")}
+    <form data-fv-add class="form inline mgmt-vrow"><input type="hidden" name="objectType" value="${ot}"><input type="hidden" name="field" value="${f}"><input name="value" placeholder="New value"><button>Add</button></form>`).join("")}
+  <h4 class="mgmt-sub">Tags</h4><p class="muted">Renaming a tag renames it on every item using it; deleting removes it from every item using it.</p>
+  ${allTags.map((t) => `<form data-tag-rename class="form inline mgmt-vrow"><input type="hidden" name="old" value="${esc(t)}"><input name="new" value="${esc(t)}"><button>Rename</button><button type="button" data-tag-delete="${esc(t)}">Delete</button></form>`).join("") || "<p class='muted'>No tags yet.</p>"}`)}
+  ${sec("templates", "Templates", `${getTemplates().length} saved`, `
+  <p class="muted">Prefilled skeletons offered in the New task / New note forms. Stored in the app and synced like everything else.</p>
+  ${getTemplates().map((t) => `<p class="tpl-row"><strong>${esc(t.name)}</strong> <span class="muted">${esc(t.kind)}</span> <button data-tpl-del="${t.id}" class="ghost-btn">Delete</button></p>`).join("") || "<p class='muted'>No templates yet.</p>"}
   <form data-tpl-add class="form">
     <div class="cf-row"><div class="cf-field"><label class="cf-label">Name</label><input name="name" required></div>
     <div class="cf-field"><label class="cf-label">Kind</label><select name="kind"><option value="note">Note</option><option value="task">Task</option></select></div></div>
     <div class="cf-field"><label class="cf-label">Title prefill (optional)</label><input name="title"></div>
     <div class="cf-field"><label class="cf-label">Body</label><textarea name="body" rows="4"></textarea></div>
     <button class="primary-btn">Add template</button>
-  </form></div>
-  <div class="panel"><h3>Group order</h3><p class="muted">Drag to rearrange the section order on grouped pages, then save each list. Sections with no items right now are included, so the order is ready when they appear. \u201cNo project\u201d, \u201cNo type\u201d and friends always stay last; Daily notes stays first.</p>
-  ${GROUPINGS.map((g) => { const vals = groupOrderCandidates(g); return `<h4>${g.label}</h4>
+  </form>`)}
+  ${sec("order", "Section order", `${GROUPINGS.length} lists`, `
+  <p class="muted">Drag to rearrange the section order on grouped pages, then save each list. Sections with no items right now are included, so the order is ready when they appear. \u201cNo project\u201d, \u201cNo type\u201d and friends always stay last; Daily notes stays first.</p>
+  ${GROUPINGS.map((g) => { const vals = groupOrderCandidates(g); return `<h4 class="mgmt-sub">${g.label}</h4>
     <ul data-group-order-list="${g.key}">${vals.map((v) => `<li draggable="true" data-group-order-item="${esc(v)}">\u2630 ${esc(v)}</li>`).join("") || "<li class='muted'>No values yet.</li>"}</ul>
-    <p><button data-group-order-save="${g.key}">Save order</button></p>`; }).join("")}</div>
-  <div class="panel"><h3>Custom object types</h3>
-  ${types.map((t) => `<p>${esc(t.name)} (${esc(t.slug)}) — ${JSON.parse(t.fields_json ?? "[]").map((f) => `${esc(f.name)} (${esc(f.kind)})`).join(", ") || "no fields"} <button data-custom-tab-toggle="${t.slug}|${t.has_tab ? 0 : 1}">${t.has_tab ? "Remove tab" : "Add tab"}</button></p>`).join("") || "<p class='muted'>No custom types yet.</p>"}
+    <p><button data-group-order-save="${g.key}" class="ghost-btn">Save order</button></p>`; }).join("")}`)}
+  ${sec("custom", "Custom types", `${types.length} types`, `
+  ${types.map((t) => `<p>${esc(t.name)} (${esc(t.slug)}) \u2014 ${JSON.parse(t.fields_json ?? "[]").map((f) => `${esc(f.name)} (${esc(f.kind)})`).join(", ") || "no fields"} <button data-custom-tab-toggle="${t.slug}|${t.has_tab ? 0 : 1}">${t.has_tab ? "Remove tab" : "Add tab"}</button></p>`).join("") || "<p class='muted'>No custom types yet.</p>"}
   <form data-create-custom-type class="form"><input name="name" placeholder="Type name (e.g. Book)" required>
     <div data-field-rows style="display:flex;gap:8px;flex-wrap:wrap"><span class="field-row"><input name="fname" placeholder="Field name"><select name="fkind"><option>Text</option><option>Long text</option><option>Date</option><option>Number</option><option>Yes-No</option></select></span></div>
-    <button type="button" data-add-field-row>Add field</button><button>Create type</button></form></div>`;
+    <button type="button" data-add-field-row>Add field</button><button>Create type</button></form>`)}
+  ${sec("backup", "Backup & export", "Database \u00b7 Markdown", `
+  <div class="mgmt-row"><div class="mgmt-rowtext"><span class="mgmt-label">Database (.db)</span><span class="muted">A full copy of the local database \u2014 the same format the app loads. Keep it somewhere safe as offline insurance.</span></div><button data-export-db class="primary-btn">Export</button></div>
+  <div class="mgmt-row"><div class="mgmt-rowtext"><span class="mgmt-label">Markdown (.zip)</span><span class="muted">Every item as a Markdown file, zipped.</span></div><button data-export-md class="primary-btn">Export</button></div>`)}`;
 }
 
 function renderCustomTab(slug) {
@@ -4339,6 +4355,15 @@ function bindExtraPopupForms(root = $("#popup-root")) {
 }
 
 function attachExtraListeners() {
+  const mainEl = $("#main");
+  if (!mainEl.dataset.mgmtBound) {
+    mainEl.dataset.mgmtBound = "1";
+    mainEl.addEventListener("toggle", (e) => {
+      const d = e.target?.closest?.("[data-mgmt-sec]");
+      if (!d) return;
+      if (d.open) mgmtOpen.add(d.dataset.mgmtSec); else mgmtOpen.delete(d.dataset.mgmtSec);
+    }, true);
+  }
   $("#main").addEventListener("click", async (e) => {
     const pageBack = e.target.closest("[data-page-back]");
     if (pageBack) { state.itemView = null; render(); return; }

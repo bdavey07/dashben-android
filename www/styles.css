@@ -517,3 +517,28 @@ body.boot-faded #main { animation: bootfade 160ms ease-out; }
 [data-rec-days] { margin-top: 6px; }
 [data-rec-days] label { margin-right: 10px; white-space: nowrap; }
 [data-rec-days-toggle] { margin-top: 6px; }
+
+/* Stamp de: Management redesign — collapsible section cards with
+   setting rows, replacing the wall of panels. */
+.mgmt-h { margin: 4px 0 12px; }
+.mgmt-sec { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; margin: 0 0 12px; overflow: hidden; }
+.mgmt-sec > summary { list-style: none; display: flex; align-items: center; gap: 10px; padding: 13px 16px; cursor: pointer; min-height: 48px; -webkit-tap-highlight-color: transparent; }
+.mgmt-sec > summary::-webkit-details-marker { display: none; }
+.mgmt-title { font-weight: 600; font-size: 15px; }
+.mgmt-state { margin-left: auto; color: var(--muted, #a89e92); font-size: 12.5px; text-align: right; }
+.mgmt-chev { color: var(--muted, #a89e92); transition: transform .15s ease; font-size: 13px; }
+.mgmt-sec[open ] .mgmt-chev { transform: rotate(90deg); }
+.mgmt-body { padding: 2px 16px 16px; border-top: 1px solid var(--line); }
+.mgmt-body .muted { line-height: 1.45; }
+.mgmt-row { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.mgmt-row:last-child { border-bottom: none; }
+.mgmt-rowtext { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.mgmt-label { font-weight: 550; }
+.mgmt-btnrow { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.mgmt-sub { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted, #a89e92); margin: 16px 0 6px; font-weight: 600; }
+.mgmt-vrow { margin: 0 0 6px; }
+.mgmt-vrow input[name=new], .mgmt-vrow input[name=value] { flex: 1; min-width: 0; }
+.theme-grid { display: flex; flex-wrap: wrap; gap: 8px; }
+.theme-grid button[disabled] { outline: 2px solid var(--primary); outline-offset: 1px; opacity: 1; }
+[data-group-order-list] { list-style: none; padding: 0; margin: 0; }
+[data-group-order-list] li, [data-tab-order-list] li { padding: 9px 10px; margin: 0 0 6px; background: rgba(127, 135, 160, .08); border: 1px solid var(--line); border-radius: 8px; cursor: grab; }
