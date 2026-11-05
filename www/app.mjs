@@ -1987,7 +1987,7 @@ function renderTasks() {
     for (const l of groups.values()) l.sort((a, b) => prioRank(a.priority) - prioRank(b.priority) || (a.due_date || "9999-12-31").localeCompare(b.due_date || "9999-12-31") || a.title.localeCompare(b.title));
     return orderedGroupKeys([...groups.keys()], "tasks.project", { last: ["No project"] }).map((k) => [k, groups.get(k)]);
   };
-  const head = `<div class="tasks-head"><div class="toggle-group"><button data-tasks-filter="open" class="toggle-btn ${filter === "open" ? "active" : ""}">Open</button><button data-tasks-filter="done" class="toggle-btn ${filter === "done" ? "active" : ""}">Done</button></div><button data-bulk-toggle class="ghost-btn">${state.bulkMode ? "Done selecting" : "Select"}</button><button data-new-task class="primary-btn">New task</button></div>`;
+  const head = `<div class="tasks-head"><div class="toggle-group"><button data-tasks-filter="open" class="toggle-btn ${filter === "open" ? "active" : ""}">Open</button><button data-tasks-filter="done" class="toggle-btn ${filter === "done" ? "active" : ""}">Done</button></div><button data-bulk-toggle class="toggle-btn${state.bulkMode ? " active" : ""}">${state.bulkMode ? "Done selecting" : "Select"}</button><button data-new-task class="primary-btn">New task</button></div>`;
   if (filter === "done") {
     const done = doneTasks();
     return `${head}${done.map(taskRow).join("") || "<p class='muted'>Nothing done yet.</p>"}`;
@@ -2275,7 +2275,7 @@ function renderInbox() {
   const sel = state.inboxSel ?? new Set();
   return `<div class="panel"><h3>Capture</h3><form data-capture class="form"><input name="title" placeholder="Title (optional)"><textarea name="body" rows="3" placeholder="Capture… a pasted link files to Reading; start with task: to make a task"></textarea><input type="file" name="photo" accept="image/*,.pdf,.txt,.md,.csv,.doc,.docx,.rtf" multiple><button class="primary-btn">Capture</button></form></div>
   ${bulk ? `<div class="panel bulk-bar"><strong>${sel.size} selected</strong> <button data-inbox-bulk-move class="primary-btn">Move to notes</button> <button data-inbox-bulk-archive class="danger-btn">Archive</button> <button data-inbox-bulk-clear class="ghost-btn">Clear</button></div>` : ""}
-  <div class="panel"><h3>Inbox (${items.length})</h3><p><button data-inbox-bulk-toggle class="ghost-btn">${bulk ? "Done selecting" : "Select"}</button></p>
+  <div class="panel"><div class="sel-head"><h3>Inbox (${items.length})</h3><button data-inbox-bulk-toggle class="toggle-btn${bulk ? " active" : ""}">${bulk ? "Done selecting" : "Select"}</button></div>
   ${items.map((i) => `<div class="row" data-inbox="${i.id}">${bulk ? `<input type="checkbox" data-inbox-sel="${i.id}"${sel.has(i.id) ? " checked" : ""}> ` : ""}<span class="row-title">${esc(i.title)}${photoInd(photoCounts, i.id)}</span><span class="muted">${esc((i.body_markdown ?? "").slice(0, 80))}</span><button data-archive-inbox="${i.id}">Archive</button></div>`).join("") || "<p class='muted'>Inbox empty.</p>"}</div>`;
 }
 
@@ -3354,6 +3354,8 @@ function attachPersistentListeners() {
       render(); saveBytes();
       return;
     }
+    const calMode = e.target.closest("[data-cal-mode]");
+    if (calMode) { calState().mode = calMode.dataset.calMode; render(); return; }
     const calNav = e.target.closest("[data-cal-nav]");
     if (calNav) {
       const v = calState();
@@ -4035,7 +4037,7 @@ function runSearchTokens(q) {
 // (?from=<first cell>&days=42) through the same Worker feed as the
 // dashboard panel; ranges are cached per grid start for 15 minutes.
 function calState() {
-  if (!state.calView) { const today = todayToronto(); state.calView = { month: today.slice(0, 7), selected: today }; }
+  if (!state.calView) { const today = todayToronto(); state.calView = { month: today.slice(0, 7), selected: today, mode: null }; }
   return state.calView;
 }
 function buildCalCells(month) {
@@ -4109,6 +4111,7 @@ function renderCalendar() {
     return `<button type="button" class="cal-cell${d.slice(0, 7) !== view.month ? " cal-other" : ""}${d === today ? " cal-today" : ""}${d === view.selected ? " cal-selected" : ""}" data-cal-day="${d}"><span class="cal-dnum">${parseInt(d.slice(8), 10)}</span>${chips}${more}</button>`;
   }).join("");
   const selList = byDay.get(view.selected) ?? [];
+  const dayMode = view.mode ?? (selList.length ? "events" : "tasks");
   const selTasks = tasksByDay.get(view.selected) ?? [];
   const selLabel = view.selected === today ? "Today" : new Date(view.selected + "T12:00:00").toLocaleDateString("en-CA", { weekday: "long", month: "long", day: "numeric" });
   return `<div class="panel cal-panel"><div class="cal-head"><button data-cal-nav="-1" class="ghost-btn" aria-label="Previous month">\u2039</button><h3>${esc(calMonthLabel(view.month))}</h3><button data-cal-nav="1" class="ghost-btn" aria-label="Next month">\u203a</button><button data-cal-today class="ghost-btn">Today</button></div>
@@ -4116,7 +4119,7 @@ function renderCalendar() {
   <div class="cal-grid">${grid}</div>
   ${range?.status === "error" ? `<p class="muted">Couldn't load the calendar. <button data-cal-retry class="ghost-btn">Retry</button></p>` : range?.status !== "ok" ? "<p class='muted'>Loading\u2026</p>" : ""}
   </div>
-  <div class="panel"><h3>${esc(selLabel)}</h3>${selList.length || selTasks.length ? selList.map((e) => `<div class="row"><span class="fam-time">${esc(famTimeLabel(e))}</span><span class="row-title">${esc(e.title)}</span>${e.location ? `<span class="muted">${esc(e.location)}</span>` : ""}</div>`).join("") + selTasks.map((t) => `<div class="row"><span class="fam-time">Task</span><span class="row-title cal-task-link" data-open="tasks:${t.id}">${esc(t.title)}</span></div>`).join("") : "<p class='muted'>Nothing scheduled.</p>"}</div>`;
+  <div class="panel"><h3>${esc(selLabel)}</h3><div class="form"><button data-cal-mode="events" class="toggle-btn ${dayMode === "events" ? "active" : ""}">Events (${selList.length})</button><button data-cal-mode="tasks" class="toggle-btn ${dayMode === "tasks" ? "active" : ""}">Tasks (${selTasks.length})</button></div>${dayMode === "events" ? (selList.length ? selList.map((e) => `<div class="row"><span class="fam-time">${esc(famTimeLabel(e))}</span><span class="row-title">${esc(e.title)}</span>${e.location ? `<span class="muted">${esc(e.location)}</span>` : ""}</div>`).join("") : "<p class='muted'>No events this day.</p>") : (selTasks.length ? selTasks.map((t) => `<div class="row"><span class="fam-time">Task</span><span class="row-title cal-task-link" data-open="tasks:${t.id}">${esc(t.title)}</span></div>`).join("") : "<p class='muted'>No tasks due this day.</p>")}</div>`;
 }
 
 // Management sections keep their open/closed state across renders
