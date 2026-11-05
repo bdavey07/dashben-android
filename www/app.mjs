@@ -241,22 +241,22 @@ function buildWidgetSnapshot() {
   const overdue = open.filter((t) => t.due_date && t.due_date < today).sort((a, b) => a.due_date < b.due_date ? -1 : 1);
   const dueToday = open.filter((t) => t.due_date === today);
   const rows = [];
-  for (const t of overdue.slice(0, 3)) rows.push({ id: t.id, kind: "overdue", text: t.title, meta: new Date(t.due_date + "T12:00:00").toLocaleDateString("en-CA", { month: "short", day: "numeric" }) });
-  for (const t of dueToday.slice(0, 6 - rows.length)) rows.push({ id: t.id, kind: "today", text: t.title, meta: t.priority || "" });
+  for (const t of overdue.slice(0, 10)) rows.push({ id: t.id, kind: "overdue", text: t.title, meta: new Date(t.due_date + "T12:00:00").toLocaleDateString("en-CA", { month: "short", day: "numeric" }) });
+  for (const t of dueToday.slice(0, 20 - rows.length)) rows.push({ id: t.id, kind: "today", text: t.title, meta: t.priority || "" });
   let family = null, familyList = [];
   try {
     const fam = famSeed();
     const nowIso = new Date().toISOString();
     const ups = (fam.events ?? []).filter((e) => e.allDay ? e.end > today : e.end > nowIso)
       .sort((a, b) => (a.allDay ? a.start + "T00:00:00" : a.start) < (b.allDay ? b.start + "T00:00:00" : b.start) ? -1 : 1)
-      .slice(0, 4);
+      .slice(0, 10);
     familyList = ups.map((e) => ({ title: e.title, when: famWhenLabel(e, today) }));
     if (familyList.length) family = { title: familyList[0].title, when: familyList[0].when };
   } catch { /* family is optional in the snapshot */ }
   let schedule = [];
   try {
     const note = dailyNoteFor(today);
-    if (note) schedule = splitSchedule(note.body_markdown ?? "").schedule.slice(0, 4).map((l) => l.trim());
+    if (note) schedule = splitSchedule(note.body_markdown ?? "").schedule.slice(0, 10).map((l) => l.trim());
   } catch { /* schedule is optional in the snapshot */ }
   let weather = "";
   if (state.weather) {
