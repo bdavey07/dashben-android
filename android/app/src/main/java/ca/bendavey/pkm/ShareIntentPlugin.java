@@ -105,6 +105,25 @@ public class ShareIntentPlugin extends Plugin {
     }
 
     @PluginMethod
+    public void getPendingDone(PluginCall call) {
+        JSObject ret = new JSObject();
+        org.json.JSONArray arr = new org.json.JSONArray();
+        try {
+            android.content.SharedPreferences prefs = getContext().getSharedPreferences("dashben", android.content.Context.MODE_PRIVATE);
+            String raw = prefs.getString("pending_done", "");
+            if (raw != null && !raw.isEmpty()) for (String id : raw.split(",")) if (!id.isEmpty()) arr.put(id);
+        } catch (Exception e) { /* none pending */ }
+        ret.put("ids", arr);
+        call.resolve(ret);
+    }
+
+    @PluginMethod
+    public void clearPendingDone(PluginCall call) {
+        try { getContext().getSharedPreferences("dashben", android.content.Context.MODE_PRIVATE).edit().remove("pending_done").apply(); } catch (Exception e) { /* ignore */ }
+        call.resolve();
+    }
+
+    @PluginMethod
     public void getSharedText(PluginCall call) {
         JSObject ret = new JSObject();
         ret.put("text", pendingText != null ? pendingText : "");

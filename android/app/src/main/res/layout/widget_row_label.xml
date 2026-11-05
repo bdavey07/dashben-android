@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TextView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/w_rlabel"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:textColor="#8d857b"
+    android:textSize="10sp"
+    android:textStyle="bold"
+    android:letterSpacing="0.12"
+    android:paddingTop="9dp"
+    android:paddingBottom="2dp" />

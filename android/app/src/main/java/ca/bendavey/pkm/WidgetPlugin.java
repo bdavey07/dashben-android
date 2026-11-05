@@ -19,7 +19,10 @@ public class WidgetPlugin extends Plugin {
     public static void poke(Context ctx) {
         AppWidgetManager mgr = AppWidgetManager.getInstance(ctx);
         int[] todayIds = mgr.getAppWidgetIds(new ComponentName(ctx, TodayWidgetProvider.class));
-        if (todayIds.length > 0) new TodayWidgetProvider().onUpdate(ctx, mgr, todayIds);
+        if (todayIds.length > 0) {
+            new TodayWidgetProvider().onUpdate(ctx, mgr, todayIds);
+            mgr.notifyAppWidgetViewDataChanged(todayIds, R.id.w_list);
+        }
         int[] capIds = mgr.getAppWidgetIds(new ComponentName(ctx, CaptureWidgetProvider.class));
         if (capIds.length > 0) new CaptureWidgetProvider().onUpdate(ctx, mgr, capIds);
     }

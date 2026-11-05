@@ -13,6 +13,7 @@ public class MainActivity extends BridgeActivity {
         super.onCreate(savedInstanceState);
         // Ben: password managers must not offer autofill anywhere in the app.
         try { getBridge().getWebView().setImportantForAutofill(android.view.View.IMPORTANT_FOR_AUTOFILL_NO); } catch (Exception e) { /* best effort */ }
+        try { getWindow().getDecorView().setImportantForAutofill(android.view.View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS); } catch (Exception e) { /* best effort */ }
         stashWidgetAction(getIntent());
     }
 

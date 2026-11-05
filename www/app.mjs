@@ -144,13 +144,30 @@ function applyNotifAction(act, id) {
   }
   buzz(); render(); saveBytes(); void scheduleReminders();
 }
+let widgetDoneDraining = false;
+// Widget checkbox completions land here: the widget records the
+// ids natively (pending_done) so the tick is visible instantly;
+// the app applies them through the real store (recurrence spawns,
+// sync logs) at boot, after syncs, and on foreground.
+async function processWidgetDone() {
+  if (!NativeShare || widgetDoneDraining || !state.booted || !state.store) return;
+  widgetDoneDraining = true;
+  try {
+    const r = await withTimeout(NativeShare.getPendingDone({}), 3000, "share.pendingDone").catch(() => null);
+    const ids = Array.isArray(r?.ids) ? r.ids : [];
+    if (!ids.length) return;
+    await withTimeout(NativeShare.clearPendingDone({}), 3000, "share.clearDone").catch(() => null);
+    for (const id of ids) applyNotifAction("done", id);
+    queueWidgetSnapshot();
+  } finally { widgetDoneDraining = false; }
+}
 function processPendingNotifActions() {
   if (!state.booted || !state.store || !pendingNotifActions.length) return;
   for (const { act, id } of pendingNotifActions.splice(0)) applyNotifAction(act, id);
 }
 async function initReminders() {
   if (!NativeNotify) return;
-  window.__dashbenAfterSync = () => { void scheduleReminders(); processPendingNotifActions(); queueWidgetSnapshot(); setTimeout(queueWidgetSnapshot, 3000); };
+  window.__dashbenAfterSync = () => { void scheduleReminders(); processPendingNotifActions(); void processWidgetDone(); queueWidgetSnapshot(); setTimeout(queueWidgetSnapshot, 3000); };
   try {
     await NativeNotify.registerActionTypes({ types: [{ id: "TASK_ACTIONS", actions: [{ id: "done", title: "Done" }, { id: "snooze", title: "Snooze 1 day" }] }] });
   } catch { /* older plugin build: plain taps still work */ }
@@ -226,13 +243,15 @@ function buildWidgetSnapshot() {
   const rows = [];
   for (const t of overdue.slice(0, 3)) rows.push({ id: t.id, kind: "overdue", text: t.title, meta: new Date(t.due_date + "T12:00:00").toLocaleDateString("en-CA", { month: "short", day: "numeric" }) });
   for (const t of dueToday.slice(0, 6 - rows.length)) rows.push({ id: t.id, kind: "today", text: t.title, meta: t.priority || "" });
-  let family = null;
+  let family = null, familyList = [];
   try {
     const fam = famSeed();
     const nowIso = new Date().toISOString();
-    const next = (fam.events ?? []).filter((e) => e.allDay ? e.end > today : e.end > nowIso)
-      .sort((a, b) => (a.allDay ? a.start + "T00:00:00" : a.start) < (b.allDay ? b.start + "T00:00:00" : b.start) ? -1 : 1)[0];
-    if (next) family = { title: next.title, when: famWhenLabel(next, today) };
+    const ups = (fam.events ?? []).filter((e) => e.allDay ? e.end > today : e.end > nowIso)
+      .sort((a, b) => (a.allDay ? a.start + "T00:00:00" : a.start) < (b.allDay ? b.start + "T00:00:00" : b.start) ? -1 : 1)
+      .slice(0, 4);
+    familyList = ups.map((e) => ({ title: e.title, when: famWhenLabel(e, today) }));
+    if (familyList.length) family = { title: familyList[0].title, when: familyList[0].when };
   } catch { /* family is optional in the snapshot */ }
   let schedule = [];
   try {
@@ -256,7 +275,7 @@ function buildWidgetSnapshot() {
       psum: d.precipitation_sum?.[0] != null ? `${Math.round(d.precipitation_sum[0] * 10) / 10} mm` : "\u2014",
     };
   }
-  return { at: Date.now(), overdueCount: overdue.length, todayCount: dueToday.length, rows, family, weather, schedule, wx };
+  return { at: Date.now(), overdueCount: overdue.length, todayCount: dueToday.length, rows, family, familyList, weather, schedule, wx };
 }
 let lastSnapAttempt = 0;
 function writeWidgetSnapshotThrottled() {
@@ -2752,15 +2771,21 @@ function bindPopupForms(root = $("#popup-root")) {
 }
 
 function attachPersistentListeners() {
-  // Password managers: keep autofill out of every field (stamp cg).
-  document.addEventListener("focusin", (e) => {
-    const el = e.target;
-    if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA")) {
-      el.setAttribute("autocomplete", "off");
-      el.setAttribute("data-1p-ignore", "true");
-      el.setAttribute("data-lpignore", "true");
-    }
-  });
+  // Password managers: keep autofill out of every field. Fields are
+  // stamped the moment they enter the DOM (an observer), not just on
+  // focus — by focus time the autofill session has already started
+  // (stamp cp; the cg focus-only version was not enough).
+  const stampNoAutofill = (el) => { el.setAttribute("autocomplete", "off"); el.setAttribute("data-1p-ignore", "true"); el.setAttribute("data-lpignore", "true"); };
+  const stampTree = (root) => {
+    if (!root || root.nodeType !== 1) return;
+    if (root.tagName === "INPUT" || root.tagName === "TEXTAREA" || root.tagName === "FORM") stampNoAutofill(root);
+    root.querySelectorAll?.("input, textarea, form").forEach(stampNoAutofill);
+  };
+  stampTree(document.body ?? document);
+  if (typeof MutationObserver === "function") {
+    new MutationObserver((muts) => { for (const m of muts) for (const n of m.addedNodes) stampTree(n); }).observe(document.documentElement, { childList: true, subtree: true });
+  }
+  document.addEventListener("focusin", (e) => { const el = e.target; if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA")) stampNoAutofill(el); });
   // Sync on return (stamp bz): coming back to the app/tab pulls
   // anything that changed elsewhere instead of sitting stale until
   // the next edit or manual sync. Throttled; doSync self-guards.
@@ -3191,6 +3216,7 @@ async function boot() {
     if (document.hidden) { shellHiddenAt = Date.now(); return; }
     captureSharedText();
     void checkWidgetAction();
+    void processWidgetDone();
     queueWidgetSnapshot();
     if (shellHiddenAt && Date.now() - shellHiddenAt > 60000) maybeLockApp();
     shellHiddenAt = 0;
@@ -3217,6 +3243,7 @@ async function boot() {
   if (!fresh) await doSync();
   void initReminders();
   processPendingNotifActions();
+  void processWidgetDone();
   maybeLockApp();
   queueWidgetSnapshot();
   void checkWidgetAction();
@@ -3678,7 +3705,7 @@ function renderManagement() {
   return `<div class="panel"><h3>Sync</h3><p class="muted">Your data syncs with pkm.ben-cloud.net. Saving a token starts a sync — delete any test items first, since later syncs upload local changes.</p>
   <p class="muted">Local database: ${state.db ? Math.round(state.db.exportBytes().length / 1024) : 0} KB${state.bootMs ? ` · started in ${state.bootMs} ms` : ""}</p>
   <div class="token-card"><label for="sync-token-input">Sync token</label>
-  <input id="sync-token-input" type="password" autocomplete="off" placeholder="SYNC_TOKEN">
+  <input id="sync-token-input" type="text" style="-webkit-text-security: disc;" autocomplete="off" data-1p-ignore="true" data-lpignore="true" placeholder="SYNC_TOKEN">
   <button data-token-save class="ghost-btn">Save token</button>
   <button data-full-sync class="ghost-btn">Re-download everything</button>
   <span class="muted">${state.token ? "Token saved" : "No token set"}</span></div>
