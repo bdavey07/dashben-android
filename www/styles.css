@@ -176,7 +176,7 @@ footer { padding: 12px 0; font-size: 13px; }
      content showed through. Pull the stuck position down by exactly
      that padding and cancel it in flow with the negative margin. */
   .popup-actions { position: sticky; bottom: calc(-20px - env(safe-area-inset-bottom)); background: var(--panel); padding-top: 12px; padding-bottom: calc(10px + env(safe-area-inset-bottom)); margin-bottom: calc(-20px - env(safe-area-inset-bottom)); }
-  .panel.weather-panel, .panel:has([data-dash-search]) { display: none; }
+  .panel.weather-panel { display: none; }
 }
 @media (max-width: 700px) { .dash-row { grid-template-columns: 1fr; } }
 .popup-actions { margin-top: 24px; display: flex; gap: 8px; flex-wrap: wrap; }
