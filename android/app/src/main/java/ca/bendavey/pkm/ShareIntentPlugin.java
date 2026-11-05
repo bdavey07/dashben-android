@@ -23,16 +23,31 @@ import java.io.InputStream;
 public class ShareIntentPlugin extends Plugin {
     private String pendingText = null;
     private String pendingImage = null;
+    private String pendingWidgetAction = null;
+    private String pendingWidgetTask = null;
 
     @Override
     public void load() {
         captureIntent(getActivity().getIntent());
+        captureWidgetIntent(getActivity().getIntent());
     }
 
     @Override
     protected void handleOnNewIntent(Intent intent) {
         super.handleOnNewIntent(intent);
         captureIntent(intent);
+        captureWidgetIntent(intent);
+    }
+
+    // Widget taps (M6) arrive as MainActivity intents carrying
+    // dashben_action / dashben_task extras; held until the web
+    // client collects them exactly once.
+    private void captureWidgetIntent(Intent intent) {
+        if (intent == null) return;
+        String act = intent.getStringExtra("dashben_action");
+        if (act == null || act.isEmpty()) return;
+        pendingWidgetAction = act;
+        pendingWidgetTask = intent.getStringExtra("dashben_task");
     }
 
     private void captureIntent(Intent intent) {
@@ -65,6 +80,16 @@ public class ShareIntentPlugin extends Plugin {
         } catch (Exception e) {
             // Share capture is best-effort; a failed copy drops the share.
         }
+    }
+
+    @PluginMethod
+    public void getWidgetAction(PluginCall call) {
+        JSObject ret = new JSObject();
+        ret.put("action", pendingWidgetAction != null ? pendingWidgetAction : "");
+        ret.put("taskId", pendingWidgetTask != null ? pendingWidgetTask : "");
+        pendingWidgetAction = null;
+        pendingWidgetTask = null;
+        call.resolve(ret);
     }
 
     @PluginMethod

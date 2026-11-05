@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/w_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="horizontal"
+    android:background="@drawable/widget_bg"
+    android:padding="8dp">
+
+    <TextView
+        android:id="@+id/w_cap_capture"
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1"
+        android:text="＋ Capture"
+        android:textColor="#ffffff"
+        android:textSize="13sp"
+        android:gravity="center"
+        android:background="@drawable/widget_btn_bg"
+        android:layout_marginEnd="6dp" />
+
+    <TextView
+        android:id="@+id/w_cap_task"
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1"
+        android:text="✓ New task"
+        android:textColor="#ffffff"
+        android:textSize="13sp"
+        android:gravity="center"
+        android:background="@drawable/widget_btn_bg"
+        android:layout_marginEnd="6dp" />
+
+    <TextView
+        android:id="@+id/w_cap_note"
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1"
+        android:text="✎ Quick note"
+        android:textColor="#ffffff"
+        android:textSize="13sp"
+        android:gravity="center"
+        android:background="@drawable/widget_btn_bg" />
+</LinearLayout>

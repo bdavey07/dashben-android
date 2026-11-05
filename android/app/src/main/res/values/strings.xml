@@ -4,4 +4,6 @@
     <string name="title_activity_main">DashBen</string>
     <string name="package_name">ca.bendavey.pkm</string>
     <string name="custom_url_scheme">ca.bendavey.pkm</string>
+    <string name="widget_today_desc">DashBen: overdue and due-today tasks, next family event, weather</string>
+    <string name="widget_capture_desc">DashBen shortcuts: capture, new task, quick note</string>
 </resources>

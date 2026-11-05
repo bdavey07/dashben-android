@@ -127,7 +127,7 @@ function processPendingNotifActions() {
 }
 async function initReminders() {
   if (!NativeNotify) return;
-  window.__dashbenAfterSync = () => { void scheduleReminders(); processPendingNotifActions(); };
+  window.__dashbenAfterSync = () => { void scheduleReminders(); processPendingNotifActions(); queueWidgetSnapshot(); setTimeout(queueWidgetSnapshot, 3000); };
   try {
     await NativeNotify.registerActionTypes({ types: [{ id: "TASK_ACTIONS", actions: [{ id: "done", title: "Done" }, { id: "snooze", title: "Snooze 1 day" }] }] });
   } catch { /* older plugin build: plain taps still work */ }
@@ -180,6 +180,74 @@ function maybeLockApp() {
   void tryUnlock(el);
 }
 let shellHiddenAt = 0;
+
+// --- Home-screen widgets (M6, stamp 2026-11-04cb, shell only) ---
+// The web client composes a small JSON snapshot after every sync
+// and writes it to widget.json in the app files dir; the native
+// Today widget renders it and asks for a redraw via WidgetBridge.
+// Read-only by design \u2014 widget taps open the app (task taps land
+// on the task popup through the ShareIntent widget channel).
+const NativeWidget = safePlugin("WidgetBridge");
+let lastWidgetJson = "", widgetSnapTimer = null;
+function famWhenLabel(e, today) {
+  const day = e.allDay ? e.start : torontoYmdOf(e.start);
+  const rel = day === today ? "Today" : day === ymdAdd(today, 1) ? "Tomorrow" : new Date(day + "T12:00:00").toLocaleDateString("en-CA", { weekday: "short" });
+  if (e.allDay) return rel;
+  return rel + " " + new Date(e.start).toLocaleTimeString("en-CA", { hour: "numeric", minute: "2-digit" });
+}
+function buildWidgetSnapshot() {
+  const today = todayToronto();
+  const open = openTasks();
+  const overdue = open.filter((t) => t.due_date && t.due_date < today).sort((a, b) => a.due_date < b.due_date ? -1 : 1);
+  const dueToday = open.filter((t) => t.due_date === today);
+  const rows = [];
+  for (const t of overdue.slice(0, 3)) rows.push({ id: t.id, kind: "overdue", text: t.title, meta: new Date(t.due_date + "T12:00:00").toLocaleDateString("en-CA", { month: "short", day: "numeric" }) });
+  for (const t of dueToday.slice(0, 6 - rows.length)) rows.push({ id: t.id, kind: "today", text: t.title, meta: t.priority || "" });
+  let family = null;
+  try {
+    const fam = famSeed();
+    const nowIso = new Date().toISOString();
+    const next = (fam.events ?? []).filter((e) => e.allDay ? e.end > today : e.end > nowIso)
+      .sort((a, b) => (a.allDay ? a.start + "T00:00:00" : a.start) < (b.allDay ? b.start + "T00:00:00" : b.start) ? -1 : 1)[0];
+    if (next) family = { title: next.title, when: famWhenLabel(next, today) };
+  } catch { /* family is optional in the snapshot */ }
+  let weather = "";
+  if (state.weather) {
+    const days = state.weather.daily;
+    const { icon, condition } = weatherIcon(days.weathercode?.[0] ?? -1);
+    weather = `${icon} ${Math.round(days.temperature_2m_max?.[0] ?? 0)}\u00B0 / ${Math.round(days.temperature_2m_min?.[0] ?? 0)}\u00B0 \u00B7 ${condition} \u00B7 ${Math.round(state.weather.current.temperature_2m)}\u00B0 now \u00B7 Mitchell`;
+  }
+  return { at: Date.now(), overdueCount: overdue.length, todayCount: dueToday.length, rows, family, weather };
+}
+async function writeWidgetSnapshot() {
+  if (!NativeFS) return;
+  try {
+    const snap = buildWidgetSnapshot();
+    const { at, ...rest } = snap;
+    const restJson = JSON.stringify(rest);
+    if (restJson === lastWidgetJson) return;
+    lastWidgetJson = restJson;
+    await withTimeout(NativeFS.writeFile({ path: "widget.json", data: bytesToB64(new TextEncoder().encode(JSON.stringify(snap))), directory: "DATA" }), 5000, "fs.widget");
+    if (NativeWidget) await withTimeout(NativeWidget.refresh({}), 5000, "widget.refresh").catch(() => null);
+  } catch { /* widgets are best-effort */ }
+}
+function queueWidgetSnapshot() {
+  if (widgetSnapTimer) clearTimeout(widgetSnapTimer);
+  widgetSnapTimer = setTimeout(() => { widgetSnapTimer = null; void writeWidgetSnapshot(); }, 600);
+}
+async function checkWidgetAction() {
+  if (!NativeShare) return;
+  try {
+    const r = await withTimeout(NativeShare.getWidgetAction({}), 3000, "share.widget");
+    const act = r?.action;
+    if (!act) return;
+    if (act === "task-open" && r.taskId && state.store?.getRow("tasks", r.taskId)) {
+      state.itemView = null; state.tab = "tasks"; saveTab(); render(); openTaskPopup(r.taskId);
+    } else if (act === "capture" || act === "task" || act === "note") {
+      document.querySelector(`[data-fab-menu="${act}"]`)?.click();
+    }
+  } catch { /* widget actions are best-effort */ }
+}
 
 // Phone slimming (stamp au): the footer sync status stays hidden
 // unless the outbox or conflicts actually need attention.
@@ -3033,6 +3101,8 @@ async function boot() {
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) { shellHiddenAt = Date.now(); return; }
     captureSharedText();
+    void checkWidgetAction();
+    queueWidgetSnapshot();
     if (shellHiddenAt && Date.now() - shellHiddenAt > 60000) maybeLockApp();
     shellHiddenAt = 0;
   });
@@ -3059,6 +3129,8 @@ async function boot() {
   void initReminders();
   processPendingNotifActions();
   maybeLockApp();
+  queueWidgetSnapshot();
+  void checkWidgetAction();
 }
 
 boot().catch((e) => {
@@ -3249,6 +3321,7 @@ async function fetchWeather() {
     state.weather = await res.json();
     state.weatherStale = null;
     wxCacheSave(state.weather);
+    queueWidgetSnapshot(); // shell: fresh weather feeds the widget snapshot
   } catch { /* keep any cached copy on screen */ }
   state.weatherFetching = false;
   if (state.tab === "dashboard" || state.tab === "daily") render();
