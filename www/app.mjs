@@ -621,7 +621,7 @@ function statusLine() {
 
 // --- Queries (local only) ---
 function openTasks() {
-  return state.db.prepare("SELECT * FROM tasks WHERE archived=0 AND done=0 ORDER BY (due_date IS NULL), due_date, title").all();
+  return state.db.prepare("SELECT * FROM tasks WHERE archived=0 AND done=0 ORDER BY (due_date IS NULL), due_date, (created_at IS NULL), created_at").all(); // stamp cy: within a due date, oldest-added first (was title/alphabetical) — new tasks land at the bottom of Dashboard + Daily lists
 }
 function doneTasks() {
   return state.db.prepare("SELECT * FROM tasks WHERE archived=0 AND done=1 ORDER BY updated_at DESC LIMIT 50").all();
@@ -1539,13 +1539,50 @@ const SUB_CHECKLIST_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="current
 const SUB_LINK_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>`;
 
 // --- Idea batch 2 helpers (stamps 2026-11-04w-ae) ---
+// Tick grace period (stamp cx): checking a task off shows it done for
+// a few seconds before the completion actually lands; tapping its
+// checkbox again inside the window undoes it. Mirrors the widget's
+// linger so the gesture means the same thing in both places.
+const TICK_GRACE_MS = 4000;
+const justDone = new Map();
+function beginTickGrace(id) {
+  if (justDone.has(id)) return;
+  justDone.set(id, setTimeout(() => {
+    justDone.delete(id);
+    const r = state.store?.getRow("tasks", id);
+    if (r && !r.done) { state.store.completeTask(id, todayToronto()); render(); saveBytes(); }
+  }, TICK_GRACE_MS));
+}
+function cancelTickGrace(id) {
+  if (!justDone.has(id)) return false;
+  clearTimeout(justDone.get(id));
+  justDone.delete(id);
+  return true;
+}
+
+// Project picker for the quick-add forms (stamp cx): the task-project
+// vocabulary, with General always present and selected by default.
+function quickProjectSelect() {
+  const vals = (() => { try { return vocabValues("tasks", "project"); } catch { return []; } })();
+  const opts = [...new Set(["General", ...vals])];
+  return `<select name="project" aria-label="Project">${opts.map((v) => `<option value="${esc(v)}"${v === "General" ? " selected" : ""}>${esc(v)}</option>`).join("")}</select>`;
+}
+
 // Smart quick-add (w): pull a due date and a priority out of a
 // quick-task title. "Pay rent Fri P1" -> due Friday, P1, "Pay rent".
-function parseQuickTask(raw) {
-  let title = ` ${raw.trim()} `;
-  let priority = null;
-  const pm = /\bP([1-3])\b/i.exec(title);
-  if (pm) { priority = `P${pm[1]}`; title = title.replace(pm[0], " "); }
+// Stamp cz: the rich parser also reports WHERE each match sits in the
+// raw text (for inline highlighting) and honours a suppression set —
+// a suppressed kind is neither highlighted nor applied, and its text
+// stays in the title (Ben: cancel "this friday" and the task is added
+// with that title, due today by the default rule).
+function parseQuickTaskRich(raw, suppress = new Set()) {
+  const src = String(raw ?? "");
+  let priority = null, due = null;
+  const marks = [];
+  if (!suppress.has("priority")) {
+    const pm = /\bP([1-3])\b/i.exec(src);
+    if (pm) { priority = `P${pm[1]}`; marks.push({ start: pm.index, len: pm[0].length, kind: "priority" }); }
+  }
   const today = todayToronto();
   const base = new Date(today + "T12:00:00");
   const fmt = (d) => d.toISOString().slice(0, 10);
@@ -1569,13 +1606,72 @@ function parseQuickTask(raw) {
     [/\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})\b/i, (m) => monthDay(m[1], m[2])],
     [/\b(\d{1,2})\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\b/i, (m) => monthDay(m[2], m[1])],
   ];
-  let due = null;
-  for (const [re, fn] of patterns) {
-    const m = re.exec(title);
-    if (m) { due = fn(m); title = title.replace(m[0], " "); break; }
+  if (!suppress.has("due")) {
+    for (const [re, fn] of patterns) {
+      const m = re.exec(src);
+      if (m) { due = fn(m); marks.push({ start: m.index, len: m[0].length, kind: "due" }); break; }
+    }
   }
+  let title = src;
+  for (const mk of [...marks].sort((a, b) => b.start - a.start)) title = title.slice(0, mk.start) + " " + title.slice(mk.start + mk.len);
   title = title.replace(/\s+/g, " ").trim();
-  return { title: title || raw.trim(), due, priority };
+  return { title: title || src.trim(), due, priority, marks };
+}
+
+function parseQuickTask(raw) {
+  const r = parseQuickTaskRich(raw);
+  return { title: r.title, due: r.due, priority: r.priority };
+}
+
+function highlightParsed(text, marks) {
+  if (!marks || !marks.length) return esc(text) + " ";
+  let out = "", pos = 0;
+  for (const mk of [...marks].sort((a, b) => a.start - b.start)) {
+    if (mk.start < pos) continue;
+    out += esc(text.slice(pos, mk.start)) + `<mark>${esc(text.slice(mk.start, mk.start + mk.len))}</mark>`;
+    pos = mk.start + mk.len;
+  }
+  return out + esc(text.slice(pos)) + " ";
+}
+
+function dueChipLabel(ymd) {
+  return new Date(ymd + "T12:00:00").toLocaleDateString("en-CA", { weekday: "short", month: "short", day: "numeric" });
+}
+
+// Wire a quick-add form's title field for live parse highlighting +
+// cancel chips (stamp cz). The backdrop mirrors the input's text with
+// the parsed spans marked; chips under the field carry the x buttons
+// that suppress a parse for this entry.
+function wireSmartInput(form) {
+  if (!form || form._smartWired) return;
+  const input = form.querySelector(".hl-input");
+  const back = form.querySelector(".hl-back");
+  const chips = form.querySelector(".parse-chips");
+  if (!input || !back) return;
+  form._smartWired = true;
+  if (!form._suppress) form._suppress = new Set();
+  const refresh = () => {
+    const r = parseQuickTaskRich(input.value, form._suppress);
+    back.innerHTML = highlightParsed(input.value, r.marks);
+    back.style.transform = `translateX(${-input.scrollLeft}px)`;
+    if (chips) {
+      const bits = [];
+      if (r.due) bits.push(`<span class="pchip">\u{1F4C5} ${esc(dueChipLabel(r.due))}<button type="button" data-chip-x="due" aria-label="Cancel scheduling">\u00d7</button></span>`);
+      if (r.priority) bits.push(`<span class="pchip">\u2691 ${esc(r.priority)}<button type="button" data-chip-x="priority" aria-label="Cancel priority">\u00d7</button></span>`);
+      chips.innerHTML = bits.join("");
+      chips.style.display = bits.length ? "flex" : "none";
+    }
+  };
+  input.addEventListener("input", refresh);
+  input.addEventListener("scroll", () => { back.style.transform = `translateX(${-input.scrollLeft}px)`; });
+  chips?.addEventListener("click", (e) => {
+    const b = e.target.closest("[data-chip-x]");
+    if (!b) return;
+    form._suppress.add(b.dataset.chipX);
+    refresh();
+    input.focus();
+  });
+  refresh();
 }
 
 // Day progress (y): done-today vs everything due up to today.
@@ -1745,8 +1841,8 @@ function taskRow(t, opts = {}) {
   const subDone = subs.filter((s) => s.done).length;
   const linkedCount = linkedTitles("tasks", t.id, "sub_tasks", "tasks").length;
   const subInd = `${subs.length ? `<span class="sub-ind" title="Checklist subtasks: ${subDone} of ${subs.length} done">${SUB_CHECKLIST_ICON}${subDone}/${subs.length}</span>` : ""}${linkedCount ? `<span class="sub-ind" title="${linkedCount} linked subtask${linkedCount === 1 ? "" : "s"}">${SUB_LINK_ICON}${linkedCount}</span>` : ""}`;
-  return `<div class="row" data-task="${t.id}">
-    ${opts.bulk ? `<input type="checkbox" data-bulk-select="${t.id}" ${state.bulkSelected && state.bulkSelected.has(t.id) ? "checked" : ""}>` : `<input type="checkbox" data-tick="${t.id}" ${t.done ? "checked" : ""}>`}
+  return `<div class="row${justDone.has(t.id) ? " row-justdone" : ""}" data-task="${t.id}">
+    ${opts.bulk ? `<input type="checkbox" data-bulk-select="${t.id}" ${state.bulkSelected && state.bulkSelected.has(t.id) ? "checked" : ""}>` : `<input type="checkbox" data-tick="${t.id}" ${t.done || justDone.has(t.id) ? "checked" : ""}>`}
     <span class="row-title">${esc(t.title)}</span>
     ${subInd}${rec ? `<span class="recur" title="Recurring task">↻</span>` : ""}
     ${t.priority ? `<span class="prio">${esc(t.priority)}</span>` : ""}
@@ -2621,14 +2717,15 @@ function bindPopupForms(root = $("#popup-root")) {
     }
     closePopup(); render(); saveBytes();
   }));
-  $$("[data-fab-task]", root).forEach((f) => f.addEventListener("submit", (e) => {
+  $$("[data-fab-task]", root).forEach((f) => { wireSmartInput(f); f.addEventListener("submit", (e) => {
     e.preventDefault();
-    const title = (new FormData(f).get("title") || "").trim();
+    const d = new FormData(f);
+    const title = (d.get("title") || "").trim();
     if (!title) return;
-    const parsed = parseQuickTask(title);
-    state.store.createTask({ title: parsed.title, due: parsed.due ?? todayToronto(), priority: parsed.priority, project: "General" });
+    const parsed = parseQuickTaskRich(title, f._suppress);
+    state.store.createTask({ title: parsed.title, due: parsed.due ?? todayToronto(), priority: parsed.priority, project: d.get("project") || "General" });
     closePopup(); render(); saveBytes(); showToast("Task added");
-  }));
+  }); });
   $$("[data-fab-note]", root).forEach((f) => f.addEventListener("submit", async (e) => {
     e.preventDefault();
     const text = (new FormData(f).get("jot") || "").trim();
@@ -2949,7 +3046,7 @@ function attachPersistentListeners() {
         const t = state.store.getRow("tasks", id);
         if (t) {
           if (swAct.dataset.swipeAct === "done") {
-            if (!t.done) state.store.completeTask(id, todayToronto());
+            if (!t.done) beginTickGrace(id);
             else state.store.updateProps("tasks", id, { done: 0 });
           } else if (!t.done) {
             const today = todayToronto();
@@ -2965,10 +3062,10 @@ function attachPersistentListeners() {
     const tick = e.target.closest("[data-tick]");
     if (tick) {
       const id = tick.dataset.tick;
+      if (cancelTickGrace(id)) { buzz(); render(); return; }
       const row = state.store.getRow("tasks", id);
-      if (!row.done) state.store.completeTask(id, todayToronto());
-      else state.store.updateProps("tasks", id, { done: 0 });
-      buzz(); render(); saveBytes();
+      if (!row.done) { beginTickGrace(id); buzz(); render(); }
+      else { state.store.updateProps("tasks", id, { done: 0 }); buzz(); render(); saveBytes(); }
       return;
     }
     const readingDone = e.target.closest("[data-reading-done]");
@@ -3230,7 +3327,7 @@ async function boot() {
     if (!act) { if (!e.target.closest?.("#fab-menu") && !e.target.closest?.("#fab-capture")) hideFabMenu(); return; }
     hideFabMenu();
     if (act === "capture") openPopup("Capture", `<form data-fab-capture class="form"><input name="title" placeholder="Title (optional)"><textarea name="body" rows="4" placeholder="Capture…"></textarea><input type="file" name="photo" accept="image/*,.pdf,.txt,.md,.csv,.doc,.docx,.rtf" multiple><p class="popup-actions"><button type="submit" class="primary-btn">Capture</button><button type="button" data-close-popup class="ghost-btn">Cancel</button></p></form>`);
-    else if (act === "task") { openPopup("Quick add task", `<form data-fab-task class="form"><input name="title" placeholder="New task — try 'Fri P1'" required style="flex:1"><p class="popup-actions"><button type="submit" class="primary-btn">Add task</button><button type="button" data-close-popup class="ghost-btn">Cancel</button></p></form>`); setTimeout(() => $("#popup-root input[name=title]")?.focus(), 40); }
+    else if (act === "task") { openPopup("Quick add task", `<form data-fab-task class="form"><span class="hl-wrap"><span class="hl-back"></span><input class="hl-input" name="title" placeholder="New task — try 'Fri P1'" required></span>${quickProjectSelect()}<span class="parse-chips"></span><p class="popup-actions"><button type="submit" class="primary-btn">Add task</button><button type="button" data-close-popup class="ghost-btn">Cancel</button></p></form>`); setTimeout(() => $("#popup-root input[name=title]")?.focus(), 40); }
     else if (act === "schedule") { openPopup("Add to schedule", `<form data-fab-schedule class="form"><input type="time" name="time" required><input name="text" placeholder="e.g. Meeting with…" required style="flex:1"><p class="popup-actions"><button type="submit" class="primary-btn">Add to schedule</button><button type="button" data-close-popup class="ghost-btn">Cancel</button></p></form>`); setTimeout(() => $("#popup-root input[name=text]")?.focus(), 40); }
     else if (act === "note") { openPopup("Quick note", `<form data-fab-note class="form"><textarea name="jot" rows="3" placeholder="Jot a note for today…" required style="flex:1"></textarea><p class="popup-actions"><button type="submit" class="primary-btn">Jot it down</button><button type="button" data-close-popup class="ghost-btn">Cancel</button></p></form>`); setTimeout(() => $("#popup-root textarea[name=jot]")?.focus(), 40); }
   });
@@ -3570,14 +3667,14 @@ function dailyWorkspacePanel() {
   if (note) {
     const { schedule, notes } = splitSchedule(note.body_markdown ?? "");
     inner = `<div class="panel"><h3>Todos</h3>${overdue.length ? `<button data-carry-all class="ghost-btn">All overdue → today</button> ` : ""}${dueToday.length ? `<button data-push-all class="ghost-btn">All today → tomorrow</button> ` : ""}${overdue.length ? `<h4>Overdue (${overdue.length})</h4>${overdue.map((t) => taskRow(t, { carry: true, snooze: true })).join("")}<h4>Due today</h4>` : ""}${dueToday.length ? dueToday.map((t) => taskRow(t, { snooze: true })).join("") : "<p class='muted'>Nothing due today.</p>"}</div>
-    <form data-dash-task class="form"><input name="title" placeholder="New task" required style="flex:1"><button class="primary-btn">+ New task</button></form>
+    <form data-dash-task class="form"><span class="hl-wrap"><span class="hl-back"></span><input class="hl-input" name="title" placeholder="New task" required></span>${quickProjectSelect()}<button class="primary-btn">+ New task</button><span class="parse-chips"></span></form>
     <h4>Schedule</h4>${schedule.length ? schedule.map((l) => `<p>${esc(l)}</p>`).join("") : "<p class='muted'>No schedule yet.</p>"}
     <h4>Notes</h4>${notes.join("\n").trim() ? notes.map((l) => `<p>${esc(l)}</p>`).join("") : "<p class='muted'>No notes yet.</p>"}
     <form data-daily-jot="${today}" class="form"><input name="jot" placeholder="Jot a note…" style="flex:1"><button>Add note</button></form>
     <p><button data-open="notes:${note.id}">Open full note</button></p>`;
   } else {
     inner = `<div class="panel"><h3>Todos</h3>${overdue.length ? `<button data-carry-all class="ghost-btn">All overdue → today</button> ` : ""}${dueToday.length ? `<button data-push-all class="ghost-btn">All today → tomorrow</button> ` : ""}${overdue.length ? `<h4>Overdue (${overdue.length})</h4>${overdue.map((t) => taskRow(t, { carry: true, snooze: true })).join("")}<h4>Due today</h4>` : ""}${dueToday.length ? dueToday.map((t) => taskRow(t, { snooze: true })).join("") : "<p class='muted'>Nothing due today.</p>"}</div>
-    <form data-dash-task class="form"><input name="title" placeholder="New task" required style="flex:1"><button class="primary-btn">+ New task</button></form>
+    <form data-dash-task class="form"><span class="hl-wrap"><span class="hl-back"></span><input class="hl-input" name="title" placeholder="New task" required></span>${quickProjectSelect()}<button class="primary-btn">+ New task</button><span class="parse-chips"></span></form>
     <p class="muted">No daily note for today yet.</p><p><button data-create-daily="${today}" class="primary-btn">Create today's daily note</button></p>`;
   }
   return `<div class="panel"><h3>Daily Note</h3><p><button data-daily-tab>Open Daily tab →</button></p>${dayProgressHtml()}${inner}</div>`;
@@ -3897,20 +3994,20 @@ function bindExtraForms() {
     try { await appendDailyLine(f.dataset.dailySchedule, `${time} — ${text}`); } catch (err) { alert(err.message); return; }
     render(); saveBytes();
   }));
-  $$("[data-dash-task]", main).forEach((f) => f.addEventListener("submit", async (e) => {
+  $$("[data-dash-task]", main).forEach((f) => { wireSmartInput(f); f.addEventListener("submit", async (e) => {
     e.preventDefault();
     const title = (new FormData(f).get("title") || "").trim();
     if (!title) return;
     // Smart quick-add (stamp 2026-11-04w): a due date / priority in
     // the text ("Pay rent Fri P1") is parsed out of the title.
-    const parsed = parseQuickTask(title);
-    state.store.createTask({ title: parsed.title, due: parsed.due ?? todayToronto(), priority: parsed.priority, project: "General" });
+    const parsed = parseQuickTaskRich(title, f._suppress);
+    state.store.createTask({ title: parsed.title, due: parsed.due ?? todayToronto(), priority: parsed.priority, project: (new FormData(f).get("project") || "General") });
     render(); saveBytes();
     // Rapid entry (stamp 2026-11-04l): render() rebuilt the dashboard,
     // so put the cursor straight back in the new quick-add box — Enter,
     // type, Enter chains without touching the mouse.
     document.querySelector("[data-dash-task] input[name=title]")?.focus();
-  }));
+  }); });
   $$("[data-daily-nav]", main).forEach((f) => f.addEventListener("submit", (e) => e.preventDefault()));
   $$("[data-fv-add]", main).forEach((f) => f.addEventListener("submit", async (e) => {
     e.preventDefault();
