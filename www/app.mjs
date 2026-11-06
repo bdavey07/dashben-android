@@ -345,7 +345,7 @@ const state = {
   db: null, engine: null, store: null, transport: null,
   base: "https://pkm.ben-cloud.net", token: "",
   tab: "dashboard", dailyDate: null, weather: null, weatherTried: false, weatherDay: null, itemView: null,
-  lastSync: null, lastError: null, booted: false,
+  lastSync: null, lastError: null, persistError: null, lastReport: null, booted: false,
 };
 
 // Managed-field vocabularies (server defaults; field_values rows
@@ -427,21 +427,45 @@ function saveBytes(flush = false) {
   });
   return saveChain;
 }
+// Honest persistence (reliability batch): a failed write is a
+// visible state, not a silent no-op. The native file is the durable
+// store when the Filesystem plugin is present (loadBytes reads it
+// first), so its result is authoritative; IndexedDB alone counts as
+// saved only when there is no native store. Returns true only when
+// the authoritative write landed.
+function paintSyncStatus() {
+  try { const el = $("#sync-status"); if (el) el.textContent = statusLine(); } catch { /* no DOM yet */ }
+}
 async function persistBytesNow() {
-  if (!state.db) return;
+  if (!state.db) return true;
   const bytes = state.db.exportBytes();
+  let fileOk = !NativeFS;
+  let firstErr = null;
   if (NativeFS) {
     try {
       await withTimeout(NativeFS.writeFile({ path: DB_FILE, data: bytesToB64(bytes), directory: "DATA" }), 5000, "fs.writeFile");
-    } catch { /* file persistence is best-effort */ }
+      fileOk = true;
+    } catch (e) { firstErr = e; }
   }
+  let idbOk = false;
   try {
     const db = await idb();
-    await new Promise((resolve) => {
+    await new Promise((resolve, reject) => {
       const tx = db.transaction("files", "readwrite").objectStore("files").put(bytes, "db");
-      tx.oncomplete = resolve; tx.onerror = resolve;
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error ?? new Error("IndexedDB write failed"));
+      tx.onabort = () => reject(tx.error ?? new Error("IndexedDB write aborted"));
     });
-  } catch { /* persistence is best-effort */ }
+    idbOk = true;
+  } catch (e) { firstErr = firstErr ?? e; }
+  const ok = NativeFS ? fileOk : idbOk;
+  if (ok) {
+    if (state.persistError) { state.persistError = null; paintSyncStatus(); }
+  } else {
+    state.persistError = String(firstErr?.message ?? firstErr ?? "write failed");
+    paintSyncStatus();
+  }
+  return ok;
 }
 
 // --- Settings ---
@@ -495,12 +519,23 @@ async function doSync() {
   try {
     if (!state.booted) {
       await state.engine.firstSync(state.transport);
+      state.booted = true;
+      state.lastSync = new Date().toLocaleTimeString();
+      state.lastError = null;
     } else {
-      await state.engine.sync(state.transport);
+      // Honest status (reliability batch): the report is consumed,
+      // not discarded. A cycle with per-change errors or conflicts
+      // does NOT stamp a clean last-sync — the leftover outbox /
+      // conflict counts in the status line say what still needs
+      // attention, in plain language.
+      const report = await state.engine.sync(state.transport);
+      state.booted = true;
+      state.lastReport = report;
+      if ((report.errors?.length ?? 0) === 0 && (report.conflicts?.length ?? 0) === 0) {
+        state.lastSync = new Date().toLocaleTimeString();
+        state.lastError = null;
+      }
     }
-    state.booted = true;
-    state.lastSync = new Date().toLocaleTimeString();
-    state.lastError = null;
     state.searchDirty = true;
   } catch (e) {
     state.lastError = e.message;
@@ -616,6 +651,11 @@ function statusLine() {
   const out = state.engine ? state.engine.outboxCount() : 0;
   const conf = state.engine ? state.engine.listConflicts().length : 0;
   let s = `outbox ${out} · conflicts ${conf}`;
+  const notes = [];
+  if (out) notes.push(`${out} change${out === 1 ? "" : "s"} waiting to sync`);
+  if (conf) notes.push(`${conf} edit${conf === 1 ? "" : "s"} need${conf === 1 ? "s" : ""} review`);
+  if (notes.length) s += ` · ${notes.join(" · ")}`;
+  if (state.persistError) s += ` · ERROR: not saved on this device (${state.persistError})`;
   if (state.lastSync) s += ` · last sync ${state.lastSync}`;
   if (state.lastError) s += ` · ERROR: ${state.lastError}`;
   return s;
@@ -1666,19 +1706,37 @@ function weatherLineHtml() {
   return `${line}<div class="panel wx-open">${inner}</div>`;
 }
 
+function conflictRowHtml(c) {
+  let srv = null, mine = null;
+  try { srv = c.server_row_json ? JSON.parse(c.server_row_json) : null; } catch {}
+  try { mine = c.local_row_json ? JSON.parse(c.local_row_json) : null; } catch {}
+  const title = srv?.title ?? mine?.title ?? "";
+  const snippet = (r) => { const b = String(r?.body_markdown ?? "").replace(/\s+/g, " ").trim(); return b ? esc(b.slice(0, 140)) : ""; };
+  return `<div class="conflict-block"><p class="conflict">${esc(c.table_name)} ${esc(c.row_id)}${title ? `: ${esc(title)}` : ""} <span class="muted">${esc(c.created_at ?? "")}</span></p>`
+    + `<p class="muted">Server copy${srv?.title ? `: ${esc(srv.title)}` : ""}${snippet(srv) ? ` — ${snippet(srv)}` : ""}</p>`
+    + (mine ? `<p class="muted">Your copy${mine.title ? `: ${esc(mine.title)}` : ""}${snippet(mine) ? ` — ${snippet(mine)}` : ""}</p>` : `<p class="muted">Your copy was not kept (recorded before local copies were preserved).</p>`)
+    + `<p>${mine ? `<button data-conflict-restore="${c.id}">Restore mine</button> ` : ""}<button data-conflict-dismiss="${c.id}">Dismiss</button></p></div>`;
+}
+function conflictsPanelHtml() {
+  const conflicts = state.engine ? state.engine.listConflicts() : [];
+  if (!conflicts.length) return "";
+  return `<div class="panel"><h3>Sync conflicts (${conflicts.length}) — server row kept; your edit is saved below</h3>` + conflicts.map(conflictRowHtml).join("") + `</div>`;
+}
+function restoreConflict(id) {
+  try {
+    const change = state.engine.restoreConflict(Number(id));
+    if (!change) return;
+    render(); saveBytes();
+  } catch (e) { state.lastError = String(e?.message ?? e); render(); }
+}
+
 function renderDashboard() {
-  const conflicts = state.engine.listConflicts();
   return `${weatherLineHtml()}
   ${pinnedPanel()}
   ${upcomingPanel()}
   ${familyPanel()}
   ${inboxPanel()}
-  ${conflicts.length ? `<div class="panel"><h3>Sync conflicts (${conflicts.length}) — server row kept</h3>` + conflicts.map((c) => {
-    let srv = null;
-    try { srv = c.server_row_json ? JSON.parse(c.server_row_json) : null; } catch {}
-    const title = srv?.title ? `: ${esc(srv.title)}` : "";
-    return `<p class="conflict">${esc(c.table_name)} ${esc(c.row_id)}${title} <span class="muted">${esc(c.created_at ?? "")}</span> <button data-conflict-dismiss="${c.id}">Dismiss</button></p>`;
-  }).join("") + `</div>` : ""}
+  ${conflictsPanelHtml()}
   <div class="panel"><form data-dash-search class="form"><input name="q" placeholder="Search DashBen…" style="flex:1"><button>Search</button></form></div>
 `;
 }
@@ -3713,6 +3771,7 @@ async function boot() {
     fresh = true;
   }
   state.engine = new SyncEngine(state.db);
+  state.engine.ensureConflictColumns();
   state.store = new LocalStore(state.engine);
   state.transport = new HttpTransport(state.base, state.token);
   state.booted = !fresh || !!bytes;
@@ -5008,6 +5067,8 @@ function attachExtraListeners() {
       location.reload();
       return;
     }
+    const confRestore = e.target.closest("[data-conflict-restore]");
+    if (confRestore) { restoreConflict(confRestore.dataset.conflictRestore); return; }
     const confDismiss = e.target.closest("[data-conflict-dismiss]");
     if (confDismiss) {
       state.db.prepare("DELETE FROM sync_conflicts WHERE id=?").run([confDismiss.dataset.conflictDismiss]);

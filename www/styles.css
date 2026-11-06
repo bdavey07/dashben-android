@@ -629,3 +629,4 @@ body.boot-faded #main { animation: bootfade 160ms ease-out; }
 /* Stamp ei: pill colour editor controls in Management. */
 .pill-ctl { display: inline-flex; gap: 8px; align-items: center; }
 .pill-ctl input[type="color"] { width: 46px; height: 28px; padding: 0; border: 1px solid var(--line); border-radius: 6px; background: none; cursor: pointer; }
+.conflict-block { border-top: 1px solid rgba(127, 127, 127, 0.35); padding: 6px 0; }

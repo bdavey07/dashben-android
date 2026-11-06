@@ -70,7 +70,7 @@ CREATE TABLE IF NOT EXISTS sync_meta (
 CREATE TABLE IF NOT EXISTS sync_conflicts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   client_change_id TEXT, table_name TEXT, row_id TEXT,
-  server_row_json TEXT, created_at TEXT NOT NULL
+  server_row_json TEXT, local_row_json TEXT, created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS attachments (

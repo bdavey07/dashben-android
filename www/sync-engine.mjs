@@ -103,6 +103,22 @@ export class SyncEngine {
 
   init(schemaSql) {
     this.db.exec(schemaSql);
+    this.ensureConflictColumns();
+  }
+
+  // Reliability batch: sync_conflicts gained a local_row_json column
+  // so a conflicted local edit survives (it used to exist only in the
+  // outbox payload, which the conflict branch deletes). Databases
+  // created before the column existed are never recreated from
+  // schema.sql (CREATE TABLE IF NOT EXISTS does not alter), so add
+  // the column in place wherever it is missing.
+  ensureConflictColumns() {
+    try {
+      const cols = this.db.prepare("PRAGMA table_info(sync_conflicts)").all();
+      if (cols.length && !cols.some((c) => c.name === "local_row_json")) {
+        this.db.exec("ALTER TABLE sync_conflicts ADD COLUMN local_row_json TEXT");
+      }
+    } catch { /* sync_conflicts not created yet — the schema creates it with the column */ }
   }
 
   getWatermark() {
@@ -177,12 +193,59 @@ export class SyncEngine {
     return this.db.prepare("SELECT * FROM sync_conflicts ORDER BY id DESC").all();
   }
 
+  readLocalRow(table, rowId) {
+    if (COMPOSITE.has(table)) {
+      const w = compositeWhere(table, rowId);
+      return this.db.prepare(`SELECT * FROM ${table} WHERE ${w.clause}`).get(...w.vals) ?? null;
+    }
+    if (table === "tag_vocab") {
+      return this.db.prepare("SELECT * FROM tag_vocab WHERE id=?").get(Number(rowId)) ?? null;
+    }
+    return this.db.prepare(`SELECT * FROM ${table} WHERE ${idColumn(table)}=?`).get(rowId) ?? null;
+  }
+
+  dismissConflict(conflictId) {
+    this.db.prepare("DELETE FROM sync_conflicts WHERE id=?").run(conflictId);
+  }
+
+  // Re-apply a conflicted local edit as a fresh edit on top of the
+  // current server row: the stored local copy is queued through
+  // localWrite with base = the server row's current updated_at, so
+  // the next push applies instead of conflicting again. The conflict
+  // record is consumed in the same transaction. Returns the queued
+  // change, or null when there is nothing restorable (a conflict
+  // recorded before local copies were preserved, or a delete).
+  restoreConflict(conflictId) {
+    const c = this.db.prepare("SELECT * FROM sync_conflicts WHERE id=?").get(conflictId);
+    if (!c || !c.local_row_json) return null;
+    let local = null;
+    try { local = JSON.parse(c.local_row_json); } catch { return null; }
+    if (!local || typeof local !== "object" || Array.isArray(local)) return null;
+    let server = null;
+    try { server = this.readLocalRow(c.table_name, c.row_id); } catch { server = null; }
+    if (!server && c.server_row_json) {
+      try { server = JSON.parse(c.server_row_json); } catch { server = null; }
+    }
+    const row = { ...local };
+    if ((TABLE_COLUMNS[c.table_name] ?? []).includes("updated_at")) row.updated_at = nowIso();
+    let change = null;
+    this.txn(() => {
+      change = this.localWrite(c.table_name, row, { baseUpdatedAt: server?.updated_at ?? null });
+      this.db.prepare("DELETE FROM sync_conflicts WHERE id=?").run(conflictId);
+    });
+    return change;
+  }
+
   // One sync cycle: pull first (reduces conflicts), then push the
-  // outbox in order. Conflicts adopt the server row locally and are
-  // logged; the outbox entry is dropped either way, because the
-  // server state is now the state of record. Validation errors keep
-  // their entry for a later cycle and are reported, never dropped.
+  // outbox in order. Conflicts adopt the server row locally (server
+  // wins by default) and are logged WITH the discarded local row, so
+  // the edit survives in sync_conflicts until the user dismisses it
+  // or restores it with restoreConflict(); the outbox entry is
+  // dropped either way, because the server state is now the state
+  // of record. Validation errors keep their entry for a later cycle
+  // and are reported, never dropped.
   async sync(transport) {
+    this.ensureConflictColumns();
     const report = { pulled: 0, applied: [], conflicts: [], errors: [] };
     const since = this.getWatermark();
     let cur = since;
@@ -267,8 +330,8 @@ export class SyncEngine {
           const c = conflictById.get(o.client_change_id);
           if (c.server_row) this.upsertLocal(o.table_name, cleanRow(o.table_name, c.server_row));
           this.db.prepare(
-            "INSERT INTO sync_conflicts (client_change_id, table_name, row_id, server_row_json, created_at) VALUES (?, ?, ?, ?, ?)",
-          ).run(o.client_change_id, o.table_name, o.row_id, c.server_row ? JSON.stringify(c.server_row) : null, nowIso());
+            "INSERT INTO sync_conflicts (client_change_id, table_name, row_id, server_row_json, local_row_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+          ).run(o.client_change_id, o.table_name, o.row_id, c.server_row ? JSON.stringify(c.server_row) : null, g.last.row_json ?? null, nowIso());
           for (const m of g.members) { del.run(m.client_change_id); report.conflicts.push(m.client_change_id); }
         } else if (errorById.has(o.client_change_id)) {
           report.errors.push({ client_change_id: o.client_change_id, error: errorById.get(o.client_change_id).error });
