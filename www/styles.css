@@ -625,3 +625,7 @@ body.boot-faded #main { animation: bootfade 160ms ease-out; }
 .snooze-pill:hover { border-color: #fb923c; background: color-mix(in srgb, #fb923c 22%, transparent); }
 .mon-pill { color: #6aa6e8; border-color: color-mix(in srgb, #6aa6e8 55%, transparent); background: color-mix(in srgb, #6aa6e8 12%, transparent); font-weight: 600; }
 .mon-pill:hover { border-color: #6aa6e8; background: color-mix(in srgb, #6aa6e8 22%, transparent); }
+
+/* Stamp ei: pill colour editor controls in Management. */
+.pill-ctl { display: inline-flex; gap: 8px; align-items: center; }
+.pill-ctl input[type="color"] { width: 46px; height: 28px; padding: 0; border: 1px solid var(--line); border-radius: 6px; background: none; cursor: pointer; }

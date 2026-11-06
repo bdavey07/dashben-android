@@ -1975,6 +1975,57 @@ function bulkBarHtml() {
   return `<div class="bulk-bar"><b>${n} selected</b><button data-bulk-action="complete" class="primary-btn">Complete</button><button data-bulk-action="postpone" class="ghost-btn">Postpone +1d</button><button data-bulk-action="archive" class="danger-btn">Archive</button><button data-bulk-action="clear" class="ghost-btn">Clear</button></div>`;
 }
 
+// --- Pill colours (stamp ei): every project, project status and
+// person role gets a colour for its pill. Stored overrides live in
+// the synced ui_prefs row "pill_colors" ({kind: {name: hex}}); names
+// without an override fall back to a stable hash of the palette, so
+// everything is coloured out of the box and edits sync everywhere.
+function pillHashColor(name) {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
+  return CLUSTER_COLORS[h % CLUSTER_COLORS.length];
+}
+function pillColors() {
+  try { const v = JSON.parse(state.store.getRow("ui_prefs", "pill_colors")?.value ?? "{}"); return v && typeof v === "object" && !Array.isArray(v) ? v : {}; } catch { return {}; }
+}
+function pillColorFor(kind, name) {
+  if (!name) return "";
+  return pillColors()[kind]?.[name] || pillHashColor(name);
+}
+function setPillColor(kind, name, hex) {
+  const map = pillColors();
+  if (hex) { (map[kind] ??= {})[name] = hex; } else if (map[kind]) { delete map[kind][name]; }
+  const ts = new Date().toISOString();
+  state.engine.localWrite("ui_prefs", { key: "pill_colors", value: JSON.stringify(map), updated_at: ts }, { baseUpdatedAt: state.store.getRow("ui_prefs", "pill_colors")?.updated_at ?? null });
+}
+function pillStyle(kind, name) {
+  const c = pillColorFor(kind, name);
+  return ` style="color:${c};border-color:${c}99;background:${c}26"`;
+}
+function pillColorNames() {
+  const un = (vals) => [...new Set(vals.filter(Boolean))];
+  return {
+    projects: un(allRows("projects").map((r) => r.title)).sort((a, b) => a.localeCompare(b)),
+    statuses: un([...vocabValues("projects", "status"), ...allRows("projects").map((r) => r.status)]),
+    roles: un([...vocabValues("people", "role"), ...allRows("people").map((r) => r.role)]),
+  };
+}
+function pillColorsBody() {
+  const groups = pillColorNames();
+  const map = pillColors();
+  const row = (kind, n) => { const c = pillColorFor(kind, n); return `<div class="mgmt-row"><span class="project-pill" style="color:${c};border-color:${c}99;background:${c}26">${esc(n)}</span><span class="pill-ctl"><input type="color" data-pill-color="${kind}|${esc(n)}" value="${c}"><button type="button" data-pill-reset="${kind}|${esc(n)}" class="ghost-btn"${map[kind]?.[n] ? "" : " disabled"}>Auto</button></span></div>`; };
+  const part = (label, kind, names) => `<h4 class="mgmt-sub">${label}</h4>${names.length ? names.map((n) => row(kind, n)).join("") : "<p class='muted'>None yet.</p>"}`;
+  return `<p class="muted">Every project, project status and person role gets its own pill colour. The starting colours are automatic — pick a swatch to override one, or Auto to go back. Colours sync across your devices.</p>${part("Projects", "projects", groups.projects)}${part("Project statuses", "statuses", groups.statuses)}${part("People roles", "roles", groups.roles)}`;
+}
+function pillColorSummary() {
+  const map = pillColors();
+  const n = ["projects", "statuses", "roles"].reduce((a, k) => a + Object.keys(map[k] ?? {}).length, 0);
+  return n ? `${n} custom` : "All automatic";
+}
+function clusterColor(name) {
+  return pillColorFor("projects", name);
+}
+const CLUSTER_COLORS = ["#d98e4a", "#7ea6c9", "#a3b86b", "#c97b84", "#9b8ec4", "#6bb8a6", "#c9a86a", "#7fc4c9", "#b48ec9", "#8ec97f"];
 // Dashboard and Daily task lists sort priority-first (Ben, Nov 6
 // 2026): within each date group, P1..P4 then no priority. The sort is
 // stable, so the underlying openTasks order (due date, then added)
@@ -2004,7 +2055,7 @@ function taskRow(t, opts = {}) {
     <span class="row-title">${esc(t.title)}</span>
     ${subInd}${rec ? `<span class="recur" title="Recurring task">↻</span>` : ""}
     ${t.priority ? `<span class="prio">${esc(t.priority)}</span>` : ""}
-    ${t.project ? `<span class="project-pill">${esc(t.project)}</span>` : ""}
+    ${t.project ? `<span class="project-pill"${pillStyle("projects", t.project)}>${esc(t.project)}</span>` : ""}
     ${opts.carry ? `<button data-carry-today="${t.id}" class="ghost-btn">→ Today</button>` : ""}
     ${opts.snooze ? `<button data-snooze-days="1" data-snooze-task="${t.id}" class="pill-btn snooze-pill">+ 1d</button><button data-snooze-days="7" data-snooze-task="${t.id}" class="pill-btn snooze-pill">+ 1 wk</button><button data-snooze-mon data-snooze-task="${t.id}" class="pill-btn mon-pill">→ Mon</button>` : ""}
     <span class="due${overdue ? " overdue" : ""}">${t.due_date ? t.due_date : "No due date"}</span>
@@ -2358,7 +2409,7 @@ function renderPeople() {
   }
   const ordered = orderedGroupKeys([...groups.keys()], "people.role", { last: ["No role"] }).map((k) => [k, groups.get(k)]);
   return `<div style="display:flex;justify-content:flex-end;align-items:center"><button data-new-person class="primary-btn">New person</button></div>
-  ${ordered.map(([g, list]) => `<details class="group" open><summary>${esc(g)} (${list.length})</summary>${list.map((r) => `<div class="row" data-person="${r.id}"><span class="row-title">${esc(r.title)}</span>${r.role ? `<span class="project-pill">${esc(r.role)}</span>` : ""}</div>`).join("")}</details>`).join("") || "<p class='muted'>Nothing here yet.</p>"}`;
+  ${ordered.map(([g, list]) => `<details class="group" open><summary>${esc(g)} (${list.length})</summary>${list.map((r) => `<div class="row" data-person="${r.id}"><span class="row-title">${esc(r.title)}</span>${r.role ? `<span class="project-pill"${pillStyle("roles", r.role)}>${esc(r.role)}</span>` : ""}</div>`).join("")}</details>`).join("") || "<p class='muted'>Nothing here yet.</p>"}`;
 }
 
 function renderReading() {
@@ -2384,7 +2435,7 @@ function renderProjects() {
   for (const l of groups.values()) l.sort((a, b) => a.title.localeCompare(b.title)); // stamp du: A-Z inside groups (was updated_at order — the list reshuffled after every edit)
   const ordered = orderedGroupKeys([...groups.keys()], "projects.category", { last: ["No category"] }).map((k) => [k, groups.get(k)]);
   return `<div style="display:flex;justify-content:flex-end;align-items:center"><button data-new-project class="primary-btn">New project</button></div>
-  ${ordered.map(([g, list]) => `<details class="group" open><summary>${esc(g)} (${list.length})</summary>${list.map((r) => `<div class="row" data-project="${r.id}"><span class="row-title">${esc(r.title)}</span>${r.status ? `<span class="project-pill">${esc(r.status)}</span>` : ""}${r.category ? `<span class="muted">${esc(r.category)}</span>` : ""}</div>`).join("")}</details>`).join("") || "<p class='muted'>Nothing here yet.</p>"}`;
+  ${ordered.map(([g, list]) => `<details class="group" open><summary>${esc(g)} (${list.length})</summary>${list.map((r) => `<div class="row" data-project="${r.id}"><span class="row-title">${esc(r.title)}</span>${r.status ? `<span class="project-pill"${pillStyle("statuses", r.status)}>${esc(r.status)}</span>` : ""}${r.category ? `<span class="muted">${esc(r.category)}</span>` : ""}</div>`).join("")}</details>`).join("") || "<p class='muted'>Nothing here yet.</p>"}`;
 }
 
 function renderSearch() {
@@ -3556,6 +3607,13 @@ function attachPersistentListeners() {
     if (archI) { archiveWithUndo("inbox_items", archI.dataset.archiveInbox); render(); saveBytes(); return; }
   });
   $("#main").addEventListener("change", async (e) => {
+    const pillInput = e.target.closest("[data-pill-color]");
+    if (pillInput) {
+      const v = pillInput.dataset.pillColor; const i = v.indexOf("|");
+      setPillColor(v.slice(0, i), v.slice(i + 1), pillInput.value);
+      render(); saveBytes();
+      return;
+    }
     const sel = e.target.closest("[data-reading-status]");
     if (sel) {
       state.store.updateProps("reading_items", sel.dataset.readingStatus, { status: sel.value });
@@ -4306,6 +4364,7 @@ function renderManagement() {
   ${sec("appearance", "Appearance", esc(themeLabel), `
   <p class="muted">Current theme: <b>${esc(themeLabel)}</b></p>
   <div class="theme-grid">${THEMES.map(([v, label]) => `<button data-theme-btn="${v}" ${v === currentTheme ? "disabled" : ""}>${label}</button>`).join("")}</div>`)}
+  ${sec("colors", "Colours", pillColorSummary(), pillColorsBody())}
   ${sec("tabs", "Tabs", `${order.length} tabs \u00b7 ${prefs.groups.length} groups`, `
   <h4 class="mgmt-sub">Order</h4><p class="muted">Drag tabs to reorder them, then save.</p>
   <ul data-tab-order-list>${order.map((tid) => `<li draggable="true" data-tab-order-item="${tid}">\u2630 ${esc(tabLabel(tid))}</li>`).join("")}</ul>
@@ -5033,6 +5092,13 @@ function attachExtraListeners() {
     if (themeBtn) {
       state.store.setTheme(themeBtn.dataset.themeBtn);
       applyTheme();
+      render(); saveBytes();
+      return;
+    }
+    const pillReset = e.target.closest("[data-pill-reset]");
+    if (pillReset) {
+      const v = pillReset.dataset.pillReset; const i = v.indexOf("|");
+      setPillColor(v.slice(0, i), v.slice(i + 1), null);
       render(); saveBytes();
       return;
     }
