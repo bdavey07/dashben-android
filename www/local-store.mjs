@@ -454,7 +454,7 @@ export class LocalStore {
     const current = this.listTags(objectType, objectId);
     this.engine.txn(() => {
       for (const tag of current.filter((t) => !clean.includes(t))) {
-        this.engine.localWrite("object_tags", `${objectType}|${objectId}|${tag}`, { op: "delete" });
+        this.engine.localWrite("object_tags", { object_type: objectType, object_id: objectId, tag }, { op: "delete" });
       }
       for (const tag of clean.filter((t) => !current.includes(t))) {
         this.engine.localWrite("object_tags", { object_type: objectType, object_id: objectId, tag }, { baseUpdatedAt: null });
@@ -474,7 +474,7 @@ export class LocalStore {
     const current = this.listPeople(objectType, objectId);
     this.engine.txn(() => {
       for (const pid of current.filter((p) => !clean.includes(p))) {
-        this.engine.localWrite("relations", `${objectType}|${objectId}|people|${pid}|people`, { op: "delete" });
+        this.engine.localWrite("relations", { from_type: objectType, from_id: objectId, to_type: "people", to_id: pid, relation_name: "people" }, { op: "delete" });
       }
       for (const pid of clean.filter((p) => !current.includes(p))) {
         this.engine.localWrite("relations", { from_type: objectType, from_id: objectId, to_type: "people", to_id: pid, relation_name: "people" }, { baseUpdatedAt: null });
@@ -508,15 +508,15 @@ export class LocalStore {
     ).all(taskId).map((r) => r.to_id);
     this.engine.txn(() => {
       for (const old of oldParents) {
-        this.engine.localWrite("relations", `tasks|${taskId}|tasks|${old}|parent_task`, { op: "delete" });
-        this.engine.localWrite("relations", `tasks|${old}|tasks|${taskId}|sub_tasks`, { op: "delete" });
+        this.engine.localWrite("relations", { from_type: "tasks", from_id: taskId, to_type: "tasks", to_id: old, relation_name: "parent_task" }, { op: "delete" });
+        this.engine.localWrite("relations", { from_type: "tasks", from_id: old, to_type: "tasks", to_id: taskId, relation_name: "sub_tasks" }, { op: "delete" });
       }
       const doomed = this.db.prepare(
         "SELECT from_type, from_id, to_type, to_id, relation_name FROM relations WHERE to_type='tasks' AND to_id=? AND relation_name='sub_tasks'",
       ).all(taskId);
       for (const r of doomed) {
         if (!oldParents.includes(r.from_id)) {
-          this.engine.localWrite("relations", `${r.from_type}|${r.from_id}|${r.to_type}|${r.to_id}|${r.relation_name}`, { op: "delete" });
+          this.engine.localWrite("relations", r, { op: "delete" });
         }
       }
       if (parentId) {
@@ -544,7 +544,7 @@ export class LocalStore {
     const current = this.listRelatedTodos(projectId);
     this.engine.txn(() => {
       for (const tid of current.filter((t) => !taskIds.includes(t))) {
-        this.engine.localWrite("relations", `projects|${projectId}|tasks|${tid}|related_todo`, { op: "delete" });
+        this.engine.localWrite("relations", { from_type: "projects", from_id: projectId, to_type: "tasks", to_id: tid, relation_name: "related_todo" }, { op: "delete" });
       }
       for (const tid of taskIds.filter((t) => !current.includes(t))) {
         this.engine.localWrite("relations", { from_type: "projects", from_id: projectId, to_type: "tasks", to_id: tid, relation_name: "related_todo" }, { baseUpdatedAt: null });
@@ -567,7 +567,7 @@ export class LocalStore {
   removeLink(fromType, fromId, toType, toId) {
     this.engine.txn(() => {
       for (const [a, b, c, d] of [[fromType, fromId, toType, toId], [toType, toId, fromType, fromId]]) {
-        this.engine.localWrite("relations", `${a}|${b}|${c}|${d}|link`, { op: "delete" });
+        this.engine.localWrite("relations", { from_type: a, from_id: b, to_type: c, to_id: d, relation_name: "link" }, { op: "delete" });
       }
     });
   }
@@ -667,7 +667,7 @@ export class LocalStore {
     if (newValue !== oldValue && vocab.includes(newValue)) throw new Error(`A value named "${newValue}" already exists.`);
     this.engine.txn(() => {
       if (vocab.includes(oldValue)) {
-        this.engine.localWrite("field_values", `${objectType}|${field}|${oldValue}`, { op: "delete" });
+        this.engine.localWrite("field_values", { object_type: objectType, field, value: oldValue }, { op: "delete" });
       }
       this.engine.localWrite("field_values", { object_type: objectType, field, value: newValue }, { baseUpdatedAt: null });
       // Data rows keep their updated_at (the server rename does not
@@ -687,7 +687,7 @@ export class LocalStore {
     if (used > 0) throw new Error(`Cannot delete "${value}": it is used by ${used} ${used === 1 ? "row" : "rows"}. Rename it instead.`);
     const exists = this.db.prepare("SELECT 1 FROM field_values WHERE object_type=? AND field=? AND value=?").get(objectType, field, value);
     if (!exists) throw new Error(`No value named "${value}".`);
-    this.engine.localWrite("field_values", `${objectType}|${field}|${value}`, { op: "delete" });
+    this.engine.localWrite("field_values", { object_type: objectType, field, value }, { op: "delete" });
   }
 
   // --- Global tags (notes scope, mirrors production tag management) ---
@@ -698,7 +698,7 @@ export class LocalStore {
     if (rows.length === 0) throw new Error(`Nothing tagged "${t}".`);
     this.engine.txn(() => {
       for (const r of rows) {
-        this.engine.localWrite("object_tags", `${r.object_type}|${r.object_id}|${t}`, { op: "delete" });
+        this.engine.localWrite("object_tags", r, { op: "delete" });
         const exists = this.db.prepare("SELECT 1 FROM object_tags WHERE object_type=? AND object_id=? AND tag=?").get(r.object_type, r.object_id, n);
         if (!exists) this.engine.localWrite("object_tags", { object_type: r.object_type, object_id: r.object_id, tag: n }, { baseUpdatedAt: null });
       }
@@ -711,7 +711,7 @@ export class LocalStore {
     const rows = this.db.prepare("SELECT * FROM object_tags WHERE tag=?").all(t);
     if (rows.length === 0) throw new Error(`Nothing tagged "${t}".`);
     this.engine.txn(() => {
-      for (const r of rows) this.engine.localWrite("object_tags", `${r.object_type}|${r.object_id}|${t}`, { op: "delete" });
+      for (const r of rows) this.engine.localWrite("object_tags", r, { op: "delete" });
     });
   }
 

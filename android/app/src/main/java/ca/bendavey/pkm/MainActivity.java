@@ -29,7 +29,10 @@ public class MainActivity extends BridgeActivity {
         super.onResume();
         // Re-assert the autofill exclusion once the WebView certainly exists.
         try { getBridge().getWebView().setImportantForAutofill(android.view.View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS); } catch (Exception e) { /* best effort */ }
-        try { getBridge().getWebView().setImportantForAccessibility(android.view.View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS); } catch (Exception e) { /* best effort */ }
+        // NOTE: no IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS here
+        // (review 3, item 10): it hid the whole app from screen readers.
+        // Autofill suppression above uses the autofill flags + the
+        // WebView's empty autofill structure, not accessibility.
         WidgetPlugin.poke(this);
     }
 

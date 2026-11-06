@@ -1,6 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- Widget action broadcasts (task completions, refresh) are only
+         legitimate from this app itself (review 3, item 11): the
+         widget receivers stay exported for the system's AppWidget
+         service, but the custom actions ride on a signature-level
+         permission no other app can hold. -->
+    <permission
+        android:name="ca.bendavey.pkm.permission.WIDGET_ACTIONS"
+        android:protectionLevel="signature" />
+    <uses-permission android:name="ca.bendavey.pkm.permission.WIDGET_ACTIONS" />
+
     <application
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
@@ -45,7 +55,7 @@
                 android:resource="@xml/file_paths"></meta-data>
         </provider>
 
-        <receiver android:name=".TodayWidgetProvider" android:exported="true" android:label="DashBen Today">
+        <receiver android:name=".TodayWidgetProvider" android:exported="true" android:permission="ca.bendavey.pkm.permission.WIDGET_ACTIONS" android:label="DashBen Today">
             <intent-filter>
                 <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
             </intent-filter>
@@ -54,7 +64,7 @@
 
         <service android:name=".WidgetListService" android:exported="false" android:permission="android.permission.BIND_REMOTEVIEWS" />
 
-        <receiver android:name=".CaptureWidgetProvider" android:exported="true" android:label="DashBen Capture">
+        <receiver android:name=".CaptureWidgetProvider" android:exported="true" android:permission="ca.bendavey.pkm.permission.WIDGET_ACTIONS" android:label="DashBen Capture">
             <intent-filter>
                 <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
             </intent-filter>

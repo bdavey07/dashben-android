@@ -156,8 +156,21 @@ async function processWidgetDone() {
     const r = await withTimeout(NativeShare.getPendingDone({}), 3000, "share.pendingDone").catch(() => null);
     const ids = Array.isArray(r?.ids) ? r.ids : [];
     if (!ids.length) return;
-    await withTimeout(NativeShare.clearPendingDone({}), 3000, "share.clearDone").catch(() => null);
-    for (const id of ids) applyNotifAction("done", id);
+    // Acknowledge AFTER applying (review 3, item 12): completions
+    // used to be cleared from native prefs before the store applied
+    // them, so a crash in between lost the ticks. Apply first, flush
+    // the database write, then clear exactly the ids that landed —
+    // anything else stays queued for the next drain.
+    const doneIds = [];
+    for (const id of ids) {
+      try { applyNotifAction("done", id); doneIds.push(id); } catch { /* stays pending */ }
+    }
+    if (doneIds.length) {
+      await saveBytes(true);
+      if (!state.persistError) {
+        await withTimeout(NativeShare.clearPendingDoneIds({ ids: doneIds }), 3000, "share.clearDoneIds").catch(() => null);
+      }
+    }
     queueWidgetSnapshot();
   } finally { widgetDoneDraining = false; }
 }
@@ -391,21 +404,30 @@ function idb() {
 }
 async function loadBytes() {
   // Shell: the native DB file is the durable store (and the file M6
-  // widgets will read). IndexedDB stays as fallback for databases
-  // created by the proof build, which had no file yet.
+  // widgets will read). Fallback order (review 3, item 13): the live
+  // file, then the last-known-good .bak the atomic replace keeps,
+  // then IndexedDB (databases created by the proof build, which had
+  // no file yet). state.dbSource records which source won, so a
+  // recovery is visible in the status line, never silent.
   if (NativeFS) {
     try {
       const r = await withTimeout(NativeFS.readFile({ path: DB_FILE, directory: "DATA" }), 5000, "fs.readFile");
-      if (r && r.data) return b64ToBytes(r.data);
-    } catch { /* no file yet */ }
+      if (r && r.data) { state.dbSource = "native"; return b64ToBytes(r.data); }
+    } catch { /* unreadable — try the backup copy */ }
+    try {
+      const r = await withTimeout(NativeFS.readFile({ path: DB_FILE + ".bak", directory: "DATA" }), 5000, "fs.readBak");
+      if (r && r.data) { state.dbSource = "native-backup"; return b64ToBytes(r.data); }
+    } catch { /* no backup — fall through to IndexedDB */ }
   }
   try {
     const db = await idb();
-    return await new Promise((resolve) => {
+    const bytes = await new Promise((resolve) => {
       const tx = db.transaction("files", "readonly").objectStore("files").get("db");
       tx.onsuccess = () => resolve(tx.result ?? null);
       tx.onerror = () => resolve(null);
     });
+    if (bytes) state.dbSource = "indexeddb";
+    return bytes;
   } catch { return null; }
 }
 // Persistence coalescing (stamp bz): every edit used to serialize
@@ -449,7 +471,15 @@ async function persistBytesNow() {
   let firstErr = null;
   if (NativeFS) {
     try {
-      await withTimeout(NativeFS.writeFile({ path: DB_FILE, data: bytesToB64(bytes), directory: "DATA" }), 5000, "fs.writeFile");
+      // Atomic replace (review 3, item 13): write a temp file,
+      // rotate the live file to a last-known-good .bak, then rename
+      // the temp into place. The old code overwrote pkm.db in
+      // place, so a crash mid-write could truncate the only native
+      // copy; loadBytes now falls back to the .bak before IndexedDB.
+      await withTimeout(NativeFS.writeFile({ path: DB_FILE + ".tmp", data: bytesToB64(bytes), directory: "DATA" }), 5000, "fs.writeTmp");
+      try { await withTimeout(NativeFS.deleteFile({ path: DB_FILE + ".bak", directory: "DATA" }), 3000, "fs.delBak"); } catch { /* no previous backup */ }
+      try { await withTimeout(NativeFS.renameFile({ path: DB_FILE, to: DB_FILE + ".bak", directory: "DATA", toDirectory: "DATA" }), 3000, "fs.rotate"); } catch { /* first write: no live file yet */ }
+      await withTimeout(NativeFS.renameFile({ path: DB_FILE + ".tmp", to: DB_FILE, directory: "DATA", toDirectory: "DATA" }), 3000, "fs.rename");
       fileOk = true;
     } catch (e) { firstErr = e; }
   }
@@ -457,10 +487,16 @@ async function persistBytesNow() {
   try {
     const db = await idb();
     await new Promise((resolve, reject) => {
-      const tx = db.transaction("files", "readwrite").objectStore("files").put(bytes, "db");
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error ?? new Error("IndexedDB write failed"));
-      tx.onabort = () => reject(tx.error ?? new Error("IndexedDB write aborted"));
+      // Resolve on the TRANSACTION's complete event: put() returns a
+      // request, and requests fire success/error only — attaching
+      // oncomplete to the request never fires, so the promise used to
+      // hang forever on the success path (review 3, item 1).
+      const transaction = db.transaction("files", "readwrite");
+      const request = transaction.objectStore("files").put(bytes, "db");
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error ?? new Error("IndexedDB write failed"));
+      transaction.onabort = () => reject(transaction.error ?? new Error("IndexedDB write aborted"));
+      request.onerror = () => reject(request.error ?? new Error("IndexedDB write failed"));
     });
     idbOk = true;
   } catch (e) { firstErr = firstErr ?? e; }
@@ -531,10 +567,37 @@ function noteSyncResult(ok) {
   retryTimer = setTimeout(() => { retryTimer = null; void doSync(); }, delay);
 }
 
+
+// True while the user is editing a field in the main region — a
+// background re-render would destroy that unsaved input.
+function mainFormActive() {
+  const a = document.activeElement;
+  if (!a) return false;
+  const tag = a.tagName;
+  if (tag !== "INPUT" && tag !== "TEXTAREA" && tag !== "SELECT" && !a.isContentEditable) return false;
+  const m = document.querySelector("#main");
+  return !!(m && m.contains(a));
+}
+// Background sync must not clobber main-page forms (review 3, item
+// 5b): skip the re-render when the cycle changed nothing, defer it
+// while a main-region form is being edited (the focusout listener
+// below paints once the field is left). The boot sync always paints.
+function renderAfterSync(changed, wasBooted) {
+  if (!wasBooted) { render(); return; }
+  if (!changed) { paintSyncStatus(); return; }
+  if (mainFormActive()) { state.renderDeferred = true; return; }
+  render();
+}
+document.addEventListener("focusout", () => {
+  if (state.renderDeferred && !mainFormActive()) { state.renderDeferred = false; render(); }
+});
+
 async function doSync() {
   if (state.syncing) return;
   state.syncing = true;
   let cycleOk = false;
+  const wasBooted = state.booted;
+  let syncChanged = !wasBooted;
   const btn = $("#sync-btn");
   btn.disabled = true;
   syncBtnLabel("Syncing…");
@@ -559,6 +622,8 @@ async function doSync() {
         state.lastError = null;
       }
       cycleOk = (report.errors?.length ?? 0) === 0;
+      syncChanged = (report.pulled ?? 0) > 0 || (report.applied?.length ?? 0) > 0
+        || (report.conflicts?.length ?? 0) > 0 || (report.errors?.length ?? 0) > 0 || !!report.resynced;
     }
     state.searchDirty = true;
   } catch (e) {
@@ -568,7 +633,7 @@ async function doSync() {
   noteSyncResult(cycleOk);
   btn.disabled = false;
   syncBtnLabel("Sync now");
-  render();
+  renderAfterSync(syncChanged, wasBooted);
   saveBytes();
   if (typeof window !== "undefined") window.__dashbenAfterSync?.();
   loadFamilyCalendar();
@@ -657,15 +722,27 @@ async function runHealthCheck() {
 // are safe — boot + every return to the foreground.
 async function captureSharedText() {
   if (!NativeShare || !state.store) return;
+  let text = "";
   try {
     const r = await withTimeout(NativeShare.getSharedText(), 5000, "share.get");
-    const text = (r && r.text ? String(r.text) : "").trim();
-    if (text) {
+    text = (r && r.text ? String(r.text) : "").trim();
+  } catch { /* bridge unavailable — nothing to collect */ }
+  if (text) {
+    // Durable ack protocol (review 3, item 14): getSharedText only
+    // PEEKS — the share stays queued natively until the capture is
+    // saved here and explicitly acknowledged. A failed save leaves
+    // it queued for the next foreground and says so, instead of the
+    // old consume-at-read behaviour that lost shares silently.
+    try {
       if (routeCapture(text) === "inbox") state.store.captureInbox({ title: "", body: text });
       render();
-      saveBytes();
+      await saveBytes(true);
+      if (state.persistError) throw new Error(state.persistError);
+      await withTimeout(NativeShare.clearSharedText(), 3000, "share.clearText").catch(() => null);
+    } catch {
+      showToast("<span>Couldn't save the shared text — it stays queued and will retry.</span>");
     }
-  } catch { /* no share pending */ }
+  }
   await captureSharedImage();
 }
 
@@ -679,18 +756,27 @@ async function captureSharedImage() {
   try {
     const r = await withTimeout(NativeShare.getSharedImage(), 5000, "share.image");
     file = (r && r.file) ? String(r.file) : "";
-    if (!file) return;
+  } catch { /* bridge unavailable */ }
+  if (!file) return;
+  // Same peek + ack protocol as shared text (review 3, item 14):
+  // acknowledge (and delete the temp copy) only after the photo is
+  // captured in the Inbox AND the database write has landed.
+  try {
     const rd = await withTimeout(NativeFS.readFile({ path: file, directory: "DATA" }), 20000, "fs.readShared");
     const b64 = rd && typeof rd.data === "string" ? rd.data : "";
-    if (!b64) return;
+    if (!b64) throw new Error("shared image unreadable");
     const att = await dataToAttachment(b64, "image/jpeg");
     const item = state.store.captureInbox({ title: "", body: "Photo" });
     state.store.addAttachment("inbox_items", item.id, att.mime, att.data, att.name ?? null);
     state.searchDirty = true;
     render();
-    saveBytes();
-  } catch { /* no image share pending */ }
-  if (file) { try { await NativeFS.deleteFile({ path: file, directory: "DATA" }); } catch {} }
+    await saveBytes(true);
+    if (state.persistError) throw new Error(state.persistError);
+    await withTimeout(NativeShare.clearSharedImage(), 3000, "share.clearImage").catch(() => null);
+    try { await NativeFS.deleteFile({ path: file, directory: "DATA" }); } catch {}
+  } catch {
+    showToast("<span>Couldn't save the shared photo — it stays queued and will retry.</span>");
+  }
 }
 
 function statusLine() {
@@ -702,6 +788,7 @@ function statusLine() {
   if (conf) notes.push(`${conf} edit${conf === 1 ? "" : "s"} need${conf === 1 ? "s" : ""} review`);
   if (notes.length) s += ` · ${notes.join(" · ")}`;
   if (state.persistError) s += ` · ERROR: not saved on this device (${state.persistError})`;
+  if (state.dbSource === "native-backup") s += " · recovered from the backup DB copy";
   if (state.lastSync) s += ` · last sync ${state.lastSync}`;
   if (state.lastError) s += ` · ERROR: ${state.lastError}`;
   return s;
@@ -2556,7 +2643,7 @@ function exportMarkdown() {
       count++;
     }
   }
-  files.unshift({ name: "index.md", data: `# DashBen Markdown export\n\n${count} items · exported ${todayToronto()}.\n` });
+  files.unshift({ name: "index.md", data: `# DashBen Markdown export\n\n${count} items · exported ${todayToronto()}.\n\nScope: tasks, notes, people, projects, reading and inbox items only. Archived items, custom objects and attachment files are not included.\n` });
   downloadBytes(`dashben-markdown-${todayToronto()}.zip`, zipStore(files), "application/zip");
   showToast(`<span>Markdown export saved (${count} items)</span>`);
 }
@@ -4854,7 +4941,7 @@ function renderManagement() {
   ${sec("recovery", "Recovery history & Trash", "Archived · previous versions", recoveryHtml())}
   ${sec("backup", "Backup & export", "Database \u00b7 Markdown", `
   <div class="mgmt-row"><div class="mgmt-rowtext"><span class="mgmt-label">Database (.db)</span><span class="muted">A full copy of the local database \u2014 the same format the app loads. Keep it somewhere safe as offline insurance.</span></div><button data-export-db class="primary-btn">Export</button></div>
-  <div class="mgmt-row"><div class="mgmt-rowtext"><span class="mgmt-label">Markdown (.zip)</span><span class="muted">Every item as a Markdown file, zipped.</span></div><button data-export-md class="primary-btn">Export</button></div>`)}`;
+  <div class="mgmt-row"><div class="mgmt-rowtext"><span class="mgmt-label">Markdown (.zip)</span><span class="muted">Tasks, notes, people, projects, reading and inbox items as Markdown files, zipped. Archived items, custom objects and attachment files are not included.</span></div><button data-export-md class="primary-btn">Export</button></div>`)}`;
 }
 
 function renderCustomTab(slug) {

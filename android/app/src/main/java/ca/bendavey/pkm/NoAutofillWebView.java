@@ -20,7 +20,9 @@ public class NoAutofillWebView extends CapacitorWebView {
     public NoAutofillWebView(Context context, AttributeSet attrs) {
         super(context, attrs);
         setImportantForAutofill(IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS);
-        setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS);
+        // No accessibility importance override (review 3, item 10):
+        // NO_HIDE_DESCENDANTS here hid the app from screen readers;
+        // the empty autofill structure below is the real suppression.
     }
 
     @Override

@@ -94,7 +94,7 @@ export function localTableCounts(db) {
     const wanted = [];
     if (table === "relations") wanted.push("from_type", "from_id", "to_type", "to_id", "relation_name");
     else if (table === "object_tags") wanted.push("object_type", "object_id", "tag");
-    else if (table === "custom_field_values") wanted.push("object_type", "field", "value");
+    else if (table === "field_values") wanted.push("object_type", "field", "value");
     else if (table === "ui_prefs") wanted.push("key");
     else if (table === "custom_object_types") wanted.push("slug");
     else wanted.push("id");
@@ -191,13 +191,57 @@ export class SyncEngine {
     }
   }
 
-  applyChanges(changes) {
+  // Rows with queued local edits are protected from pulled changes
+  // (review 3, item 2): a pull — including the post-push re-pull —
+  // must never overwrite a row the user has edited but not yet
+  // synced, or the display reverts and the queued edit self-conflicts
+  // on its stale base next cycle. `excludeIds` names outbox entries
+  // already accounted for by an in-flight push (their rows SHOULD
+  // adopt the server stamps the re-pull delivers); any OTHER queued
+  // entry guards its row. When the guarded row is one of this push's
+  // applied rows (appliedKeys), the incoming change is our own edit
+  // coming back: rebase the queued entries onto its server stamp and
+  // re-assert the queued snapshot, so the newer edit stays visible
+  // and pushes cleanly next cycle.
+  applyChanges(changes, opts = {}) {
+    const exclude = opts.excludeIds ?? null;
+    const appliedKeys = opts.appliedKeys ?? null;
     this.txn(() => {
+      let guard = null;
+      const guardSet = () => {
+        if (guard) return guard;
+        guard = new Set();
+        for (const r of this.db.prepare("SELECT client_change_id, table_name, row_id FROM sync_outbox").all()) {
+          if (exclude && exclude.has(r.client_change_id)) continue;
+          guard.add(r.table_name + "\0" + r.row_id);
+        }
+        return guard;
+      };
       for (const c of changes) {
+        const key = c.table + "\0" + c.row_id;
+        if (guardSet().has(key)) {
+          if (appliedKeys && appliedKeys.has(key) && c.op !== "delete" && c.row) {
+            this.db.prepare("UPDATE sync_outbox SET base_updated_at=? WHERE table_name=? AND row_id=?")
+              .run(c.row.updated_at ?? null, c.table, c.row_id);
+            this.reassertPending(c.table, c.row_id);
+          }
+          continue;
+        }
         if (c.op === "delete") this.deleteLocal(c.table, c.row_id);
         else if (c.row) this.upsertLocal(c.table, cleanRow(c.table, c.row));
       }
     });
+  }
+
+  // Re-apply the newest queued snapshot for a row over whatever a
+  // bulk apply (pull page, snapshot) put there, so a pending edit is
+  // what the user sees. Bases are NOT touched here — a genuinely
+  // diverged server row still conflicts honestly at push time.
+  reassertPending(table, rowId) {
+    const last = this.db.prepare("SELECT op, row_json FROM sync_outbox WHERE table_name=? AND row_id=? ORDER BY rowid DESC LIMIT 1").get(table, rowId);
+    if (!last) return;
+    if (last.op === "delete") this.deleteLocal(table, rowId);
+    else if (last.row_json) this.upsertLocal(table, cleanRow(table, JSON.parse(last.row_json)));
   }
 
   // Every local write goes through here: the row change and its
@@ -209,7 +253,14 @@ export class SyncEngine {
       throw new Error(`Delete is not supported for ${table}; archive with an upsert instead.`);
     }
     const clean = op === "delete" ? null : cleanRow(table, row);
-    const rowId = op === "delete" ? String(row) : rowIdFor(table, clean);
+    // Delete callers may pass the row object instead of a pre-joined
+    // id string: the encoded id is then computed here, so components
+    // containing "|" (a tag named "a|b") survive — raw template
+    // strings used to throw in the id parser (review 3, item 7).
+    // Plain string ids still work (legacy unencoded ids parse too).
+    const rowId = op === "delete"
+      ? (row !== null && typeof row === "object" ? rowIdFor(table, row) : String(row))
+      : rowIdFor(table, clean);
     const changeId = uid();
     this.txn(() => {
       if (table !== "ui_prefs") {
@@ -358,6 +409,7 @@ export class SyncEngine {
     }
     const outbox = this.db.prepare("SELECT * FROM sync_outbox ORDER BY rowid").all();
     if (outbox.length === 0) return report;
+    const pushedIds = new Set(outbox.map((o) => o.client_change_id));
     // Coalesce per (table, row_id) before pushing. Push rows are full
     // snapshots, so only the latest state per row needs to go — and
     // pushing every intermediate edit self-conflicts: the server
@@ -400,7 +452,17 @@ export class SyncEngine {
     // anything newer waits for the next cycle. If the re-pull
     // itself fails, keep the pre-push watermark so the next cycle
     // re-delivers the applied rows instead of skipping them.
-    let relearned = true;
+    // The watermark may only advance over changes actually DELIVERED
+    // by a pull (review 3, item 3): res.seq is the server's head, and
+    // adopting it when nothing applied (every change errored or
+    // conflicted, so the re-pull below is skipped) would jump past
+    // server changes this client has never seen.
+    const appliedKeySet = new Set(
+      [...groups.values()]
+        .filter((g) => (res.applied ?? []).includes(g.last.client_change_id))
+        .map((g) => g.last.table_name + "\0" + g.last.row_id),
+    );
+    let deliveredMark = cur;
     if ((res.applied ?? []).length > 0) {
       try {
         const target = res.seq ?? cur;
@@ -408,12 +470,13 @@ export class SyncEngine {
         let more = true;
         while (more) {
           const page = await transport.pull(cur2, 200);
-          this.applyChanges(page.changes);
+          this.applyChanges(page.changes, { excludeIds: pushedIds, appliedKeys: appliedKeySet });
           report.pulled += page.changes.length;
           cur2 = page.next_seq;
           more = page.has_more && cur2 < target;
         }
-      } catch { relearned = false; }
+        deliveredMark = cur2;
+      } catch { deliveredMark = cur; }
     }
     const appliedSet = new Set(res.applied ?? []);
     const conflictById = new Map((res.conflicts ?? []).map((c) => [c.client_change_id, c]));
@@ -458,7 +521,7 @@ export class SyncEngine {
         }
         this.db.prepare("UPDATE sync_conflicts SET row_id=? WHERE table_name='tag_vocab' AND row_id=?").run(toId, fromId);
       }
-      this.setWatermark(relearned ? (res.seq ?? cur) : cur);
+      this.setWatermark(deliveredMark);
     });
     return report;
   }
@@ -479,6 +542,12 @@ export class SyncEngine {
         if (!cursor) break;
       }
     }
+    // A snapshot rebuild must not bury queued local edits (review 3,
+    // item 2): re-assert every pending row over the snapshot state.
+    this.txn(() => {
+      const keys = this.db.prepare("SELECT DISTINCT table_name, row_id FROM sync_outbox").all();
+      for (const k of keys) this.reassertPending(k.table_name, k.row_id);
+    });
     const mark = seq ?? 0;
     this.txn(() => this.setWatermark(mark));
     return mark;

@@ -13,7 +13,12 @@ import java.io.FileOutputStream;
 import java.io.InputStream;
 
 // Receives Android share-sheet sends (text/plain and image/*) and
-// holds them until the web client collects each exactly once. Images
+// holds them until the web client collects each exactly once. Shares
+// are ALSO persisted to SharedPreferences at capture time and the
+// getters only PEEK (review 3, item 14): the web client acknowledges
+// with clearSharedText/clearSharedImage only after the capture is
+// durably saved, so a process death or a failed save no longer loses
+// a share, and failures surface instead of being swallowed. Images
 // are copied into the app files dir (the same DATA directory the web
 // client's Filesystem bridge reads); only the file name crosses to
 // JS, which reads, downscales, and files the photo in the Inbox.
@@ -63,6 +68,11 @@ public class ShareIntentPlugin extends Plugin {
         if (text == null || text.isEmpty()) return;
         String subject = intent.getStringExtra(Intent.EXTRA_SUBJECT);
         pendingText = (subject != null && !subject.isEmpty()) ? subject + "\n" + text : text;
+        try { prefs().edit().putString("share_text", pendingText).apply(); } catch (Exception e) { /* in-memory copy still held */ }
+    }
+
+    private android.content.SharedPreferences prefs() {
+        return getContext().getSharedPreferences("dashben", android.content.Context.MODE_PRIVATE);
     }
 
     private void copySharedImage(Uri uri) {
@@ -77,6 +87,7 @@ public class ShareIntentPlugin extends Plugin {
             fos.close();
             in.close();
             pendingImage = out.getName();
+            try { prefs().edit().putString("share_image", pendingImage).apply(); } catch (Exception e) { /* in-memory copy still held */ }
         } catch (Exception e) {
             // Share capture is best-effort; a failed copy drops the share.
         }
@@ -123,19 +134,69 @@ public class ShareIntentPlugin extends Plugin {
         call.resolve();
     }
 
+    // Peek only (review 3, item 14): the value survives until the
+    // web client acknowledges a durable capture via the clear*
+    // methods below. Falls back to the persisted copy so a share
+    // that arrived before a process restart is still delivered.
     @PluginMethod
     public void getSharedText(PluginCall call) {
+        String v = pendingText;
+        if (v == null) { try { v = prefs().getString("share_text", ""); } catch (Exception e) { v = ""; } }
         JSObject ret = new JSObject();
-        ret.put("text", pendingText != null ? pendingText : "");
-        pendingText = null;
+        ret.put("text", v != null ? v : "");
         call.resolve(ret);
     }
 
     @PluginMethod
+    public void clearSharedText(PluginCall call) {
+        pendingText = null;
+        try { prefs().edit().remove("share_text").apply(); } catch (Exception e) { /* ignore */ }
+        call.resolve();
+    }
+
+    @PluginMethod
     public void getSharedImage(PluginCall call) {
+        String v = pendingImage;
+        if (v == null) { try { v = prefs().getString("share_image", ""); } catch (Exception e) { v = ""; } }
         JSObject ret = new JSObject();
-        ret.put("file", pendingImage != null ? pendingImage : "");
-        pendingImage = null;
+        ret.put("file", v != null ? v : "");
         call.resolve(ret);
+    }
+
+    @PluginMethod
+    public void clearSharedImage(PluginCall call) {
+        pendingImage = null;
+        try { prefs().edit().remove("share_image").apply(); } catch (Exception e) { /* ignore */ }
+        call.resolve();
+    }
+
+    // Per-id acknowledgement for widget completions (review 3, item
+    // 12): the web client clears exactly the ids it applied and
+    // durably saved; anything else stays queued for the next drain.
+    @PluginMethod
+    public void clearPendingDoneIds(PluginCall call) {
+        try {
+            org.json.JSONArray ids = call.getArray("ids");
+            if (ids == null || ids.length() == 0) { call.resolve(); return; }
+            java.util.HashSet<String> done = new java.util.HashSet<>();
+            for (int i = 0; i < ids.length(); i++) done.add(ids.getString(i));
+            android.content.SharedPreferences prefs = prefs();
+            java.util.LinkedHashSet<String> keep = new java.util.LinkedHashSet<>();
+            String raw = prefs.getString("pending_done", "");
+            if (raw != null && !raw.isEmpty()) for (String x : raw.split(",")) if (!x.isEmpty() && !done.contains(x)) keep.add(x);
+            StringBuilder sb = new StringBuilder();
+            String rawAt = prefs.getString("pending_done_at", "");
+            if (rawAt != null && !rawAt.isEmpty()) {
+                for (String pair : rawAt.split(",")) {
+                    int colon = pair.lastIndexOf(':');
+                    if (colon > 0 && !done.contains(pair.substring(0, colon))) {
+                        if (sb.length() > 0) sb.append(',');
+                        sb.append(pair);
+                    }
+                }
+            }
+            prefs.edit().putString("pending_done", String.join(",", keep)).putString("pending_done_at", sb.toString()).apply();
+        } catch (Exception e) { /* ids stay queued; next drain retries */ }
+        call.resolve();
     }
 }
