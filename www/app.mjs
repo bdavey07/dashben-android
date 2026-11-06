@@ -2015,12 +2015,7 @@ function pillColorsBody() {
   const map = pillColors();
   const row = (kind, n) => { const c = pillColorFor(kind, n); return `<div class="mgmt-row"><span class="project-pill" style="color:${c};border-color:${c}99;background:${c}26">${esc(n)}</span><span class="pill-ctl"><input type="color" data-pill-color="${kind}|${esc(n)}" value="${c}"><button type="button" data-pill-reset="${kind}|${esc(n)}" class="ghost-btn"${map[kind]?.[n] ? "" : " disabled"}>Auto</button></span></div>`; };
   const part = (label, kind, names) => `<h4 class="mgmt-sub">${label}</h4>${names.length ? names.map((n) => row(kind, n)).join("") : "<p class='muted'>None yet.</p>"}`;
-  return `<p class="muted">Every project, project status and person role gets its own pill colour. The starting colours are automatic — pick a swatch to override one, or Auto to go back. Colours sync across your devices.</p>${part("Projects", "projects", groups.projects)}${part("Project statuses", "statuses", groups.statuses)}${part("People roles", "roles", groups.roles)}`;
-}
-function pillColorSummary() {
-  const map = pillColors();
-  const n = ["projects", "statuses", "roles"].reduce((a, k) => a + Object.keys(map[k] ?? {}).length, 0);
-  return n ? `${n} custom` : "All automatic";
+  return `<h4 class="mgmt-sub">Pill colours</h4><p class="muted">Every project, project status and person role gets its own pill colour. The starting colours are automatic — pick a swatch to override one, or Auto to go back. Colours sync across your devices.</p>${part("Projects", "projects", groups.projects)}${part("Project statuses", "statuses", groups.statuses)}${part("People roles", "roles", groups.roles)}`;
 }
 function clusterColor(name) {
   return pillColorFor("projects", name);
@@ -4364,7 +4359,6 @@ function renderManagement() {
   ${sec("appearance", "Appearance", esc(themeLabel), `
   <p class="muted">Current theme: <b>${esc(themeLabel)}</b></p>
   <div class="theme-grid">${THEMES.map(([v, label]) => `<button data-theme-btn="${v}" ${v === currentTheme ? "disabled" : ""}>${label}</button>`).join("")}</div>`)}
-  ${sec("colors", "Colours", pillColorSummary(), pillColorsBody())}
   ${sec("tabs", "Tabs", `${order.length} tabs \u00b7 ${prefs.groups.length} groups`, `
   <h4 class="mgmt-sub">Order</h4><p class="muted">Drag tabs to reorder them, then save.</p>
   <ul data-tab-order-list>${order.map((tid) => `<li draggable="true" data-tab-order-item="${tid}">\u2630 ${esc(tabLabel(tid))}</li>`).join("")}</ul>
@@ -4382,7 +4376,7 @@ function renderManagement() {
     ${vocabValues(ot, f).map((v) => `<form data-fv-rename class="form inline mgmt-vrow"><input type="hidden" name="objectType" value="${ot}"><input type="hidden" name="field" value="${f}"><input type="hidden" name="old" value="${esc(v)}"><span class="mgmt-vname">${esc(v)}</span><input name="new" value="${esc(v)}"><button type="button" class="vrow-edit ghost-btn" data-vrow-edit>Edit</button><button class="vrow-save primary-btn">Save</button><button type="button" class="vrow-cancel ghost-btn" data-vrow-cancel>Cancel</button><button type="button" class="vrow-del ghost-btn" data-fv-delete="${ot}|${f}|${esc(v)}">Delete</button></form>`).join("")}
     <form data-fv-add class="form inline mgmt-vrow"><input type="hidden" name="objectType" value="${ot}"><input type="hidden" name="field" value="${f}"><input name="value" placeholder="New value"><button>Add</button></form>`).join("")}
   <h4 class="mgmt-sub">Tags</h4><p class="muted">Renaming a tag renames it on every item using it; deleting removes it from every item using it.</p>
-  ${allTags.map((t) => `<form data-tag-rename class="form inline mgmt-vrow"><input type="hidden" name="old" value="${esc(t)}"><span class="mgmt-vname">${esc(t)}</span><input name="new" value="${esc(t)}"><button type="button" class="vrow-edit ghost-btn" data-vrow-edit>Edit</button><button class="vrow-save primary-btn">Save</button><button type="button" class="vrow-cancel ghost-btn" data-vrow-cancel>Cancel</button><button type="button" class="vrow-del ghost-btn" data-tag-delete="${esc(t)}">Delete</button></form>`).join("") || "<p class='muted'>No tags yet.</p>"}`)}
+  ${allTags.map((t) => `<form data-tag-rename class="form inline mgmt-vrow"><input type="hidden" name="old" value="${esc(t)}"><span class="mgmt-vname">${esc(t)}</span><input name="new" value="${esc(t)}"><button type="button" class="vrow-edit ghost-btn" data-vrow-edit>Edit</button><button class="vrow-save primary-btn">Save</button><button type="button" class="vrow-cancel ghost-btn" data-vrow-cancel>Cancel</button><button type="button" class="vrow-del ghost-btn" data-tag-delete="${esc(t)}">Delete</button></form>`).join("") || "<p class='muted'>No tags yet.</p>"}${pillColorsBody()}`)}
   ${sec("templates", "Templates", `${getTemplates().length} saved`, `
   <p class="muted">Prefilled skeletons offered in the New task / New note forms. Stored in the app and synced like everything else.</p>
   ${getTemplates().map((t) => `<p class="tpl-row"><strong>${esc(t.name)}</strong> <span class="muted">${esc(t.kind)}</span> <button data-tpl-del="${t.id}" class="ghost-btn">Delete</button></p>`).join("") || "<p class='muted'>No templates yet.</p>"}
