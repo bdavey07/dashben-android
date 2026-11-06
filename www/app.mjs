@@ -1985,6 +1985,14 @@ function bulkBarHtml() {
   return `<div class="bulk-bar"><b>${n} selected</b><button data-bulk-action="complete" class="primary-btn">Complete</button><button data-bulk-action="postpone" class="ghost-btn">Postpone +1d</button><button data-bulk-action="archive" class="danger-btn">Archive</button><button data-bulk-action="clear" class="ghost-btn">Clear</button></div>`;
 }
 
+// Dashboard and Daily task lists sort priority-first (Ben, Nov 6
+// 2026): within each date group, P1..P4 then no priority. The sort is
+// stable, so the underlying openTasks order (due date, then added)
+// breaks ties.
+function sortByPrio(list) {
+  const rank = (p) => ({ P1: 1, P2: 2, P3: 3, P4: 4 })[p] ?? 5;
+  return [...list].sort((a, b) => rank(a.priority) - rank(b.priority));
+}
 function taskRow(t, opts = {}) {
   const today = todayToronto();
   const overdue = !!t.due_date && t.due_date < today;
@@ -2008,7 +2016,7 @@ function taskRow(t, opts = {}) {
     ${t.priority ? `<span class="prio">${esc(t.priority)}</span>` : ""}
     ${t.project ? `<span class="project-pill">${esc(t.project)}</span>` : ""}
     ${opts.carry ? `<button data-carry-today="${t.id}" class="ghost-btn">→ Today</button>` : ""}
-    ${opts.snooze ? `<button data-snooze-days="1" data-snooze-task="${t.id}" class="ghost-btn">→ Tmrw</button><button data-snooze-days="7" data-snooze-task="${t.id}" class="ghost-btn">→ +1wk</button>` : ""}
+    ${opts.snooze ? `<button data-snooze-days="1" data-snooze-task="${t.id}" class="ghost-btn">+ 1 day</button><button data-snooze-days="7" data-snooze-task="${t.id}" class="ghost-btn">→ +1wk</button>` : ""}
     <span class="due${overdue ? " overdue" : ""}">${t.due_date ? t.due_date : "No due date"}</span>
   </div>`;
 }
@@ -3946,8 +3954,8 @@ function splitSchedule(body) {
 function renderDaily() {
   const date = state.dailyDate || todayToronto();
   const note = dailyNoteFor(date);
-  const todos = openTasks().filter((t) => t.due_date === date);
-  const overdue = openTasks().filter((t) => t.due_date && t.due_date < date);
+  const todos = sortByPrio(openTasks().filter((t) => t.due_date === date));
+  const overdue = sortByPrio(openTasks().filter((t) => t.due_date && t.due_date < date));
   let body = "";
   if (note) {
     const { schedule, notes } = splitSchedule(note.body_markdown ?? "");
@@ -4096,8 +4104,8 @@ function weatherPanel() {
 function dailyWorkspacePanel() {
   const today = todayToronto();
   const note = dailyNoteFor(today);
-  const overdue = openTasks().filter((t) => t.due_date && t.due_date < today);
-  const dueToday = openTasks().filter((t) => t.due_date === today);
+  const overdue = sortByPrio(openTasks().filter((t) => t.due_date && t.due_date < today));
+  const dueToday = sortByPrio(openTasks().filter((t) => t.due_date === today));
   let inner = "";
   if (note) {
     const { schedule, notes } = splitSchedule(note.body_markdown ?? "");
@@ -4119,10 +4127,10 @@ function upcomingPanel() {
   const d = new Date(today + "T12:00:00");
   const addDays = (n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x.toISOString().slice(0, 10); };
   const tomorrow = addDays(1), weekEnd = addDays(7);
-  const dueTomorrow = openTasks().filter((t) => t.due_date === tomorrow);
-  const dueWeek = openTasks().filter((t) => t.due_date && t.due_date > tomorrow && t.due_date <= weekEnd);
+  const dueTomorrow = sortByPrio(openTasks().filter((t) => t.due_date === tomorrow));
+  const dueWeek = sortByPrio(openTasks().filter((t) => t.due_date && t.due_date > tomorrow && t.due_date <= weekEnd));
   const section = (label, list) => `<h4>${label} (${list.length})</h4>${list.length ? list.map((t) => taskRow(t, { snooze: true })).join("") : "<p class='muted'>None.</p>"}`;
-  const dueToday = openTasks().filter((t) => t.due_date === today);
+  const dueToday = sortByPrio(openTasks().filter((t) => t.due_date === today));
   return `<div class="panel"><h3>Upcoming</h3>
   ${section("Due Today", dueToday)}
   ${section("Due Tomorrow", dueTomorrow)}
