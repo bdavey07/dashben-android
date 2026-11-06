@@ -510,9 +510,24 @@ function syncBtnLabel(txt) {
   if (span) span.textContent = txt;
   else b.textContent = txt;
 }
+
+// Retry backoff (reliability round 2): a failed sync cycle
+// schedules its own retry — 15 s, doubling to a 5-minute cap —
+// until a clean cycle clears it.
+let retryTimer = null;
+let retryCount = 0;
+function noteSyncResult(ok) {
+  if (ok) { retryCount = 0; if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; } return; }
+  retryCount += 1;
+  if (retryTimer) return;
+  const delay = Math.min(15000 * (2 ** (retryCount - 1)), 300000);
+  retryTimer = setTimeout(() => { retryTimer = null; void doSync(); }, delay);
+}
+
 async function doSync() {
   if (state.syncing) return;
   state.syncing = true;
+  let cycleOk = false;
   const btn = $("#sync-btn");
   btn.disabled = true;
   syncBtnLabel("Syncing…");
@@ -522,6 +537,7 @@ async function doSync() {
       state.booted = true;
       state.lastSync = new Date().toLocaleTimeString();
       state.lastError = null;
+      cycleOk = true;
     } else {
       // Honest status (reliability batch): the report is consumed,
       // not discarded. A cycle with per-change errors or conflicts
@@ -535,12 +551,14 @@ async function doSync() {
         state.lastSync = new Date().toLocaleTimeString();
         state.lastError = null;
       }
+      cycleOk = (report.errors?.length ?? 0) === 0;
     }
     state.searchDirty = true;
   } catch (e) {
     state.lastError = e.message;
   }
   state.syncing = false;
+  noteSyncResult(cycleOk);
   btn.disabled = false;
   syncBtnLabel("Sync now");
   render();
@@ -560,7 +578,22 @@ async function doSync() {
 // nothing local is deleted.
 async function doFullSync() {
   try {
-    if (state.booted) { try { await state.engine.sync(state.transport); } catch { /* best-effort push; snapshot still fixes missing rows */ } }
+    if (state.booted) {
+      try { await state.engine.sync(state.transport); } catch { /* best-effort push; snapshot still fixes missing rows */ }
+      // Recovery guard (reliability round 2): with edits still
+      // waiting, rebuilding would swap the rows they touch back to
+      // the server copies until the next sync. Hold off and arm —
+      // a second Re-download tap proceeds anyway.
+      const outN = state.engine.outboxCount();
+      const confN = state.engine.listConflicts().length;
+      if ((outN > 0 || confN > 0) && !state.redownloadArmed) {
+        state.redownloadArmed = true;
+        state.lastError = `Re-download held off: ${outN} change${outN === 1 ? "" : "s"} waiting to sync, ${confN} edit${confN === 1 ? "" : "s"} need review. Tap Re-download again to rebuild anyway.`;
+        render();
+        return;
+      }
+      state.redownloadArmed = false;
+    }
     await state.engine.firstSync(state.transport);
     state.booted = true;
     state.lastSync = new Date().toLocaleTimeString();
@@ -583,13 +616,13 @@ async function runHealthCheck() {
   const outbox = count("sync_outbox");
   const conflicts = count("sync_conflicts");
   const rows = [];
-  let mismatches = 0, errors = 0;
+  let mismatches = 0, errors = 0, logFailures = 0;
   for (const t of SYNC_TABLES) {
     const lc = count(t);
     let sc = null;
     try {
       let cursor = null, total = 0, guard = 0;
-      do { const page = await state.transport.snapshot(t, cursor); total += (page.rows ?? []).length; cursor = page.next_cursor; } while (cursor && ++guard < 60);
+      do { const page = await state.transport.snapshot(t, cursor); if (typeof page.log_failures === "number") logFailures = page.log_failures; total += (page.rows ?? []).length; cursor = page.next_cursor; } while (cursor && ++guard < 60);
       sc = total;
     } catch { errors++; }
     if (sc === null) { rows.push(`<p class="muted">${esc(t)}: this device ${lc ?? "?"} \u00b7 server unreachable</p>`); continue; }
@@ -599,10 +632,10 @@ async function runHealthCheck() {
   }
   const verdict = errors
     ? `Could not reach the server for ${errors} table(s) \u2014 check the connection and token.`
-    : (mismatches === 0 && (outbox ?? 0) === 0 && (conflicts ?? 0) === 0)
+    : (mismatches === 0 && (outbox ?? 0) === 0 && (conflicts ?? 0) === 0 && logFailures === 0)
       ? "In sync \u2014 every table matches the server, nothing waiting to upload, no conflicts."
       : "Differences found \u2014 if edits are waiting, Sync now; if they persist with an empty outbox, Re-download everything rebuilds from the server.";
-  state.healthHtml = `<div class="health-box"><p><b>Health check</b> <span class="muted">${new Date().toLocaleTimeString()}</span></p><p>${verdict}</p><p class="muted">Waiting to upload: ${outbox ?? "?"} \u00b7 Conflicts: ${conflicts ?? "?"} \u00b7 Last sync: ${state.lastSync ?? "not yet this session"}</p>${rows.join("")}</div>`;
+  state.healthHtml = `<div class="health-box"><p><b>Health check</b> <span class="muted">${new Date().toLocaleTimeString()}</span></p><p>${verdict}</p><p class="muted">Waiting to upload: ${outbox ?? "?"} \u00b7 Conflicts: ${conflicts ?? "?"} \u00b7 Last sync: ${state.lastSync ?? "not yet this session"}${logFailures ? ` · Server sync-log failures recorded: ${logFailures}` : ""}</p>${rows.join("")}</div>`;
   render();
 }
 
@@ -3939,9 +3972,29 @@ async function boot() {
   void checkWidgetAction();
 }
 
-boot().catch((e) => {
+// Reliability round 2 — cross-tab single-writer guard. Two tabs
+// of this app each hold a whole in-memory database and persist it
+// back to the same store, so they can silently overwrite each
+// other. The first tab holds a Web Locks lease for its lifetime;
+// a second tab waits with a plain explanation and boots on its own
+// once the first tab closes (the lease releases on tab death,
+// crash included). No Web Locks → boot as before. In the Android
+// shell there is only ever one WebView, so the lease is
+// uncontended and boot is immediate.
+function showBootError(e) {
   document.querySelector("#main").innerHTML = `<p class="error">Failed to start: ${esc(e.message)}</p>`;
-});
+}
+function bootAsOwner() {
+  if (!navigator.locks?.request) { void boot().catch(showBootError); return; }
+  const mainEl = document.querySelector("#main");
+  if (mainEl) mainEl.innerHTML = `<div class="panel"><h3>Already open in another tab</h3><p class="muted">This tab is waiting so the two copies can't overwrite each other. It starts on its own when the other tab closes.</p></div>`;
+  navigator.locks.request("pkm-local-db", async () => {
+    try { await boot(); } catch (e) { showBootError(e); return; }
+    await new Promise(() => {});
+  });
+}
+bootAsOwner();
+
 
 // --- Parity P2/P3/P4/P6: Daily, Management, custom types, FTS, themes ---
 const DEFAULT_TABS = ["dashboard", "daily", "calendar", "tasks", "notes", "projects", "reading", "feed", "people", "inbox", "search", "management"]; // Review tab removed on mobile (stamp bc)

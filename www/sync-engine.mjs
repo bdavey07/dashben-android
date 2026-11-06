@@ -37,15 +37,22 @@ export function idColumn(table) {
   return "id";
 }
 
+// Composite row ids URI-encode each component (reliability round
+// 2): a component containing "|" (a tag named "a|b") used to produce
+// an id no parser could split back. compositeWhere decodes with a
+// raw fallback, so ids written before this change still resolve.
+const encPart = (v) => encodeURIComponent(String(v ?? ""));
+const decPart = (s) => { try { return decodeURIComponent(s); } catch { return s; } };
+
 export function rowIdFor(table, row) {
-  if (table === "relations") return [row.from_type, row.from_id, row.to_type, row.to_id, row.relation_name].join("|");
-  if (table === "object_tags") return [row.object_type, row.object_id, row.tag].join("|");
-  if (table === "field_values") return [row.object_type, row.field, row.value].join("|");
+  if (table === "relations") return [row.from_type, row.from_id, row.to_type, row.to_id, row.relation_name].map(encPart).join("|");
+  if (table === "object_tags") return [row.object_type, row.object_id, row.tag].map(encPart).join("|");
+  if (table === "field_values") return [row.object_type, row.field, row.value].map(encPart).join("|");
   return String(row[idColumn(table)]);
 }
 
 function compositeWhere(table, rowId) {
-  const parts = rowId.split("|");
+  const parts = rowId.split("|").map(decPart);
   if (table === "relations") {
     if (parts.length !== 5) throw new Error(`Bad relations row_id: ${rowId}`);
     return { clause: "from_type=? AND from_id=? AND to_type=? AND to_id=? AND relation_name=?", vals: parts };
@@ -338,6 +345,27 @@ export class SyncEngine {
         } else {
           report.errors.push({ client_change_id: o.client_change_id, error: "No result for change." });
         }
+      }
+      // tag_vocab id adoption (round 2): the server adopted or
+      // assigned a real id for a temp negative-id vocab row. The
+      // re-pull above already delivered the server row under its
+      // real id, so drop the temp row and point any still-queued
+      // changes and conflicts at the adopted id.
+      for (const r of res.remapped ?? []) {
+        if (r.table !== "tag_vocab" || !r.server_row) continue;
+        const fromId = String(r.from_row_id);
+        const toId = String(r.server_row.id);
+        if (fromId === toId) continue;
+        this.db.prepare("DELETE FROM tag_vocab WHERE id=?").run(Number(fromId));
+        const pend = this.db.prepare("SELECT client_change_id, row_json FROM sync_outbox WHERE table_name='tag_vocab' AND row_id=?").all(fromId);
+        for (const p2 of pend) {
+          let rj = null;
+          try { rj = p2.row_json ? JSON.parse(p2.row_json) : null; } catch { rj = null; }
+          if (rj && typeof rj === "object") rj.id = r.server_row.id;
+          this.db.prepare("UPDATE sync_outbox SET row_id=?, row_json=? WHERE client_change_id=?")
+            .run(toId, rj ? JSON.stringify(rj) : p2.row_json, p2.client_change_id);
+        }
+        this.db.prepare("UPDATE sync_conflicts SET row_id=? WHERE table_name='tag_vocab' AND row_id=?").run(toId, fromId);
       }
       this.setWatermark(relearned ? (res.seq ?? cur) : cur);
     });
