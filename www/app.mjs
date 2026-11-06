@@ -3,7 +3,7 @@
 // browser's localStorage (from earlier setup) and is never sent
 // anywhere except the sync host.
 import { SqlJsDb } from "./db-adapter.mjs";
-import { SyncEngine, SYNC_TABLES } from "./sync-engine.mjs";
+import { SyncEngine, SYNC_TABLES, localTableCounts } from "./sync-engine.mjs";
 import { LocalStore, recurrenceSummary, parseRecurrence } from "./local-store.mjs";
 import { HttpTransport } from "./transport.mjs";
 
@@ -436,9 +436,15 @@ function saveBytes(flush = false) {
 function paintSyncStatus() {
   try { const el = $("#sync-status"); if (el) el.textContent = statusLine(); } catch { /* no DOM yet */ }
 }
+let lastPersistHash = null;
+function bytesHash(bytes) { let h = 0x811c9dc5; for (let i = 0; i < bytes.length; i++) { h ^= bytes[i]; h = Math.imul(h, 0x01000193); } return bytes.length + ":" + (h >>> 0); }
 async function persistBytesNow() {
   if (!state.db) return true;
   const bytes = state.db.exportBytes();
+  // Change-aware persist (feature batch): skip both writes when the
+  // exported bytes match the last successful persist.
+  const hash = bytesHash(bytes);
+  if (hash === lastPersistHash) { if (state.persistError) { state.persistError = null; paintSyncStatus(); } return true; }
   let fileOk = !NativeFS;
   let firstErr = null;
   if (NativeFS) {
@@ -459,6 +465,7 @@ async function persistBytesNow() {
     idbOk = true;
   } catch (e) { firstErr = firstErr ?? e; }
   const ok = NativeFS ? fileOk : idbOk;
+  if (ok) lastPersistHash = hash;
   if (ok) {
     if (state.persistError) { state.persistError = null; paintSyncStatus(); }
   } else {
@@ -617,18 +624,24 @@ async function runHealthCheck() {
   const conflicts = count("sync_conflicts");
   const rows = [];
   let mismatches = 0, errors = 0, logFailures = 0;
+  let serverCounts = null;
+  try { serverCounts = await state.transport.counts(); if (typeof serverCounts?.log_failures === "number") logFailures = serverCounts.log_failures; } catch { serverCounts = null; }
+  const localCounts = localTableCounts(state.db);
   for (const t of SYNC_TABLES) {
     const lc = count(t);
-    let sc = null;
-    try {
-      let cursor = null, total = 0, guard = 0;
-      do { const page = await state.transport.snapshot(t, cursor); if (typeof page.log_failures === "number") logFailures = page.log_failures; total += (page.rows ?? []).length; cursor = page.next_cursor; } while (cursor && ++guard < 60);
-      sc = total;
-    } catch { errors++; }
+    let sc = null, revOk = true;
+    if (serverCounts?.tables?.[t]) { sc = serverCounts.tables[t].count; revOk = serverCounts.tables[t].rev === localCounts[t]?.rev; }
+    else {
+      try {
+        let cursor = null, total = 0, guard = 0;
+        do { const page = await state.transport.snapshot(t, cursor); if (typeof page.log_failures === "number") logFailures = page.log_failures; total += (page.rows ?? []).length; cursor = page.next_cursor; } while (cursor && ++guard < 60);
+        sc = total;
+      } catch { errors++; }
+    }
     if (sc === null) { rows.push(`<p class="muted">${esc(t)}: this device ${lc ?? "?"} \u00b7 server unreachable</p>`); continue; }
-    const ok = lc === sc;
+    const ok = lc === sc && revOk;
     if (!ok) mismatches++;
-    rows.push(`<p class="muted">${esc(t)}: this device ${lc ?? "?"} \u00b7 server ${sc} ${ok ? "\u2713" : "\u26a0"}</p>`);
+    rows.push(`<p class="muted">${esc(t)}: this device ${lc ?? "?"} \u00b7 server ${sc} ${ok ? "\u2713" : "\u26a0"}${lc === sc && !revOk ? " \u2014 same count, different contents" : ""}</p>`);
   }
   const verdict = errors
     ? `Could not reach the server for ${errors} table(s) \u2014 check the connection and token.`
@@ -714,6 +727,22 @@ function linkedTitles(fromType, fromId, relationName, toType) {
   const rels = state.db.prepare("SELECT to_id FROM relations WHERE from_type=? AND from_id=? AND relation_name=? AND to_type=?").all(fromType, fromId, relationName, toType);
   return rels.map((r) => ({ id: r.to_id, row: state.store.getRow(toType, r.to_id) })).filter((x) => x.row);
 }
+
+// --- Backlink excerpts (feature batch): each link shows the passage
+// that explains the connection — the mention of this item's title in
+// the other body when there is one, else the body's opening.
+function linkExcerpt(row, otherTitle) {
+  const body = String(row?.body_markdown ?? "");
+  if (!body) return "";
+  const flat = body.replace(/\s+/g, " ").trim();
+  if (!flat) return "";
+  if (otherTitle) {
+    const i = flat.toLowerCase().indexOf(String(otherTitle).toLowerCase());
+    if (i >= 0) { const s = Math.max(0, i - 50); const e = i + String(otherTitle).length + 70; return `${s > 0 ? "…" : ""}${flat.slice(s, e)}${e < flat.length ? "…" : ""}`; }
+  }
+  return flat.slice(0, 130) + (flat.length > 130 ? "…" : "");
+}
+
 function backlinks(toType, toId) {
   const rels = state.db.prepare("SELECT from_type, from_id FROM relations WHERE to_type=? AND to_id=? AND relation_name='link'").all(toType, toId);
   return rels.map((r) => ({ type: r.from_type, id: r.from_id, row: state.store.getRow(r.from_type, r.from_id) })).filter((x) => x.row);
@@ -740,6 +769,7 @@ function openPopup(title, inner, openRef) {
   </div>`;
   bindPopupForms();
   bindExtraPopupForms();
+  focusPopup();
 }
 // Clicking the backdrop saves (stamp 2026-11-04aj): an editor
 // popup submits its form exactly like Close; a create
@@ -758,7 +788,48 @@ function savePopupAndClose() {
 }
 function closePopup() {
   $("#popup-root").innerHTML = "";
+  restorePopupFocus();
 }
+// --- Accessibility (feature batch): popup focus trap + restore and
+// keyboard-operable rows.
+let lastFocusBeforePopup = null;
+function focusPopup() {
+  lastFocusBeforePopup = document.activeElement;
+  const card = $("#popup-root .popup-card");
+  if (!card) return;
+  const f = card.querySelector("input, textarea, select, button:not([disabled])");
+  (f ?? card).focus?.();
+}
+function restorePopupFocus() {
+  if (lastFocusBeforePopup && document.contains(lastFocusBeforePopup)) { try { lastFocusBeforePopup.focus(); } catch { /* element gone */ } }
+  lastFocusBeforePopup = null;
+}
+function trapPopupTab(e) {
+  if (e.key !== "Tab") return;
+  const card = document.querySelector("#popup-root .popup-card");
+  if (!card) return;
+  const items = [...card.querySelectorAll("input, textarea, select, button, a[href], [tabindex]")].filter((el) => !el.disabled && el.offsetParent !== null);
+  if (!items.length) return;
+  const first = items[0], last = items[items.length - 1];
+  if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+}
+const ROW_SELECTOR = "[data-open], [data-task], [data-note], [data-person], [data-reading], [data-project]";
+function enhanceRows() {
+  try {
+    $$("#main [data-open], #main [data-task], #main [data-note], #main [data-person], #main [data-reading], #main [data-project]").forEach((el) => {
+      if (!el.hasAttribute("tabindex")) { el.setAttribute("tabindex", "0"); el.setAttribute("role", "button"); }
+    });
+  } catch { /* enhancement only */ }
+}
+function rowKeyActivation(e) {
+  if (e.key !== "Enter" && e.key !== " ") return;
+  const row = e.target.closest?.(ROW_SELECTOR);
+  if (!row || e.target.closest("input,button,select,textarea,a")) return;
+  e.preventDefault();
+  row.click();
+}
+
 function selectHtml(name, values, current, allowEmpty = true) {
   return `<select name="${name}">${allowEmpty ? `<option value="">—</option>` : ""}${values.map((v) => `<option value="${esc(v)}" ${v === current ? "selected" : ""}>${esc(v)}</option>`).join("")}</select>`;
 }
@@ -985,9 +1056,9 @@ function bindMdEditors(root) {
     });
     ta.addEventListener("keydown", (e) => {
       const mod = e.ctrlKey || e.metaKey;
-      if (mod && !e.shiftKey && e.key.toLowerCase() === "b") { e.preventDefault(); mdApply(ta, "bold"); }
-      else if (mod && !e.shiftKey && e.key.toLowerCase() === "i") { e.preventDefault(); mdApply(ta, "italic"); }
-      else if (mod && !e.shiftKey && e.key.toLowerCase() === "k") { e.preventDefault(); mdApply(ta, "link"); }
+      if (mod && !e.shiftKey && e.key.toLowerCase() === "b") { e.preventDefault(); e.stopPropagation(); mdApply(ta, "bold"); }
+      else if (mod && !e.shiftKey && e.key.toLowerCase() === "i") { e.preventDefault(); e.stopPropagation(); mdApply(ta, "italic"); }
+      else if (mod && !e.shiftKey && e.key.toLowerCase() === "k") { e.preventDefault(); e.stopPropagation(); mdApply(ta, "link"); }
       else if (e.key === "Enter") { if (mdContinueList(ta)) { e.preventDefault(); grow(); } }
       else if (e.key === "Tab") { e.preventDefault(); const p = ta.selectionStart; ta.value = ta.value.slice(0, p) + "  " + ta.value.slice(ta.selectionEnd); ta.setSelectionRange(p + 2, p + 2); }
     });
@@ -1070,7 +1141,7 @@ function linksBlock(fromType, fromId) {
   }
   candidates.sort((a, b) => a.title.localeCompare(b.title));
   return `<h4>Links</h4>
-    ${uniq.map((l) => `<div class="row"><span class="badge">${esc(l.type)}</span><span class="row-title" data-open="${l.type}:${l.id}">${esc(l.row.title)}</span><button data-remove-link="${fromType}:${fromId}:${l.type}:${l.id}">Remove</button></div>`).join("") || "<p class='muted'>No links.</p>"}
+    ${uniq.map((l) => `<div class="row"><span class="badge">${esc(l.type)}</span><span class="row-title" data-open="${l.type}:${l.id}">${esc(l.row.title)}</span><span class="muted">${esc(linkExcerpt(l.row, state.store.getRow(fromType, fromId)?.title))}</span><button data-remove-link="${fromType}:${fromId}:${l.type}:${l.id}">Remove</button></div>`).join("") || "<p class='muted'>No links.</p>"}
     <form data-add-link="${fromType}:${fromId}" class="form inline inline-add">
       <div class="cf-combo" data-combo>
         <input type="text" data-combo-input placeholder="Search all items to link…" autocomplete="off">
@@ -1302,7 +1373,7 @@ function pageLinks(fromType, fromId) {
   });
   const refFor = (l) => l.type === "custom_objects" ? `custom:${l.row.type}:${l.id}` : `${l.type}:${l.id}`;
   return `<h4>Links</h4>
-    ${uniq.map((l) => `<div class="row"><span class="badge">${esc(l.type)}</span><span class="row-title" data-open-page="${refFor(l)}">${esc(l.row.title)}</span></div>`).join("") || "<p class='muted'>No links.</p>"}`;
+    ${uniq.map((l) => `<div class="row"><span class="badge">${esc(l.type)}</span><span class="row-title" data-open-page="${refFor(l)}">${esc(l.row.title)}</span><span class="muted">${esc(linkExcerpt(l.row, state.store.getRow(fromType, fromId)?.title))}</span></div>`).join("") || "<p class='muted'>No links.</p>"}`;
 }
 function pageSubtasks(subtasksJson) {
   let subs = [];
@@ -1472,6 +1543,7 @@ function render() {
   if (state.itemView) { bindPopupForms($("#main")); bindExtraPopupForms($("#main")); }
   if (state.booted && !state.itemView && state.tab === "daily") cacheBootHtml(JSON.stringify({ tab: state.tab, html: main.innerHTML }));
   pushNav();
+  enhanceRows();
 }
 
 // --- Family calendar (stamp 2026-11-04ai) ---
@@ -1763,14 +1835,28 @@ function restoreConflict(id) {
   } catch (e) { state.lastError = String(e?.message ?? e); render(); }
 }
 
+
+// --- Collapsible secondary panels (feature batch): weather, family
+// calendar and the Daily "On this day" context can be folded away;
+// the choice persists per panel in ui_prefs. Primary content (tasks,
+// daily note, quick capture) is never wrapped.
+function panelOpen(id, dflt = true) {
+  try { const raw = state.store.getPref("panel_state"); if (raw) { const m = JSON.parse(raw); if (typeof m[id] === "boolean") return m[id]; } } catch { /* default */ }
+  return dflt;
+}
+function collapsible(id, title, html, dflt = true) {
+  if (!html) return "";
+  return `<details class="panel collapsible" data-panel-id="${id}" ${panelOpen(id, dflt) ? "open" : ""}><summary>${esc(title)}</summary>${html}</details>`;
+}
+
 function renderDashboard() {
   return `${weatherLineHtml()}
   ${pinnedPanel()}
   ${upcomingPanel()}
-  ${familyPanel()}
+  ${collapsible("dash-family", "Family calendar", familyPanel())}
   ${inboxPanel()}
   ${conflictsPanelHtml()}
-  <div class="panel"><form data-dash-search class="form"><input name="q" placeholder="Search DashBen…" style="flex:1"><button>Search</button></form></div>
+  <div class="panel"><form data-dash-search class="form"><input name="q" placeholder="Search DashBen…" style="flex:1" aria-label="Search DashBen"><button>Search</button></form></div>
 `;
 }
 
@@ -2483,7 +2569,7 @@ function renderInbox() {
   return `<div class="panel"><h3>Capture</h3><form data-capture class="form"><input name="title" placeholder="Title (optional)"><textarea name="body" rows="3" placeholder="Capture… a pasted link files to Reading; start with task: to make a task"></textarea><input type="file" name="photo" accept="image/*,.pdf,.txt,.md,.csv,.doc,.docx,.rtf" multiple><button class="primary-btn">Capture</button></form></div>
   ${bulk ? `<div class="panel bulk-bar"><strong>${sel.size} selected</strong> <button data-inbox-bulk-move class="primary-btn">Move to notes</button> <button data-inbox-bulk-archive class="danger-btn">Archive</button> <button data-inbox-bulk-clear class="ghost-btn">Clear</button></div>` : ""}
   <div class="panel"><div class="sel-head"><h3>Inbox (${items.length})</h3><button data-inbox-bulk-toggle class="toggle-btn${bulk ? " active" : ""}">${bulk ? "Done selecting" : "Select"}</button></div>
-  ${items.map((i) => `<div class="row" data-inbox="${i.id}">${bulk ? `<input type="checkbox" data-inbox-sel="${i.id}"${sel.has(i.id) ? " checked" : ""}> ` : ""}<span class="row-title">${esc(i.title)}${photoInd(photoCounts, i.id)}</span><span class="muted">${esc((i.body_markdown ?? "").slice(0, 80))}</span><button data-archive-inbox="${i.id}">Archive</button></div>`).join("") || "<p class='muted'>Inbox empty.</p>"}</div>`;
+  ${items.map((i) => `<div class="row" data-inbox="${i.id}">${bulk ? `<input type="checkbox" data-inbox-sel="${i.id}"${sel.has(i.id) ? " checked" : ""}> ` : ""}<span class="row-title">${esc(i.title)}${photoInd(photoCounts, i.id)}</span><span class="muted">${esc((i.body_markdown ?? "").slice(0, 80))}</span><button data-inbox-to-note="${i.id}">→ Note</button><button data-inbox-to-task="${i.id}">→ Task</button><button data-archive-inbox="${i.id}">Archive</button></div>`).join("") || "<p class='muted'>Inbox empty.</p>"}</div>`;
 }
 
 function renderPeople() {
@@ -2524,25 +2610,97 @@ function renderProjects() {
   ${ordered.map(([g, list]) => `<details class="group" open><summary>${esc(g)} (${list.length})</summary>${list.map((r) => `<div class="row" data-project="${r.id}"><span class="row-title">${esc(r.title)}</span>${r.status ? `<span class="project-pill"${pillStyle("statuses", r.status)}>${esc(r.status)}</span>` : ""}${r.category ? `<span class="muted">${esc(r.category)}</span>` : ""}</div>`).join("")}</details>`).join("") || "<p class='muted'>Nothing here yet.</p>"}`;
 }
 
+
+// --- Search upgrades (feature batch): <mark> highlighting, type
+// filter chips, and a recently-opened list fed by every item open.
+function hlText(text, terms) {
+  const raw = String(text ?? "");
+  if (!terms?.length) return esc(raw);
+  const lower = raw.toLowerCase();
+  const spans = [];
+  for (const term of terms) {
+    if (!term) continue;
+    let i = 0;
+    while ((i = lower.indexOf(term, i)) >= 0) { spans.push([i, i + term.length]); i += term.length; }
+  }
+  if (!spans.length) return esc(raw);
+  spans.sort((a, b) => a[0] - b[0]);
+  const merged = [];
+  for (const s of spans) { const last = merged[merged.length - 1]; if (last && s[0] <= last[1]) last[1] = Math.max(last[1], s[1]); else merged.push([...s]); }
+  let out = "", pos = 0;
+  for (const [a, b] of merged) { out += esc(raw.slice(pos, a)) + "<mark>" + esc(raw.slice(a, b)) + "</mark>"; pos = b; }
+  return out + esc(raw.slice(pos));
+}
+const SEARCH_TYPES = [["tasks", "Tasks"], ["notes", "Notes"], ["people", "People"], ["projects", "Projects"], ["reading_items", "Reading"], ["inbox_items", "Inbox"], ["custom_objects", "Custom"]];
+function recentOpens() {
+  try { const v = JSON.parse(state.store.getPref("recent_opens") || "[]"); return Array.isArray(v) ? v : []; } catch { return []; }
+}
+function noteRecentOpen(type, id) {
+  if (!type || !id) return;
+  const ref = `${type}:${id}`;
+  const list = recentOpens().filter((r) => r !== ref);
+  list.unshift(ref);
+  try { state.store.setPref("recent_opens", JSON.stringify(list.slice(0, 12))); } catch { /* prefs are best-effort */ }
+}
+function searchFilterValue() {
+  if (state.searchFilter === undefined) state.searchFilter = state.store.getPref("search_filter") || "all";
+  return state.searchFilter;
+}
+function searchResultRow(r, terms) {
+  const label = SEARCH_TYPES.find(([v]) => v === r.object_type)?.[1] ?? r.object_type;
+  return `<div class="row"><span class="badge">${esc(label)}</span><span class="row-title" data-open="${r.object_type}:${r.object_id}">${hlText(r.title, terms)}</span>${r.snippet ? `<span class="muted">${hlText(r.snippet, terms)}</span>` : ""}</div>`;
+}
+function recentOpensHtml() {
+  const items = recentOpens().map((ref) => {
+    const i = ref.indexOf(":");
+    const type = ref.slice(0, i), id = ref.slice(i + 1);
+    const row = state.store.getRow(type, id);
+    return row ? { object_type: type, object_id: id, title: row.title ?? "(untitled)", snippet: "" } : null;
+  }).filter(Boolean);
+  if (!items.length) return "";
+  return `<p class="muted">Recently opened</p>` + items.map((r) => searchResultRow(r, [])).join("");
+}
+
+// --- Saved views (feature batch): named standing searches (query +
+// type filter) stored in ui_prefs, applied from the Search tab.
+function savedViews() {
+  try { const v = JSON.parse(state.store.getPref("saved_views") || "[]"); return Array.isArray(v) ? v : []; } catch { return []; }
+}
+function storeSavedViews(list) { try { state.store.setPref("saved_views", JSON.stringify(list)); } catch { /* best-effort */ } }
+function savedViewsHtml() {
+  const views = savedViews();
+  const chips = views.map((v) => `<span class="toggle-group"><button type="button" class="toggle-btn" data-view-apply="${v.id}">${esc(v.name)}</button><button type="button" class="toggle-btn" data-view-del="${v.id}" aria-label="Delete view">×</button></span>`).join("");
+  const saveForm = state.showViewSave ? `<form data-view-save-form class="form"><input name="name" placeholder="View name (e.g. Waiting)" aria-label="View name"><button>Save view</button></form>` : `<button type="button" class="toggle-btn" data-view-save-toggle>＋ Save current search as a view</button>`;
+  return `<div class="form">${chips}${saveForm}</div>`;
+}
+
 function renderSearch() {
-  return `<form data-search class="form"><input name="q" placeholder="Search titles and bodies" id="search-input"><button>Search</button></form>
-  <div id="search-results"><p class="muted">Search runs against the local database only — no network.</p></div>`;
+  const filter = searchFilterValue();
+  const chips = [["all", "All"], ...SEARCH_TYPES].map(([v, l]) => `<button type="button" class="toggle-btn ${filter === v ? "active" : ""}" data-search-filter="${v}">${l}</button>`).join("");
+  return `<form data-search class="form"><input name="q" placeholder="Search titles and bodies" id="search-input" aria-label="Search titles and bodies"><button>Search</button></form>
+  <div class="form">${chips}</div>
+  ${savedViewsHtml()}
+  <div id="search-results">${recentOpensHtml() || `<p class="muted">Search runs against the local database only — no network.</p>`}</div>`;
 }
 
 function runSearch(q) {
-  let html = null;
-  try { html = runSearchTokens(q); } catch { html = null; }
-  if (html !== null && html.length) {
-    $("#search-results").innerHTML = html.join("");
-    return;
+  state.lastSearchQ = q;
+  const terms = tokenize(q);
+  const filter = searchFilterValue();
+  let results = null;
+  try { results = runSearchTokens(q); } catch { results = null; }
+  if (!results) {
+    const like = `%${q}%`;
+    results = [];
+    for (const [table] of SEARCH_TYPES) {
+      if (table === "custom_objects") continue;
+      const rows = state.db.prepare(`SELECT id, title FROM ${table} WHERE archived=0 AND (title LIKE ? OR body_markdown LIKE ?) LIMIT 20`).all(like, like);
+      for (const r of rows) results.push({ object_type: table, object_id: r.id, title: r.title, snippet: searchSnippet(table, r.id, terms) });
+    }
   }
-  const like = `%${q}%`;
-  const out = [];
-  for (const [table, label] of [["tasks", "Task"], ["notes", "Note"], ["people", "Person"], ["projects", "Project"], ["reading_items", "Reading"]]) {
-    const rows = state.db.prepare(`SELECT id, title FROM ${table} WHERE archived=0 AND (title LIKE ? OR body_markdown LIKE ?) LIMIT 20`).all(like, like);
-    for (const r of rows) out.push(`<div class="row"><span class="badge">${label}</span><span class="row-title" data-open="${table}:${r.id}">${esc(r.title)}</span></div>`);
-  }
-  $("#search-results").innerHTML = out.join("") || "<p class='muted'>No matches.</p>";
+  if (filter !== "all") results = results.filter((r) => r.object_type === filter);
+  const el = $("#search-results");
+  if (el) el.innerHTML = results.length ? results.map((r) => searchResultRow(r, terms)).join("") : "<p class='muted'>No matches.</p>";
 }
 
 
@@ -2836,6 +2994,19 @@ function bindMainForms() {
   $$("[data-search]").forEach((f) => f.addEventListener("submit", (e) => {
     e.preventDefault();
     runSearch(new FormData(f).get("q") || "");
+  }));
+  $$("[data-view-save-form]").forEach((f) => f.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const name = String(new FormData(f).get("name") || "").trim();
+    if (!name) return;
+    const views = savedViews();
+    views.push({ id: `v${Date.now().toString(36)}`, name, q: state.lastSearchQ || $("#search-input")?.value || "", filter: searchFilterValue() });
+    storeSavedViews(views);
+    state.showViewSave = false;
+    render();
+    const inp = $("#search-input");
+    if (inp && state.lastSearchQ) { inp.value = state.lastSearchQ; runSearch(state.lastSearchQ); }
+    saveBytes();
   }));
   $$("[data-dash-search]").forEach((f) => f.addEventListener("submit", (e) => {
     e.preventDefault();
@@ -3670,9 +3841,69 @@ function attachPersistentListeners() {
     if (dupTask) { duplicateTask(dupTask.dataset.duplicateTask); return; }
     const dupNote = e.target.closest("[data-duplicate-note]");
     if (dupNote) { duplicateNote(dupNote.dataset.duplicateNote); return; }
+    const rHist = e.target.closest("[data-restore-history]");
+    if (rHist) {
+      try { state.store.engine.restoreHistory(Number(rHist.dataset.restoreHistory)); state.searchDirty = true; toast("Restored"); } catch (err) { toast(String(err?.message ?? err)); }
+      render(); saveBytes();
+      return;
+    }
+    const unarch = e.target.closest("[data-unarchive-item]");
+    if (unarch) {
+      const raw = unarch.dataset.unarchiveItem;
+      const i = raw.indexOf(":");
+      try { state.store.unarchiveObject(raw.slice(0, i), raw.slice(i + 1)); state.searchDirty = true; toast("Unarchived"); } catch (err) { toast(String(err?.message ?? err)); }
+      render(); saveBytes();
+      return;
+    }
+    const iNote = e.target.closest("[data-inbox-to-note]");
+    if (iNote) { const item = state.store.getRow("inbox_items", iNote.dataset.inboxToNote); if (item) openMoveCategoryPrompt(item, "list"); return; }
+    const iTask = e.target.closest("[data-inbox-to-task]");
+    if (iTask) {
+      const item = state.store.getRow("inbox_items", iTask.dataset.inboxToTask);
+      if (item) {
+        try {
+          state.engine.txn(() => {
+            const task = state.store.createTask({ title: item.title || (item.body_markdown ?? "").split("\n")[0].slice(0, 60), body: item.body_markdown ?? "", due: todayToronto() });
+            if (task) state.store.reassignAttachments("inbox_items", item.id, "tasks", task.id);
+            state.store.archiveObject("inbox_items", item.id);
+          });
+          state.searchDirty = true; toast("Moved to Tasks");
+        } catch (err) { toast(String(err?.message ?? err)); }
+      }
+      render(); saveBytes();
+      return;
+    }
+    const vApply = e.target.closest("[data-view-apply]");
+    if (vApply) {
+      const v = savedViews().find((x) => x.id === vApply.dataset.viewApply);
+      if (v) {
+        state.searchFilter = v.filter || "all";
+        try { state.store.setPref("search_filter", state.searchFilter); } catch { /* best-effort */ }
+        render();
+        const inp = $("#search-input");
+        if (inp) inp.value = v.q || "";
+        runSearch(v.q || "");
+      }
+      return;
+    }
+    const vDel = e.target.closest("[data-view-del]");
+    if (vDel) { storeSavedViews(savedViews().filter((x) => x.id !== vDel.dataset.viewDel)); render(); const inp2 = $("#search-input"); if (inp2 && state.lastSearchQ) { inp2.value = state.lastSearchQ; runSearch(state.lastSearchQ); } return; }
+    const vToggle = e.target.closest("[data-view-save-toggle]");
+    if (vToggle) { state.showViewSave = !state.showViewSave; const q0 = $("#search-input")?.value || state.lastSearchQ || ""; render(); const inp3 = $("#search-input"); if (inp3 && q0) inp3.value = q0; return; }
+    const sFilter = e.target.closest("[data-search-filter]");
+    if (sFilter) {
+      const q = $("#search-input")?.value || "";
+      state.searchFilter = sFilter.dataset.searchFilter;
+      try { state.store.setPref("search_filter", state.searchFilter); } catch { /* best-effort */ }
+      render();
+      const inp = $("#search-input");
+      if (inp && q) { inp.value = q; runSearch(q); }
+      return;
+    }
     const open = e.target.closest("[data-open]");
     if (open) {
       const [type, id] = open.dataset.open.split(":");
+      noteRecentOpen(type, id);
       openPopupByRef(type, id);
       return;
     }
@@ -3742,9 +3973,69 @@ function attachPersistentListeners() {
       render(); saveBytes(); openPopupByRef(fromType, fromId);
       return;
     }
+    const rHist = e.target.closest("[data-restore-history]");
+    if (rHist) {
+      try { state.store.engine.restoreHistory(Number(rHist.dataset.restoreHistory)); state.searchDirty = true; toast("Restored"); } catch (err) { toast(String(err?.message ?? err)); }
+      render(); saveBytes();
+      return;
+    }
+    const unarch = e.target.closest("[data-unarchive-item]");
+    if (unarch) {
+      const raw = unarch.dataset.unarchiveItem;
+      const i = raw.indexOf(":");
+      try { state.store.unarchiveObject(raw.slice(0, i), raw.slice(i + 1)); state.searchDirty = true; toast("Unarchived"); } catch (err) { toast(String(err?.message ?? err)); }
+      render(); saveBytes();
+      return;
+    }
+    const iNote = e.target.closest("[data-inbox-to-note]");
+    if (iNote) { const item = state.store.getRow("inbox_items", iNote.dataset.inboxToNote); if (item) openMoveCategoryPrompt(item, "list"); return; }
+    const iTask = e.target.closest("[data-inbox-to-task]");
+    if (iTask) {
+      const item = state.store.getRow("inbox_items", iTask.dataset.inboxToTask);
+      if (item) {
+        try {
+          state.engine.txn(() => {
+            const task = state.store.createTask({ title: item.title || (item.body_markdown ?? "").split("\n")[0].slice(0, 60), body: item.body_markdown ?? "", due: todayToronto() });
+            if (task) state.store.reassignAttachments("inbox_items", item.id, "tasks", task.id);
+            state.store.archiveObject("inbox_items", item.id);
+          });
+          state.searchDirty = true; toast("Moved to Tasks");
+        } catch (err) { toast(String(err?.message ?? err)); }
+      }
+      render(); saveBytes();
+      return;
+    }
+    const vApply = e.target.closest("[data-view-apply]");
+    if (vApply) {
+      const v = savedViews().find((x) => x.id === vApply.dataset.viewApply);
+      if (v) {
+        state.searchFilter = v.filter || "all";
+        try { state.store.setPref("search_filter", state.searchFilter); } catch { /* best-effort */ }
+        render();
+        const inp = $("#search-input");
+        if (inp) inp.value = v.q || "";
+        runSearch(v.q || "");
+      }
+      return;
+    }
+    const vDel = e.target.closest("[data-view-del]");
+    if (vDel) { storeSavedViews(savedViews().filter((x) => x.id !== vDel.dataset.viewDel)); render(); const inp2 = $("#search-input"); if (inp2 && state.lastSearchQ) { inp2.value = state.lastSearchQ; runSearch(state.lastSearchQ); } return; }
+    const vToggle = e.target.closest("[data-view-save-toggle]");
+    if (vToggle) { state.showViewSave = !state.showViewSave; const q0 = $("#search-input")?.value || state.lastSearchQ || ""; render(); const inp3 = $("#search-input"); if (inp3 && q0) inp3.value = q0; return; }
+    const sFilter = e.target.closest("[data-search-filter]");
+    if (sFilter) {
+      const q = $("#search-input")?.value || "";
+      state.searchFilter = sFilter.dataset.searchFilter;
+      try { state.store.setPref("search_filter", state.searchFilter); } catch { /* best-effort */ }
+      render();
+      const inp = $("#search-input");
+      if (inp && q) { inp.value = q; runSearch(q); }
+      return;
+    }
     const open = e.target.closest("[data-open]");
     if (open) {
       const [type, id] = open.dataset.open.split(":");
+      noteRecentOpen(type, id);
       openPopupByRef(type, id);
       return;
     }
@@ -3778,9 +4069,24 @@ function cacheBootHtml(html) {
   if (bootHtmlTimer) return;
   bootHtmlTimer = setTimeout(() => { bootHtmlTimer = null; try { localStorage.setItem("dashben-boot-html", html); } catch { /* quota */ } }, 400);
 }
+
+// WASM delivery (feature batch): prefer the real binary asset
+// (written into dist by the astro build from the committed b64, and
+// bundled directly in the Android shell); fall back to decoding the
+// b64 text where the binary is unavailable.
+async function loadWasmBinary() {
+  try {
+    const res = await fetch("./vendor/sql-wasm.wasm");
+    if (res.ok) return new Uint8Array(await res.arrayBuffer());
+  } catch { /* fall through to b64 */ }
+  const b64 = await (await fetch("./vendor/sql-wasm.wasm.b64")).text();
+  return Uint8Array.from(atob(b64.trim()), (c) => c.charCodeAt(0));
+}
+
 async function boot() {
   paintBootPreview();
   resolveNativePlugins();
+  if ("serviceWorker" in navigator && location.protocol === "https:" && !window.Capacitor) { navigator.serviceWorker.register("./sw.js").catch(() => {}); }
   loadSettings();
   await loadSecureToken();
   // Stamp cw: with no token the app opens on a connect screen instead
@@ -3790,9 +4096,7 @@ async function boot() {
   // because the repo push tooling only accepts UTF-8 files, so the
   // binary .wasm itself is never committed. Decoded here and handed
   // to sql.js directly — same self-hosted bytes, no CDN.
-  const b64 = await (await fetch("./vendor/sql-wasm.wasm.b64")).text();
-  const bin = Uint8Array.from(atob(b64.trim()), (c) => c.charCodeAt(0));
-  const SQL = await initSqlJs({ wasmBinary: bin });
+  const SQL = await initSqlJs({ wasmBinary: await loadWasmBinary() });
   const schema = await (await fetch(SCHEMA_URL)).text();
   const bytes = await loadBytes();
   let fresh = false;
@@ -3985,6 +4289,14 @@ function showBootError(e) {
   document.querySelector("#main").innerHTML = `<p class="error">Failed to start: ${esc(e.message)}</p>`;
 }
 function bootAsOwner() {
+  document.addEventListener("keydown", trapPopupTab);
+  document.addEventListener("toggle", (e) => {
+    const d = e.target.closest?.("details[data-panel-id]");
+    if (!d) return;
+    try { const raw = state.store.getPref("panel_state"); const m = raw ? JSON.parse(raw) : {}; m[d.dataset.panelId] = d.open; state.store.setPref("panel_state", JSON.stringify(m)); } catch { /* ignore */ }
+    saveBytes();
+  }, true);
+  document.addEventListener("keydown", rowKeyActivation);
   if (!navigator.locks?.request) { void boot().catch(showBootError); return; }
   const mainEl = document.querySelector("#main");
   if (mainEl) mainEl.innerHTML = `<div class="panel"><h3>Already open in another tab</h3><p class="muted">This tab is waiting so the two copies can't overwrite each other. It starts on its own when the other tab closes.</p></div>`;
@@ -4005,10 +4317,20 @@ const MANAGED_FIELD_LIST = [
 ];
 const THEMES = [["auto", "Auto (system)"], ["blueprint", "Blueprint dark"], ["linear-light", "Linear light"], ["paper", "Paper light"], ["civic", "Civic"], ["minimal", "Minimal light"], ["notebook", "Field notebook"], ["ember", "Ember dark"]];
 
+// Default sidebar groups (feature batch): applied only when the
+// user has never saved tab prefs — any stored prefs (including an
+// explicitly empty groups list) are respected as-is. Grouping itself
+// (labels, collapse) is the existing renderSidebar machinery.
+const DEFAULT_TAB_GROUPS = [
+  { id: "work", label: "Work", tabs: ["dashboard", "daily", "tasks", "projects", "calendar"], collapsed: false },
+  { id: "knowledge", label: "Knowledge", tabs: ["notes", "reading", "people"], collapsed: false },
+  { id: "review", label: "Review", tabs: ["inbox", "review"], collapsed: false },
+  { id: "system", label: "System", tabs: ["feed", "search", "management"], collapsed: false },
+];
 function getTabPrefs() {
   try {
     const row = state.store.getRow("ui_prefs", "tabs");
-    if (!row?.value) return { order: [...DEFAULT_TABS], hidden: [], rearrangeEnabled: true, groups: [] };
+    if (!row?.value) return { order: [...DEFAULT_TABS], hidden: [], rearrangeEnabled: true, groups: DEFAULT_TAB_GROUPS.map((g) => ({ ...g, tabs: [...g.tabs] })) };
     const p = JSON.parse(row.value);
     const order = Array.isArray(p.order) ? p.order : [...DEFAULT_TABS];
     const missing = DEFAULT_TABS.filter((t) => !order.includes(t));
@@ -4116,11 +4438,11 @@ function renderDaily() {
     const { schedule, notes } = splitSchedule(note.body_markdown ?? "");
     body = `<div class="panel"><h3>Schedule</h3>${schedule.length ? schedule.map((l) => `<p>${esc(l)}</p>`).join("") : "<p class='muted'>No schedule entries yet (lines starting with a time, like 9:00 — Meeting).</p>"}</div>
     <div class="panel"><h3>Notes</h3>${notes.join("\n").trim() ? notes.map((l) => `<p>${esc(l)}</p>`).join("") : "<p class='muted'>No notes yet.</p>"}</div>
-    ${familyPanel()}
+    ${collapsible("daily-family", "Family calendar", familyPanel())}
     <p><button data-open="notes:${note.id}">Edit daily note</button></p>`;
   } else {
     body = `<p class="muted">No daily note for this date yet.</p>
-    ${familyPanel()}<p><button data-create-daily="${date}" class="primary-btn">Create daily note for ${date}</button></p>`;
+    ${collapsible("daily-family", "Family calendar", familyPanel())}<p><button data-create-daily="${date}" class="primary-btn">Create daily note for ${date}</button></p>`;
   }
   return `<form data-daily-nav class="form">
     <button type="button" data-daily-shift="-1"><span class="nav-arrow">← </span>Prev</button>
@@ -4129,7 +4451,7 @@ function renderDaily() {
     <button type="button" data-daily-shift="1">Next <span class="nav-arrow">→</span></button>
     <button type="button" data-daily-shift="0">Today</button>
   </form>
-  ${dayContextPanel(date)}
+  ${collapsible("daily-context", "On this day", dayContextPanel(date))}
   <div class="panel"><h3>Overdue (${overdue.length})</h3>${date === todayToronto() && overdue.length ? ` <button data-carry-all class="ghost-btn">All → today</button>` : ""}${overdue.length ? overdue.map((t) => taskRow(t, { carry: date === todayToronto() })).join("") : "<p class='muted'>Nothing overdue.</p>"}</div>
   <div class="panel"><h3>Due Today (${todos.length})</h3>${date === todayToronto() && todos.length ? `<p><button data-push-all class="ghost-btn">All → tomorrow</button></p>` : ""}${todos.length ? todos.map(taskRow).join("") : "<p class='muted'>Nothing due this day.</p>"}</div>
   ${completedDayHtml(date)}
@@ -4346,7 +4668,7 @@ function runSearchTokens(q) {
   const parts = terms.map(() => "SELECT object_type, object_id, title FROM search_tokens WHERE token LIKE ?");
   const params = terms.map((t) => `${t}%`);
   const rows = state.db.prepare(parts.join(" INTERSECT ")).all(...params);
-  return rows.map((r) => `<div class="row"><span class="badge">${esc(r.object_type)}</span><span class="row-title" data-open="${r.object_type}:${r.object_id}">${esc(r.title)}</span><span class="muted">${esc(searchSnippet(r.object_type, r.object_id, terms))}</span></div>`);
+  return rows.map((r) => ({ object_type: r.object_type, object_id: r.object_id, title: r.title, snippet: searchSnippet(r.object_type, r.object_id, terms) }));
 }
 
 // --- Calendar tab (stamp 2026-11-04ak) ---
@@ -4444,6 +4766,26 @@ function renderCalendar() {
 // this the accordion would snap shut after every tap.
 const mgmtOpen = new Set(["sync"]);
 
+
+// --- Recovery history & Trash (feature batch): Management section
+// listing archived items (unarchive) and the engine's row_history
+// (restore a previous version or a deleted item).
+function recoveryHtml() {
+  const archived = [];
+  for (const table of [...FTS_TABLES, "custom_objects"]) {
+    try { for (const r of state.db.prepare(`SELECT id, title FROM ${table} WHERE archived=1 ORDER BY updated_at DESC LIMIT 50`).all()) archived.push({ table, id: r.id, title: r.title ?? "(untitled)" }); } catch { /* table shape */ }
+  }
+  let hist = [];
+  try { hist = state.store.engine.listHistory(60); } catch { hist = []; }
+  const archRows = archived.map((a) => `<div class="mgmt-row"><div class="mgmt-rowtext"><span class="mgmt-label">${esc(a.title)}</span><span class="muted">${esc(a.table)} · archived</span></div><button data-unarchive-item="${a.table}:${a.id}" class="ghost-btn">Unarchive</button></div>`).join("");
+  const histRows = hist.map((h) => {
+    let title = h.row_id;
+    try { const r = JSON.parse(h.row_json); title = r.title ?? r.name ?? r.key ?? h.row_id; } catch { /* keep id */ }
+    return `<div class="mgmt-row"><div class="mgmt-rowtext"><span class="mgmt-label">${esc(title)}</span><span class="muted">${esc(h.table_name)} · ${h.op === "delete" ? "deleted item" : "previous version"} · ${esc(new Date(h.created_at).toLocaleString("en-CA"))}</span></div><button data-restore-history="${h.id}" class="ghost-btn">Restore</button></div>`;
+  }).join("");
+  return `${archRows}${histRows}${!archRows && !histRows ? `<p class="muted">Nothing archived, and no edits recorded yet on this device. Previous versions and deleted items will appear here.</p>` : ""}`;
+}
+
 function renderManagement() {
   const prefs = getTabPrefs();
   const allTags = state.db.prepare("SELECT DISTINCT tag FROM object_tags ORDER BY tag").all().map((r) => r.tag);
@@ -4509,6 +4851,7 @@ function renderManagement() {
   <form data-create-custom-type class="form"><input name="name" placeholder="Type name (e.g. Book)" required>
     <div data-field-rows style="display:flex;gap:8px;flex-wrap:wrap"><span class="field-row"><input name="fname" placeholder="Field name"><select name="fkind"><option>Text</option><option>Long text</option><option>Date</option><option>Number</option><option>Yes-No</option></select></span></div>
     <button type="button" data-add-field-row>Add field</button><button>Create type</button></form>`)}
+  ${sec("recovery", "Recovery history & Trash", "Archived · previous versions", recoveryHtml())}
   ${sec("backup", "Backup & export", "Database \u00b7 Markdown", `
   <div class="mgmt-row"><div class="mgmt-rowtext"><span class="mgmt-label">Database (.db)</span><span class="muted">A full copy of the local database \u2014 the same format the app loads. Keep it somewhere safe as offline insurance.</span></div><button data-export-db class="primary-btn">Export</button></div>
   <div class="mgmt-row"><div class="mgmt-rowtext"><span class="mgmt-label">Markdown (.zip)</span><span class="muted">Every item as a Markdown file, zipped.</span></div><button data-export-md class="primary-btn">Export</button></div>`)}`;

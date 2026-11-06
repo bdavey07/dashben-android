@@ -595,6 +595,17 @@ export class LocalStore {
     this.engine.localWrite("ui_prefs", { key: "theme", value: theme, updated_at: ts }, { baseUpdatedAt: this.getRow("ui_prefs", "theme")?.updated_at ?? null });
   }
 
+  // Generic ui_prefs access (feature batch: search recents/filters,
+  // saved views, panel state — all synced prefs).
+  getPref(key) {
+    return this.getRow("ui_prefs", key)?.value ?? null;
+  }
+
+  setPref(key, value) {
+    const ts = new Date().toISOString();
+    this.engine.localWrite("ui_prefs", { key, value, updated_at: ts }, { baseUpdatedAt: this.getRow("ui_prefs", key)?.updated_at ?? null });
+  }
+
   // News feed sources (stamp dh): a JSON list in ui_prefs, synced
   // like every other pref. null = unset (the Worker serves its
   // curated defaults); setFeedSources(null) clears back to unset.

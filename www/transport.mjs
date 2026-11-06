@@ -19,6 +19,14 @@ export class HttpTransport {
     return r.json();
   }
 
+  async counts() {
+    const r = await fetch(`${this.base}/api/sync/counts`, {
+      headers: { Authorization: `Bearer ${this.token}` },
+    });
+    if (!r.ok) throw new Error(`counts -> ${r.status}`);
+    return r.json();
+  }
+
   async pull(since, limit) {
     const r = await fetch(`${this.base}/api/sync/pull?since=${since}&limit=${limit}`, {
       headers: { Authorization: `Bearer ${this.token}` },

@@ -85,3 +85,15 @@ CREATE TABLE IF NOT EXISTS attachments (
   archived INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_attachments_owner ON attachments(owner_type, owner_id);
+
+-- Recovery history (feature batch, local-only; also created at
+-- runtime by SyncEngine.ensureHistorySchema for existing DBs).
+CREATE TABLE IF NOT EXISTS row_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  table_name TEXT NOT NULL,
+  row_id TEXT NOT NULL,
+  op TEXT NOT NULL,
+  row_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_row_history_row ON row_history(table_name, row_id);

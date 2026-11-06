@@ -84,6 +84,35 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+// Per-table {count, rev} for the lightweight health check. The rev
+// algorithm (djb2 over sorted rowId/updated_at/archived entries)
+// mirrors the server counts route exactly — keep them in lockstep.
+export function localTableCounts(db) {
+  const out = {};
+  for (const table of SYNC_TABLES) {
+    const cols = TABLE_COLUMNS[table] ?? [];
+    const wanted = [];
+    if (table === "relations") wanted.push("from_type", "from_id", "to_type", "to_id", "relation_name");
+    else if (table === "object_tags") wanted.push("object_type", "object_id", "tag");
+    else if (table === "custom_field_values") wanted.push("object_type", "field", "value");
+    else if (table === "ui_prefs") wanted.push("key");
+    else if (table === "custom_object_types") wanted.push("slug");
+    else wanted.push("id");
+    if (cols.includes("updated_at")) wanted.push("updated_at");
+    if (cols.includes("archived")) wanted.push("archived");
+    const sel = wanted.filter((c) => cols.includes(c));
+    let rows = [];
+    try { rows = db.prepare(`SELECT ${sel.join(", ")} FROM ${table}`).all(); } catch { rows = []; }
+    const entries = rows.map((r) => `${rowIdFor(table, r)}\u0001${String(r.updated_at ?? "")}\u0001${String(r.archived ?? "")}`);
+    entries.sort();
+    let h = 5381;
+    const s = entries.join("\u0002");
+    for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
+    out[table] = { count: rows.length, rev: h.toString(16) };
+  }
+  return out;
+}
+
 export class SyncEngine {
   constructor(db) {
     this.db = db;
@@ -183,6 +212,11 @@ export class SyncEngine {
     const rowId = op === "delete" ? String(row) : rowIdFor(table, clean);
     const changeId = uid();
     this.txn(() => {
+      if (table !== "ui_prefs") {
+        let prev = null;
+        try { prev = this.readLocalRow(table, rowId); } catch { prev = null; }
+        if (prev && (op === "delete" || JSON.stringify(prev) !== JSON.stringify(clean))) this.captureHistory(table, rowId, op, prev);
+      }
       if (op === "delete") this.deleteLocal(table, rowId);
       else this.upsertLocal(table, clean);
       this.db.prepare(
@@ -190,6 +224,53 @@ export class SyncEngine {
       ).run(changeId, table, rowId, op, baseUpdatedAt, clean ? JSON.stringify(clean) : null, nowIso());
     });
     return { client_change_id: changeId, table, row_id: rowId, op, base_updated_at: baseUpdatedAt, row: clean };
+  }
+
+
+  // --- Recovery history (feature batch): every localWrite keeps the
+  // pre-change row in a local-only row_history table (capped per row
+  // and globally), so deleted items and previous versions can be
+  // restored from Management. Sync-applied changes do not pass
+  // through localWrite, so history reflects THIS device's edits.
+  ensureHistorySchema() {
+    try {
+      this.db.exec(`CREATE TABLE IF NOT EXISTS row_history (id INTEGER PRIMARY KEY AUTOINCREMENT, table_name TEXT NOT NULL, row_id TEXT NOT NULL, op TEXT NOT NULL, row_json TEXT NOT NULL, created_at TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS idx_row_history_row ON row_history(table_name, row_id);`);
+    } catch { /* schema.sql creates it on fresh databases */ }
+  }
+
+  captureHistory(table, rowId, op, prevRow) {
+    if (!prevRow || table === "ui_prefs") return;
+    try {
+      this.ensureHistorySchema();
+      this.db.prepare("INSERT INTO row_history (table_name, row_id, op, row_json, created_at) VALUES (?, ?, ?, ?, ?)").run(table, rowId, op, JSON.stringify(prevRow), nowIso());
+      this.db.prepare("DELETE FROM row_history WHERE table_name=? AND row_id=? AND id NOT IN (SELECT id FROM row_history WHERE table_name=? AND row_id=? ORDER BY id DESC LIMIT 25)").run(table, rowId, table, rowId);
+      this.db.prepare("DELETE FROM row_history WHERE id NOT IN (SELECT id FROM row_history ORDER BY id DESC LIMIT 2000)").run();
+    } catch { /* history is best-effort */ }
+  }
+
+  listHistory(limit = 100) {
+    this.ensureHistorySchema();
+    return this.db.prepare("SELECT * FROM row_history ORDER BY id DESC LIMIT ?").all(limit);
+  }
+
+  restoreHistory(historyId) {
+    this.ensureHistorySchema();
+    const h = this.db.prepare("SELECT * FROM row_history WHERE id=?").get(historyId);
+    if (!h) return null;
+    let prev = null;
+    try { prev = JSON.parse(h.row_json); } catch { prev = null; }
+    if (!prev) return null;
+    let current = null;
+    try { current = this.readLocalRow(h.table_name, h.row_id); } catch { current = null; }
+    const row = { ...prev };
+    if ((TABLE_COLUMNS[h.table_name] ?? []).includes("updated_at")) row.updated_at = nowIso();
+    let change = null;
+    this.txn(() => {
+      change = this.localWrite(h.table_name, row, { baseUpdatedAt: current?.updated_at ?? null });
+      this.db.prepare("DELETE FROM row_history WHERE id=?").run(historyId);
+    });
+    return change;
   }
 
   outboxCount() {
@@ -253,12 +334,22 @@ export class SyncEngine {
   // and are reported, never dropped.
   async sync(transport) {
     this.ensureConflictColumns();
+    this.ensureHistorySchema();
     const report = { pulled: 0, applied: [], conflicts: [], errors: [] };
     const since = this.getWatermark();
     let cur = since;
     let hasMore = true;
     while (hasMore) {
       const page = await transport.pull(cur, 200);
+      if (page.resync) {
+        // The server pruned change entries this client still needed
+        // (retention). Rebuild from a full snapshot, then continue
+        // to the push phase with the snapshot watermark.
+        await this.firstSync(transport);
+        report.resynced = true;
+        cur = this.getWatermark();
+        break;
+      }
       this.applyChanges(page.changes);
       report.pulled += page.changes.length;
       cur = page.next_seq;

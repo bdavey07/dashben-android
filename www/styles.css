@@ -630,3 +630,12 @@ body.boot-faded #main { animation: bootfade 160ms ease-out; }
 .pill-ctl { display: inline-flex; gap: 8px; align-items: center; }
 .pill-ctl input[type="color"] { width: 46px; height: 28px; padding: 0; border: 1px solid var(--line); border-radius: 6px; background: none; cursor: pointer; }
 .conflict-block { border-top: 1px solid rgba(127, 127, 127, 0.35); padding: 6px 0; }
+
+/* Side-panel inspection (feature batch): docked editor on wide screens. */
+@media (min-width: 1100px) {
+  .popup-backdrop { justify-content: flex-end; align-items: stretch; padding: 0; background: rgba(3, 4, 7, 0.35); }
+  .popup-card { width: min(560px, 46vw); max-width: none; height: 100%; max-height: 100%; border-radius: 0; border-top: none; border-bottom: none; border-right: none; overflow-y: auto; }
+}
+
+details.collapsible > summary { cursor: pointer; font-weight: 600; padding: 2px 0; }
+details.collapsible > .panel { border: 0; box-shadow: none; margin: 0; padding-left: 0; padding-right: 0; }
