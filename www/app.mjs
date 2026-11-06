@@ -1478,22 +1478,12 @@ function feedMutedHit(i, muted) {
   const src = (i.source ?? "").toLowerCase();
   return muted.some((m) => { const t = String(m).trim().toLowerCase(); return !!t && (title.includes(t) || sum.includes(t) || src === t); });
 }
-function feedNewCount() {
-  const f = feedSeed(); feedSeenSet();
-  if (!f.items.length || !f.lastOpen) return 0;
-  const muted = feedMutedList();
-  return f.items.filter((i) => i.published && Date.parse(i.published) > f.lastOpen && !f.seen.has(i.link) && !feedMutedHit(i, muted)).length;
-}
 function updateFeedBadge() {
-  const n = feedNewCount();
-  const place = (host, cls) => {
-    if (!host) return;
-    let b = host.querySelector("." + cls);
-    if (n > 0) { if (!b && typeof document.createElement === "function") { b = document.createElement("span"); b.className = cls; host.appendChild(b); } if (b) b.textContent = String(n); }
-    else if (b) b.remove();
-  };
-  place(document.querySelector('[data-tab="feed"]'), "tab-badge");
-  place($("#feed-btn"), "feed-badge");
+  // The unread pill is gone (Ben, Nov 6 2026) — the "from before your
+  // last visit" divider carries that signal now. This just strips any
+  // badge an older build left behind on the persistent tab buttons.
+  document.querySelector('[data-tab="feed"]')?.querySelector(".tab-badge")?.remove();
+  $("#feed-btn")?.querySelector(".feed-badge")?.remove();
 }
 
 function feedAgo(iso) {
@@ -1549,7 +1539,7 @@ function renderFeed() {
     const saved = savedUrls.has(i.link);
     rowsHtml += `<div class="feed-row${f.seen.has(i.link) ? " feed-read" : ""}"><div class="feed-meta"><span class="badge">${esc(i.source)}</span><span class="muted">${esc(i.category)}${i.published ? ` · ${feedAgo(i.published)}` : ""}</span><span class="feed-acts">${saved ? `<span class="feed-saved">Saved ✓</span>` : `<button data-feed-save="${ix}" class="ghost-btn feed-save">Save</button>`}</span></div><a class="feed-title" data-feed-open="${ix}" href="${esc(i.link)}" target="_blank" rel="noopener">${esc(i.title)}</a>${i.summary ? `<p class="feed-sum">${esc(i.summary)}</p>` : ""}</div>`;
   }
-  return `<div class="feed-head"><div class="feed-chips">${cats.map((c) => { const n = visible.filter((i) => (c === "All" || i.category === c) && i.published && f.prevOpen && Date.parse(i.published) > f.prevOpen && !f.seen.has(i.link)).length; return `<button data-feed-cat="${esc(c)}" class="chip${c === f.category ? " chip-on" : ""}">${esc(c)}${n ? `<span class="chip-n">${n}</span>` : ""}</button>`; }).join("")}</div><div class="feed-actions"><button data-feed-sources class="ghost-btn">Sources</button> <button data-feed-refresh class="ghost-btn">Refresh</button></div></div>
+  return `<div class="feed-head"><div class="feed-chips">${cats.map((c) => `<button data-feed-cat="${esc(c)}" class="chip${c === f.category ? " chip-on" : ""}">${esc(c)}</button>`).join("")}</div><div class="feed-actions"><button data-feed-sources class="ghost-btn">Sources</button> <button data-feed-refresh class="ghost-btn">Refresh</button></div></div>
   ${f.status === "error" ? `<div class="panel"><p>Couldn't load the feed. <button data-feed-refresh class="ghost-btn">Retry</button></p></div>` : (f.status === "idle" || (f.loading && !f.items.length)) ? "<p class='muted'>Loading the river…</p>" : rowsHtml || "<p class='muted'>Nothing in this view yet.</p>"}
   ${f.errors?.length ? `<p class="muted">Couldn't fetch: ${f.errors.map((e) => esc(e.source)).join(", ")}</p>` : ""}
   ${f.fetchedAt ? `<p class="muted">Updated ${feedAgo(new Date(f.fetchedAt).toISOString())}${f.status === "stale" ? " · showing the last good copy" : ""}${hiddenCount ? ` · ${hiddenCount} hidden by mutes` : ""}</p>` : ""}`;
