@@ -2006,7 +2006,7 @@ function taskRow(t, opts = {}) {
     ${t.priority ? `<span class="prio">${esc(t.priority)}</span>` : ""}
     ${t.project ? `<span class="project-pill">${esc(t.project)}</span>` : ""}
     ${opts.carry ? `<button data-carry-today="${t.id}" class="ghost-btn">→ Today</button>` : ""}
-    ${opts.snooze ? `<button data-snooze-days="1" data-snooze-task="${t.id}" class="ghost-btn">+ 1d</button><button data-snooze-days="7" data-snooze-task="${t.id}" class="ghost-btn">+ 1 wk</button><button data-snooze-mon data-snooze-task="${t.id}" class="ghost-btn">→ Mon</button>` : ""}
+    ${opts.snooze ? `<button data-snooze-days="1" data-snooze-task="${t.id}" class="pill-btn snooze-pill">+ 1d</button><button data-snooze-days="7" data-snooze-task="${t.id}" class="pill-btn snooze-pill">+ 1 wk</button><button data-snooze-mon data-snooze-task="${t.id}" class="pill-btn mon-pill">→ Mon</button>` : ""}
     <span class="due${overdue ? " overdue" : ""}">${t.due_date ? t.due_date : "No due date"}</span>
   </div>`;
 }

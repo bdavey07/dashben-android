@@ -617,3 +617,11 @@ body.boot-faded #main { animation: bootfade 160ms ease-out; }
   .popup-actions button, .popup-actions-top button { flex: 1 1 30%; }
   .popup-actions .danger-btn, .popup-actions-top .danger-btn { margin-left: 0; }
 }
+
+/* Stamp eh: snooze pills, colour by family — nudges orange, Monday blue
+   (matches the web treatment from dz/eh; the phone buttons were ghosts). */
+.pill-btn { border-radius: 999px; padding: 3px 10px; font-size: 12.5px; white-space: nowrap; }
+.snooze-pill { color: #fb923c; border-color: color-mix(in srgb, #fb923c 55%, transparent); background: color-mix(in srgb, #fb923c 12%, transparent); font-weight: 600; }
+.snooze-pill:hover { border-color: #fb923c; background: color-mix(in srgb, #fb923c 22%, transparent); }
+.mon-pill { color: #6aa6e8; border-color: color-mix(in srgb, #6aa6e8 55%, transparent); background: color-mix(in srgb, #6aa6e8 12%, transparent); font-weight: 600; }
+.mon-pill:hover { border-color: #6aa6e8; background: color-mix(in srgb, #6aa6e8 22%, transparent); }
