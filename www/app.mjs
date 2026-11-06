@@ -2006,7 +2006,7 @@ function taskRow(t, opts = {}) {
     ${t.priority ? `<span class="prio">${esc(t.priority)}</span>` : ""}
     ${t.project ? `<span class="project-pill">${esc(t.project)}</span>` : ""}
     ${opts.carry ? `<button data-carry-today="${t.id}" class="ghost-btn">→ Today</button>` : ""}
-    ${opts.snooze ? `<button data-snooze-days="1" data-snooze-task="${t.id}" class="ghost-btn">+ 1 day</button><button data-snooze-days="7" data-snooze-task="${t.id}" class="ghost-btn">→ +1wk</button>` : ""}
+    ${opts.snooze ? `<button data-snooze-days="1" data-snooze-task="${t.id}" class="ghost-btn">+ 1d</button><button data-snooze-days="7" data-snooze-task="${t.id}" class="ghost-btn">+ 1 wk</button><button data-snooze-mon data-snooze-task="${t.id}" class="ghost-btn">→ Mon</button>` : ""}
     <span class="due${overdue ? " overdue" : ""}">${t.due_date ? t.due_date : "No due date"}</span>
   </div>`;
 }
@@ -4984,6 +4984,20 @@ function attachExtraListeners() {
         const baseStr = t.due_date && t.due_date > today ? t.due_date : today;
         const d = new Date(baseStr + "T12:00:00");
         d.setDate(d.getDate() + parseInt(snoozeBtn.dataset.snoozeDays, 10));
+        state.store.updateProps("tasks", t.id, { due_date: d.toISOString().slice(0, 10) });
+      }
+      render(); saveBytes();
+      return;
+    }
+    const snoozeMon = e.target.closest("[data-snooze-mon]");
+    if (snoozeMon) {
+      const t = state.store.getRow("tasks", snoozeMon.dataset.snoozeTask);
+      if (t) {
+        const today = todayToronto();
+        const baseStr = t.due_date && t.due_date > today ? t.due_date : today;
+        const d = new Date(baseStr + "T12:00:00");
+        let delta = (8 - d.getDay()) % 7; if (delta === 0) delta = 7;
+        d.setDate(d.getDate() + delta);
         state.store.updateProps("tasks", t.id, { due_date: d.toISOString().slice(0, 10) });
       }
       render(); saveBytes();
