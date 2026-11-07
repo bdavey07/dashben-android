@@ -1288,7 +1288,7 @@ function subtaskBlock(table, id, subtasksJson) {
     <div data-sub-list>
       ${ordered.map((s) => `<div class="row" data-sub-row="${s.id}" draggable="true"><span class="sub-grip" aria-hidden="true">⠿</span><input type="checkbox" ${s.done ? "checked" : ""}><span data-sub-text>${esc(s.text)}</span><button type="button" data-sub-del aria-label="Delete subtask">×</button></div>`).join("") || "<p class='muted'>No subtasks.</p>"}
     </div>
-    <div class="inline-add"><input data-sub-new placeholder="New subtask"><button type="button" data-add-sub-btn>Add</button></div>`;
+    <div class="inline-add"><input data-sub-new placeholder="New subtask" enterkeyhint="enter"><button type="button" data-add-sub-btn>Add</button></div>`;
 }
 
 // Collect the subtask checklist from a merged save form's DOM.
@@ -2300,6 +2300,35 @@ async function loadDayEvents(ymd) {
   } catch { state.dayEvents = { ymd, status: "error", events: [], fetchedAt: Date.now() }; }
   if (state.tab === "daily" && state.dailyDate === ymd) render();
 }
+// Per-day weather for the Daily tab (stamp es): the shared forecast
+// only covers today..+3, so other viewed days fetch their own day —
+// recent past via the forecast API's past_days, older past via the
+// Open-Meteo archive, far future via an explicit start/end range.
+async function loadDayWeather(ymd) {
+  const daily = state.weather?.daily;
+  if (daily?.time?.includes(ymd)) return;
+  const cur = state.dayWx;
+  if (cur && cur.ymd === ymd) return;
+  state.dayWx = { ymd, status: "loading", wx: null };
+  const today = todayToronto();
+  const daysAgo = Math.round((new Date(`${today}T12:00:00Z`) - new Date(`${ymd}T12:00:00Z`)) / 86400000);
+  let url;
+  if (daysAgo > 30) url = `https://archive-api.open-meteo.com/v1/archive?latitude=43.4635&longitude=-81.18748&start_date=${ymd}&end_date=${ymd}&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_sum&timezone=America%2FToronto`;
+  else if (daysAgo > 0) url = `https://api.open-meteo.com/v1/forecast?latitude=43.4635&longitude=-81.18748&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_sum&timezone=America%2FToronto&past_days=${daysAgo}&forecast_days=1`;
+  else url = `https://api.open-meteo.com/v1/forecast?latitude=43.4635&longitude=-81.18748&start_date=${ymd}&end_date=${ymd}&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_sum&timezone=America%2FToronto`;
+  try {
+    const res = await fetch(url);
+    const j = await res.json();
+    const d = j?.daily;
+    const i = d?.time ? d.time.indexOf(ymd) : -1;
+    if (i >= 0) {
+      const w = weatherIcon(d.weathercode?.[i] ?? -1);
+      state.dayWx = { ymd, status: "ok", wx: { icon: w.icon, condition: w.condition, hi: Math.round(d.temperature_2m_max[i]), lo: Math.round(d.temperature_2m_min[i]), precip: d.precipitation_sum?.[i] ?? null } };
+    } else state.dayWx = { ymd, status: "unavailable", wx: null };
+  } catch { state.dayWx = { ymd, status: "unavailable", wx: null }; }
+  if (state.tab === "daily") render();
+}
+
 function dayContextPanel(ymd) {
   loadDayEvents(ymd);
   if (!state.weather && !state.weatherTried) fetchWeather();
@@ -2311,8 +2340,15 @@ function dayContextPanel(ymd) {
     const i = daily.time.indexOf(ymd);
     if (i >= 0) { const w = weatherIcon(daily.weathercode?.[i] ?? -1); wx = `<p class="cal-ev"><span class="fam-time">${w.icon} ${Math.round(daily.temperature_2m_max[i])}° / ${Math.round(daily.temperature_2m_min[i])}°</span> ${esc(w.condition)}${daily.precipitation_sum?.[i] ? ` · ${daily.precipitation_sum[i]} mm precip` : ""}</p>`; }
   }
+  if (!wx) {
+    loadDayWeather(ymd);
+    const dw = state.dayWx;
+    if (dw && dw.ymd === ymd && dw.status === "ok" && dw.wx) wx = `<p class="cal-ev"><span class="fam-time">${dw.wx.icon} ${dw.wx.hi}° / ${dw.wx.lo}°</span> ${esc(dw.wx.condition)}${dw.wx.precip ? ` · ${dw.wx.precip} mm precip` : ""}</p>`;
+    else if (dw && dw.ymd === ymd && dw.status === "loading") wx = `<p class="muted">Loading weather…</p>`;
+    else if (dw && dw.ymd === ymd) wx = `<p class="muted">No weather data for this date.</p>`;
+  }
   if (!evs.length && !wx) return "";
-  return `<div class="panel day-context"><h3>On this day</h3>${wx}${evs.map((e) => `<p class="cal-ev">${e.allDay ? `<span class="fam-time">All day</span>` : `<span class="fam-time">${esc(famTimeLabel(e))}</span>`} ${esc(e.title)}${e.location ? ` <span class="muted">@ ${esc(e.location)}</span>` : ""}</p>`).join("")}</div>`;
+  return `<div class="panel day-context"><h3>Daily weather</h3>${wx}${evs.map((e) => `<p class="cal-ev">${e.allDay ? `<span class="fam-time">All day</span>` : `<span class="fam-time">${esc(famTimeLabel(e))}</span>`} ${esc(e.title)}${e.location ? ` <span class="muted">@ ${esc(e.location)}</span>` : ""}</p>`).join("")}</div>`;
 }
 
 function pinnedPanel() {
@@ -4760,9 +4796,9 @@ function renderDaily() {
   if (note) {
     const { schedule, notes } = splitSchedule(note.body_markdown ?? "");
     scheduleNotes = `<div class="panel"><h3>Schedule</h3>${schedule.length ? schedule.map((l) => `<p>${esc(l)}</p>`).join("") : "<p class='muted'>No schedule entries yet (lines starting with a time, like 9:00 — Meeting).</p>"}
-    <form data-daily-schedule="${date}" class="form"><input type="time" name="time" required><input name="text" placeholder="Schedule entry, e.g. Meeting with…" style="flex:1" required><button>Add to schedule</button></form></div>
+</div>
     <div class="panel"><h3>Notes</h3>${notes.join("\n").trim() ? notes.map((l) => `<p>${esc(l)}</p>`).join("") : "<p class='muted'>No notes yet.</p>"}
-    <form data-daily-jot="${date}" class="form"><textarea name="jot" rows="3" placeholder="Jot a note…" style="flex:1"></textarea><button>Jot it down</button></form></div>
+</div>
     <p><button data-open="notes:${note.id}">Edit daily note</button></p>`;
   } else {
     scheduleNotes = `<p class="muted">No daily note for this date yet.</p>
@@ -4781,7 +4817,7 @@ function renderDaily() {
   <form data-dash-task="${date}" class="form"><input name="title" placeholder="New task" required style="flex:1"><button class="primary-btn">+ New task</button></form></div>
   ${scheduleNotes}
   ${collapsible("daily-overdue", `Overdue (${overdue.length})`, overdueHtml, false)}
-  ${collapsible("daily-context", "On this day", dayContextPanel(date))}
+  ${collapsible("daily-context", "Daily weather", dayContextPanel(date))}
   ${collapsible("daily-family", "Family calendar", familyPanel())}
   ${completedDayHtml(date)}`;
 }
@@ -5284,7 +5320,7 @@ function bindExtraForms() {
     // Smart quick-add (stamp 2026-11-04w): a due date / priority in
     // the text ("Pay rent Fri P1") is parsed out of the title.
     const parsed = parseQuickTaskRich(title, f._suppress);
-    state.store.createTask({ title: parsed.title, due: parsed.due ?? todayToronto(), priority: parsed.priority, project: (new FormData(f).get("project") || "General") });
+    state.store.createTask({ title: parsed.title, due: parsed.due ?? (f.dataset.dashTask || todayToronto()), priority: parsed.priority, project: (new FormData(f).get("project") || "General") });
     render(); saveBytes();
     // Rapid entry (stamp 2026-11-04l): render() rebuilt the dashboard,
     // so put the cursor straight back in the new quick-add box — Enter,
