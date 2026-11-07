@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Material You widget palette (Android 12+): dark surfaces from the
+     system neutral tones, the accent from the wallpaper. -->
+<resources>
+    <color name="widget_bg_top">@android:color/system_neutral1_800</color>
+    <color name="widget_bg_bottom">@android:color/system_neutral1_900</color>
+    <color name="widget_stroke">@android:color/system_neutral2_700</color>
+    <color name="widget_btn">@android:color/system_accent2_800</color>
+    <color name="widget_btn_stroke">@android:color/system_accent2_700</color>
+    <color name="widget_text">@android:color/system_neutral1_50</color>
+    <color name="widget_muted">@android:color/system_neutral2_300</color>
+    <color name="widget_muted2">@android:color/system_neutral2_200</color>
+    <color name="widget_accent">@android:color/system_accent1_200</color>
+</resources>

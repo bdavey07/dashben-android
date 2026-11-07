@@ -10,6 +10,7 @@ public class MainActivity extends BridgeActivity {
         registerPlugin(ShareIntentPlugin.class);
         registerPlugin(AppLockPlugin.class);
         registerPlugin(WidgetPlugin.class);
+        registerPlugin(SystemBarsPlugin.class);
         super.onCreate(savedInstanceState);
         // Ben: password managers must not offer autofill anywhere in the app.
         try { getBridge().getWebView().setImportantForAutofill(android.view.View.IMPORTANT_FOR_AUTOFILL_NO); } catch (Exception e) { /* best effort */ }
@@ -34,6 +35,22 @@ public class MainActivity extends BridgeActivity {
         // Autofill suppression above uses the autofill flags + the
         // WebView's empty autofill structure, not accessibility.
         WidgetPlugin.poke(this);
+    }
+
+    // Back button (stamp eu): the web client closes its top-most layer
+    // first (autocomplete, lightbox, palette, + menu, popup — saving it
+    // like a backdrop tap — then the drawer, then a full item page).
+    // Only when it reports nothing left to close does Android's own
+    // back run and leave the app.
+    @SuppressWarnings("deprecation")
+    @Override
+    public void onBackPressed() {
+        android.webkit.WebView wv = null;
+        try { wv = getBridge().getWebView(); } catch (Exception e) { /* bridge not ready */ }
+        if (wv == null) { super.onBackPressed(); return; }
+        wv.evaluateJavascript("(function(){try{return window.__dashbenBack&&window.__dashbenBack()?'1':'0'}catch(e){return '0'}})()", (value) -> {
+            if (!"\"1\"".equals(value)) runOnUiThread(MainActivity.super::onBackPressed);
+        });
     }
 
     // Belt-and-braces copy of the widget-tap extras in

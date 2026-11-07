@@ -6,4 +6,11 @@
     <string name="custom_url_scheme">ca.bendavey.pkm</string>
     <string name="widget_today_desc">DashBen: overdue and due-today tasks, next family event, weather</string>
     <string name="widget_capture_desc">DashBen shortcuts: capture, new task, quick note</string>
+    <string name="shortcut_capture_short">Capture</string>
+    <string name="shortcut_capture_long">Capture to inbox</string>
+    <string name="shortcut_task_short">New task</string>
+    <string name="shortcut_task_long">New task</string>
+    <string name="shortcut_note_short">Quick note</string>
+    <string name="shortcut_note_long">Add to today\'s daily note</string>
+    <string name="tile_capture">DashBen capture</string>
 </resources>

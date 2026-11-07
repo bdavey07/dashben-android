@@ -8,6 +8,6 @@
     android:paddingTop="7dp"
     android:paddingBottom="7dp">
     <ImageView android:id="@+id/w_rcheck" android:layout_width="30dp" android:layout_height="30dp" android:src="@drawable/widget_check" android:layout_marginEnd="6dp" android:padding="8dp" />
-    <TextView android:id="@+id/w_rtext" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:textSize="14sp" android:textColor="#f5efe6" android:singleLine="true" android:ellipsize="end" />
-    <TextView android:id="@+id/w_rmeta" android:layout_width="wrap_content" android:layout_height="wrap_content" android:textSize="11sp" android:textColor="#a89e92" android:layout_marginStart="8dp" android:singleLine="true" />
+    <TextView android:id="@+id/w_rtext" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:textSize="14sp" android:textColor="@color/widget_text" android:singleLine="true" android:ellipsize="end" />
+    <TextView android:id="@+id/w_rmeta" android:layout_width="wrap_content" android:layout_height="wrap_content" android:textSize="11sp" android:textColor="@color/widget_muted2" android:layout_marginStart="8dp" android:singleLine="true" />
 </LinearLayout>

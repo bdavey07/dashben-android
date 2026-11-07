@@ -602,6 +602,10 @@ export class LocalStore {
   }
 
   setPref(key, value) {
+    // Unchanged values are not re-written: every write is a synced
+    // outbox change, so an idempotent save must cost nothing.
+    const cur = this.getRow("ui_prefs", key);
+    if (cur && cur.value === value) return;
     const ts = new Date().toISOString();
     this.engine.localWrite("ui_prefs", { key, value, updated_at: ts }, { baseUpdatedAt: this.getRow("ui_prefs", key)?.updated_at ?? null });
   }

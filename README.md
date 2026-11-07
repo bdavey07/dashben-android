@@ -15,6 +15,9 @@ DashBen, debug-signed for personal use.
   field. The canonical web client is the source of truth for shared code;
   this `www/` is a variant copy — a fix to shared code currently lands in
   both places (a single-source build script is planned to end that).
+- `www/extras.mjs` and `www/refresh.css` — shared verbatim with the web
+  client (stamp eu); keep them byte-identical with `public/local/` in
+  PKM-new.
 - `android/` — the Capacitor Android project: `MainActivity`, the custom
   `ShareIntentPlugin` (share-sheet capture), manifest (incl. the `SEND`
   intent filter), launcher icons, and Gradle config.
@@ -44,6 +47,20 @@ gradle assembleDebug            # APK: android/app/build/outputs/apk/debug/app-d
 Install with `adb install app-debug.apk`. If an older wrapper with the same
 app ID is on the device, uninstall it first (different debug signature):
 `adb uninstall ca.bendavey.pkm`.
+
+## Native extras (stamp eu)
+
+- App shortcuts: long-press the launcher icon for Capture / New task /
+  Quick note (`res/xml/shortcuts.xml`).
+- Quick Settings tile: add "DashBen capture" from the shade's edit
+  screen (`CaptureTileService`).
+- Back button closes the top-most layer (popup, menu, drawer) before
+  leaving the app (`MainActivity.onBackPressed` → `window.__dashbenBack`).
+- Status and navigation bars follow the theme (`SystemBarsPlugin`).
+- Widgets use Material You colours on Android 12+ (`values-v31/colors.xml`);
+  older versions keep the Ember palette.
+- Per-task reminder times are scheduled through the existing
+  LocalNotifications reminders; such a task skips the 9 a.m. one.
 
 ## Binary assets
 

@@ -5,6 +5,7 @@
 import { SqlJsDb } from "./db-adapter.mjs";
 import { SyncEngine, SYNC_TABLES, localTableCounts } from "./sync-engine.mjs";
 import { LocalStore, recurrenceSummary, parseRecurrence } from "./local-store.mjs";
+import * as X from "./extras.mjs";
 import { HttpTransport } from "./transport.mjs";
 
 const $ = (sel, el = document) => el.querySelector(sel);
@@ -105,7 +106,10 @@ async function scheduleReminders() {
   remindersBusy = true;
   try {
     if (!remindersOn()) return;
-    const perm = await withTimeout(NativeNotify.checkPermissions(), 5000, "notify.check").catch(() => null);
+    let perm = await withTimeout(NativeNotify.checkPermissions(), 5000, "notify.check").catch(() => null);
+    // A reminder time the user just set is an explicit ask: request
+    // the permission then rather than silently scheduling nothing.
+    if (perm && perm.display !== "granted" && X.timedReminders().length) perm = await withTimeout(NativeNotify.requestPermissions(), 15000, "notify.request").catch(() => null);
     if (!perm || perm.display !== "granted") return;
     const today = todayToronto();
     const d = new Date(today + "T12:00:00");
@@ -121,14 +125,22 @@ async function scheduleReminders() {
       if (when <= now) when = at9(tomorrow);
       notes.push({ id: 1900000001, title: "DashBen \u2014 overdue", body: `${overdue.length} overdue task${overdue.length === 1 ? "" : "s"}. First up: ${overdue[0].title}`, schedule: { at: when, allowWhileIdle: true }, actionTypeId: "TASK_ACTIONS", extra: { taskId: overdue[0].id } });
     }
+    // Per-task reminder times (stamp eu, extras.mjs): exact-time
+    // notifications; such a task skips the generic 9 a.m. one.
+    const timed = X.timedReminders();
+    const timedIds = new Set(timed.map((r) => r.taskId));
+    for (const r of timed.slice(0, 24)) {
+      notes.push({ id: reminderIdFor(`rem:${r.taskId}`), title: "Reminder", body: r.title, schedule: { at: r.at, allowWhileIdle: true }, actionTypeId: "TASK_ACTIONS", extra: { taskId: r.taskId } });
+    }
     for (const t of due) {
       if (t.due_date < today) continue;
+      if (timedIds.has(t.id)) continue;
       const when = at9(t.due_date);
       if (when <= now) continue;
       notes.push({ id: reminderIdFor(t.id), title: "Due today", body: t.title, schedule: { at: when, allowWhileIdle: true }, actionTypeId: "TASK_ACTIONS", extra: { taskId: t.id } });
     }
     await cancelAllReminders();
-    if (notes.length) await withTimeout(NativeNotify.schedule({ notifications: notes.slice(0, 24) }), 8000, "notify.schedule");
+    if (notes.length) await withTimeout(NativeNotify.schedule({ notifications: notes.slice(0, 48) }), 8000, "notify.schedule");
   } catch { /* reminders are best-effort */ } finally { remindersBusy = false; }
 }
 
@@ -581,9 +593,13 @@ async function loadSecureToken() {
 // Swap only the sync button's text span so its icon survives (the
 // collapsed sidebar shows the icon alone; a textContent rewrite used
 // to destroy the svg on the first sync).
+// The sync button is the header status pill (stamp eu): its label
+// comes from state (syncing / offline / waiting / synced), so the
+// text passed here is only a fallback before the pill exists.
 function syncBtnLabel(txt) {
   const b = $("#sync-btn");
   if (!b) return;
+  if (b.classList.contains("sync-pill")) { try { X.afterRender(); } catch { /* not installed yet */ } return; }
   const span = b.querySelector?.("span");
   if (span) span.textContent = txt;
   else b.textContent = txt;
@@ -1228,7 +1244,7 @@ function renderMarkdown(src) {
     out.push(`<p>${buf.join("<br>")}</p>`);
   }
   closeAllLists();
-  return out.join("\n");
+  return X.wikilinkify(out.join("\n"));
 }
 
 function bindMdEditors(root) {
@@ -1352,7 +1368,8 @@ function linksBlock(fromType, fromId) {
         </div>
       </div>
       <button>Add link</button>
-    </form>`;
+    </form>
+    ${X.mentionsHtml(fromType, fromId)}`;
 }
 
 function taskEditorHtml(id, forPage) {
@@ -1408,6 +1425,7 @@ function taskEditorHtml(id, forPage) {
     </div>` : ""}
       <h4>Body</h4>${bodyFieldHtml("tasks", id, t.body_markdown, t.body_version)}
       ${recurrenceForm(t)}
+      ${X.reminderFieldHtml(t)}
       <h4>Tags</h4>${tagsForm("tasks", id)}
     </form>
     ${linksBlock("tasks", id)}
@@ -1748,6 +1766,7 @@ function render() {
   if (state.booted && !state.itemView && state.tab === "daily") cacheBootHtml(JSON.stringify({ tab: state.tab, html: main.innerHTML }));
   pushNav();
   enhanceRows();
+  X.afterRender();
 }
 
 // --- Family calendar (stamp 2026-11-04ai) ---
@@ -2050,7 +2069,11 @@ function panelOpen(id, dflt = true) {
 }
 function collapsible(id, title, html, dflt = true) {
   if (!html) return "";
-  return `<details class="panel collapsible" data-panel-id="${id}" ${panelOpen(id, dflt) ? "open" : ""}><summary>${esc(title)}</summary>${html}</details>`;
+  // The summary IS the section heading (stamp eu): drop the inner
+  // panel's own first heading so it is not said twice.
+  // A heading that also holds controls (a Refresh button) keeps them.
+  html = html.replace(/^(\s*<div class="panel[^"]*">\s*(?:<div class="panel-head">)?)\s*<h3>[^<]*([\s\S]*?)<\/h3>/, (m, pre, rest) => `${pre}${rest.trim() ? `<div class="panel-tools">${rest}</div>` : ""}`);
+  return `<details class="panel collapsible" data-panel-id="${id}" data-panel-default="${dflt ? 1 : 0}" ${panelOpen(id, dflt) ? "open" : ""}><summary>${esc(title)}</summary>${html}</details>`;
 }
 
 function renderDashboard() {
@@ -2329,7 +2352,7 @@ async function loadDayWeather(ymd) {
   if (state.tab === "daily") render();
 }
 
-function dayContextPanel(ymd) {
+function dayContextPanel(ymd, opts = {}) {
   loadDayEvents(ymd);
   if (!state.weather && !state.weatherTried) fetchWeather();
   const de = state.dayEvents;
@@ -2347,8 +2370,8 @@ function dayContextPanel(ymd) {
     else if (dw && dw.ymd === ymd && dw.status === "loading") wx = `<p class="muted">Loading weather…</p>`;
     else if (dw && dw.ymd === ymd) wx = `<p class="muted">No weather data for this date.</p>`;
   }
-  if (!evs.length && !wx) return "";
-  return `<div class="panel day-context"><h3>Daily weather</h3>${wx}${evs.map((e) => `<p class="cal-ev">${e.allDay ? `<span class="fam-time">All day</span>` : `<span class="fam-time">${esc(famTimeLabel(e))}</span>`} ${esc(e.title)}${e.location ? ` <span class="muted">@ ${esc(e.location)}</span>` : ""}</p>`).join("")}</div>`;
+  if ((opts.noEvents || !evs.length) && !wx) return "";
+  return `<div class="panel day-context"><h3>Daily weather</h3>${wx}${(opts.noEvents ? [] : evs).map((e) => `<p class="cal-ev">${e.allDay ? `<span class="fam-time">All day</span>` : `<span class="fam-time">${esc(famTimeLabel(e))}</span>`} ${esc(e.title)}${e.location ? ` <span class="muted">@ ${esc(e.location)}</span>` : ""}</p>`).join("")}</div>`;
 }
 
 function pinnedPanel() {
@@ -2478,7 +2501,7 @@ function taskRow(t, opts = {}) {
     ${t.project ? `<span class="project-pill"${pillStyle("projects", t.project)}>${esc(t.project)}</span>` : ""}
     ${opts.carry ? `<button data-carry-today="${t.id}" class="ghost-btn">→ Today</button>` : ""}
     ${opts.snooze ? `<button data-snooze-days="1" data-snooze-task="${t.id}" class="pill-btn snooze-pill">+ 1d</button><button data-snooze-days="7" data-snooze-task="${t.id}" class="pill-btn snooze-pill">+ 1 wk</button><button data-snooze-mon data-snooze-task="${t.id}" class="pill-btn mon-pill">→ Mon</button>` : ""}
-    <span class="due${overdue ? " overdue" : ""}">${t.due_date ? t.due_date : "No due date"}</span>
+    <span class="due${overdue ? " overdue" : ""}" title="${esc(t.due_date ?? "")}">${X.dueLabel(t)}</span>
   </div>`;
 }
 
@@ -3140,6 +3163,7 @@ function paletteActions(q) {
     ["New project", () => openProjectCreatePopup()],
     ["Capture to inbox", () => { state.itemView = null; state.tab = "inbox"; saveTab(); render(); document.querySelector("[data-capture] textarea")?.focus(); }],
     ["Sync now", () => doSync()],
+    ["Open Trash (archived items)", () => { mgmtOpen.add("recovery"); state.itemView = null; state.tab = "management"; saveTab(); render(); }],
   ];
   if (!dailyNoteFor(todayToronto())) creates.push(["Create today's daily note", () => { state.store.createNote({ title: todayToronto(), date: todayToronto() }); render(); saveBytes(); }]);
   for (const [label, run] of creates) if (match(label)) acts.push({ kind: "action", label, run });
@@ -3706,8 +3730,14 @@ function bindPopupForms(root = $("#popup-root")) {
     const d = new FormData(f);
     const title = (d.get("title") || "").trim();
     if (!title) return;
-    const parsed = parseQuickTaskRich(title, f._suppress);
-    state.store.createTask({ title: parsed.title, due: parsed.due ?? todayToronto(), priority: parsed.priority, project: d.get("project") || "General" });
+    // Stamp eu: +project, #tags, "in 3 days", "next fri", "!high" and
+    // a time ("3pm" -> reminder) are taken out first.
+    const pre = X.preParseQuick(title, todayToronto());
+    const parsed = parseQuickTaskRich(pre.text, f._suppress);
+    if (!parsed.title) return;
+    const due = parsed.due ?? todayToronto();
+    const row = state.store.createTask({ title: parsed.title, due, priority: parsed.priority ?? pre.priority, project: pre.project ?? (d.get("project") || "General") });
+    X.applyQuickAfterCreate(row?.id, pre, due);
     closePopup(); render(); saveBytes(); showToast("Task added");
   }); });
   $$("[data-fab-note]", root).forEach((f) => f.addEventListener("submit", async (e) => {
@@ -4394,6 +4424,7 @@ async function boot() {
   state.engine.localWrite = (...args) => { const r = origLocalWrite(...args); state.searchDirty = true; scheduleSync(); return r; };
   state.searchDirty = true;
   applyTheme();
+  X.installExtras({ state, render, saveBytes, openPopupByRef, closePopup, savePopupAndClose, todayToronto, statusLine, tabLabel, toast: (m) => showToast(esc(m)), isShell: true, onRemindersChanged: () => { scheduleReminders(); } });
   // Tabs
   $$(".tab-btn").forEach((b) => b.addEventListener("click", () => { $("#sidebar").classList.remove("open"); if (b.dataset.tab === state.tab && !state.itemView && b.closest("#bottom-nav")) { window.scrollTo({ top: 0, behavior: "smooth" }); return; } state.tab = b.dataset.tab; state.itemView = null; saveTab(); render(); }));
   $("#sync-btn").addEventListener("click", doSync);
@@ -4556,7 +4587,18 @@ function bootAsOwner() {
   document.addEventListener("toggle", (e) => {
     const d = e.target.closest?.("details[data-panel-id]");
     if (!d) return;
-    try { const raw = state.store.getPref("panel_state"); const m = raw ? JSON.parse(raw) : {}; m[d.dataset.panelId] = d.open; state.store.setPref("panel_state", JSON.stringify(m)); } catch { /* ignore */ }
+    // Browsers fire "toggle" when a <details open> is merely inserted
+    // by a render, not only on a user click. Writing then queued a
+    // synced ui_prefs change on every tab view; only a real change of
+    // state is recorded now.
+    try {
+      const raw = state.store.getPref("panel_state");
+      const m = raw ? JSON.parse(raw) : {};
+      const cur = typeof m[d.dataset.panelId] === "boolean" ? m[d.dataset.panelId] : d.dataset.panelDefault !== "0";
+      if (cur === d.open) return;
+      m[d.dataset.panelId] = d.open;
+      state.store.setPref("panel_state", JSON.stringify(m));
+    } catch { return; }
     saveBytes();
   }, true);
   document.addEventListener("keydown", rowKeyActivation);
@@ -4669,7 +4711,7 @@ function renderSidebar() {
 }
 
 function applyTheme() {
-  let theme = state.store.getRow("ui_prefs", "theme")?.value ?? "ember";
+  let theme = state.store.getRow("ui_prefs", "theme")?.value ?? "auto";
   if (theme === "auto") theme = window.matchMedia("(prefers-color-scheme: light)").matches ? "paper" : "blueprint";
   if (theme === "blueprint") document.documentElement.removeAttribute("data-theme");
   else document.documentElement.setAttribute("data-theme", theme);
@@ -4787,38 +4829,64 @@ function guidedReviewHtml(tw, overdue, dueNext) {
   <p><button data-review-finish class="primary-btn">Finish — create review note</button></p></div>`;
 }
 
+// Daily header (stamp eu): one line — ‹ Friday, November 6 › Today —
+// the date itself opens the picker; swiping the header or the
+// timeline changes day (extras.mjs).
+function dailyHeadHtml(date) {
+  const today = todayToronto();
+  const d = new Date(`${date}T12:00:00Z`);
+  const t = new Date(`${today}T12:00:00Z`);
+  const long = new Intl.DateTimeFormat("en-CA", { weekday: "long", month: "long", day: "numeric", timeZone: "UTC" }).format(d);
+  const diff = Math.round((d - t) / 86400000);
+  const rel = diff === 0 ? "Today" : diff === 1 ? "Tomorrow" : diff === -1 ? "Yesterday" : diff > 0 ? `In ${diff} days` : `${-diff} days ago`;
+  const year = d.getUTCFullYear() !== t.getUTCFullYear() ? `, ${d.getUTCFullYear()}` : "";
+  return `<form data-daily-nav class="daily-head">
+    <button type="button" class="icon-btn" data-daily-shift="-1" aria-label="Previous day">‹</button>
+    <label class="daily-title"><strong>${esc(long)}${year}</strong><small>${rel}</small><input type="date" name="date" value="${date}" data-daily-date aria-label="Pick a date"></label>
+    <button type="button" class="icon-btn" data-daily-shift="1" aria-label="Next day">›</button>
+    <button type="button" class="today-chip" data-daily-shift="0" ${diff === 0 ? "disabled" : ""}>Today</button>
+  </form>`;
+}
+// Calendar events for one day: the day fetch when it has landed,
+// otherwise the cached week feed filtered to that day.
+function dailyEventsFor(ymd) {
+  const de = state.dayEvents;
+  if (de && de.ymd === ymd && de.status === "ok") return { events: de.events, status: "ok" };
+  const fam = famSeed();
+  const events = (fam.events ?? []).filter((e) => (e.allDay ? String(e.start).slice(0, 10) : torontoDayOf(e.start)) === ymd);
+  return { events, status: de && de.ymd === ymd && de.status === "loading" && !events.length ? "loading" : "ok" };
+}
+function dailyNotesHtml(notes) {
+  const text = notes.join("\n").trim();
+  return text ? `<div class="md-preview daily-notes-md">${renderMarkdown(text)}</div>` : "<p class='muted'>No notes yet.</p>";
+}
+const QUICK_TASK_HINT = "Add a task — “call Sam tomorrow 3pm +Work”";
 function renderDaily() {
   const date = state.dailyDate || todayToronto();
+  const isToday = date === todayToronto();
   const note = dailyNoteFor(date);
   const todos = sortByPrio(openTasks().filter((t) => t.due_date === date));
   const overdue = sortByPrio(openTasks().filter((t) => t.due_date && t.due_date < date));
-  let scheduleNotes = "";
-  if (note) {
-    const { schedule, notes } = splitSchedule(note.body_markdown ?? "");
-    scheduleNotes = `<div class="panel"><h3>Schedule</h3>${schedule.length ? schedule.map((l) => `<p>${esc(l)}</p>`).join("") : "<p class='muted'>No schedule entries yet (lines starting with a time, like 9:00 — Meeting).</p>"}
-</div>
-    <div class="panel"><h3>Notes</h3>${notes.join("\n").trim() ? notes.map((l) => `<p>${esc(l)}</p>`).join("") : "<p class='muted'>No notes yet.</p>"}
-</div>
-    <p><button data-open="notes:${note.id}">Edit daily note</button></p>`;
-  } else {
-    scheduleNotes = `<p class="muted">No daily note for this date yet.</p>
-    <p><button data-create-daily="${date}" class="primary-btn">Create daily note for ${date}</button></p>`;
-  }
-  const overdueHtml = `${date === todayToronto() && overdue.length ? `<p><button data-carry-all class="ghost-btn">All → today</button></p>` : ""}${overdue.length ? overdue.map((t) => taskRow(t, { carry: date === todayToronto() })).join("") : "<p class='muted'>Nothing overdue.</p>"}`;
-  return `<form data-daily-nav class="form">
-    <button type="button" data-daily-shift="-1">← Prev</button>
-    <input type="date" name="date" value="${date}" data-daily-date>
-    <button type="button" data-daily-go>Go</button>
-    <button type="button" data-daily-shift="1">Next →</button>
-    <button type="button" data-daily-shift="0">Today</button>
-  </form>
+  loadDayEvents(date);
+  const { schedule, notes } = note ? splitSchedule(note.body_markdown ?? "") : { schedule: [], notes: [] };
+  const ev = dailyEventsFor(date);
+  // Stamp es kept the Daily tab display-only on the phone (no jot /
+  // schedule forms; the + menu adds those), so the timeline and notes
+  // here are read views.
+  const timeline = `<div class="panel daily-swipe"><h3>Schedule</h3>${X.timelineHtml(date, { events: ev.events, scheduleLines: schedule, eventsStatus: ev.status })}</div>`;
+  const notesHtml = note
+    ? `<div class="panel"><div class="panel-head"><h3>Notes</h3><button data-open="notes:${note.id}" class="ghost-btn panel-open">Edit →</button></div>${dailyNotesHtml(notes)}</div>`
+    : `<div class="panel"><h3>Notes</h3><p class="muted">No daily note for this day yet.</p><p><button data-create-daily="${date}">Create daily note</button></p></div>`;
+  const overdueHtml = `${isToday && overdue.length ? `<p><button data-carry-all class="ghost-btn">All → today</button></p>` : ""}${overdue.map((t) => taskRow(t, { carry: isToday })).join("")}`;
+  return `${dailyHeadHtml(date)}
   ${focusPanelHtml(date, todos, overdue)}
-  <div class="panel"><h3>Due Today (${todos.length})</h3>${date === todayToronto() && todos.length ? `<p><button data-push-all class="ghost-btn">All → tomorrow</button></p>` : ""}${todos.length ? todos.map(taskRow).join("") : "<p class='muted'>Nothing due this day.</p>"}
-  <form data-dash-task="${date}" class="form"><input name="title" placeholder="New task" required style="flex:1"><button class="primary-btn">+ New task</button></form></div>
-  ${scheduleNotes}
-  ${collapsible("daily-overdue", `Overdue (${overdue.length})`, overdueHtml, false)}
-  ${collapsible("daily-context", "Daily weather", dayContextPanel(date))}
-  ${collapsible("daily-family", "Family calendar", familyPanel())}
+  <div class="panel"><h3>${isToday ? "Due today" : "Due this day"}${todos.length ? `<span class="count">${todos.length}</span>` : ""}</h3>${isToday && todos.length ? `<p><button data-push-all class="ghost-btn">All → tomorrow</button></p>` : ""}${todos.length ? todos.map(taskRow).join("") : "<p class='muted'>Nothing due this day.</p>"}
+  <form data-dash-task="${date}" class="form"><input name="title" placeholder="${QUICK_TASK_HINT}" required style="flex:1"><button>Add</button></form></div>
+  ${timeline}
+  ${notesHtml}
+  ${overdue.length ? collapsible("daily-overdue", `Overdue (${overdue.length})`, overdueHtml, false) : ""}
+  ${collapsible("daily-context", "Weather", dayContextPanel(date, { noEvents: true }))}
+  ${collapsible("daily-family", "Family calendar · this week", familyPanel())}
   ${completedDayHtml(date)}`;
 }
 function weatherIcon(code) {
@@ -4969,12 +5037,13 @@ function upcomingPanel() {
   const tomorrow = addDays(1), weekEnd = addDays(7);
   const dueTomorrow = sortByPrio(openTasks().filter((t) => t.due_date === tomorrow));
   const dueWeek = sortByPrio(openTasks().filter((t) => t.due_date && t.due_date > tomorrow && t.due_date <= weekEnd));
-  const section = (label, list) => `<h4>${label} (${list.length})</h4>${list.length ? list.map((t) => taskRow(t, { snooze: true })).join("") : "<p class='muted'>None.</p>"}`;
+  const section = (label, list) => (list.length ? `<h4>${label}<span class="count">${list.length}</span></h4>${list.map((t) => taskRow(t, { snooze: true })).join("")}` : "");
   const dueToday = sortByPrio(openTasks().filter((t) => t.due_date === today));
+  if (!dueToday.length && !dueTomorrow.length && !dueWeek.length) return `<div class="panel"><h3>Upcoming</h3><p class="muted">Nothing due this week.</p></div>`;
   return `<div class="panel"><h3>Upcoming</h3>
   ${section("Due Today", dueToday)}
-  ${section("Due Tomorrow", dueTomorrow)}
-  ${section("Due This Week", dueWeek)}</div>`;
+  ${section("Tomorrow", dueTomorrow)}
+  ${section("Later this week", dueWeek)}</div>`;
 }
 function inboxPanel() {
   const items = inboxItems();
@@ -5153,7 +5222,7 @@ function renderManagement() {
   const prefs = getTabPrefs();
   const allTags = state.db.prepare("SELECT DISTINCT tag FROM object_tags ORDER BY tag").all().map((r) => r.tag);
   const types = state.db.prepare("SELECT * FROM custom_object_types ORDER BY name").all();
-  const currentTheme = state.store.getRow("ui_prefs", "theme")?.value ?? "ember";
+  const currentTheme = state.store.getRow("ui_prefs", "theme")?.value ?? "auto";
   const themeLabel = THEMES.find(([v]) => v === currentTheme)?.[1] ?? currentTheme;
   const ungrouped = allTabIds().filter((id) => !prefs.groups.some((g) => (g.tabs ?? []).includes(id)));
   const knownTabs = allTabIds();
@@ -5163,6 +5232,7 @@ function renderManagement() {
   const sec = (key, title, sub, body) => `<details class="mgmt-sec" data-mgmt-sec="${key}"${mgmtOpen.has(key) ? " open" : ""}><summary><span class="mgmt-title">${title}</span><span class="mgmt-state">${sub}</span><span class="mgmt-chev">\u25b8</span></summary><div class="mgmt-body">${body}</div></details>`;
   return `<h2 class="mgmt-h">Management</h2>
   ${sec("sync", "Sync", state.token ? `Connected \u00b7 ${dbKb} KB` : `No token \u00b7 ${dbKb} KB`, `
+  <p class="mgmt-status">${esc(statusLine())}</p>
   <p class="muted">Your data syncs with pkm.ben-cloud.net. Saving a token starts a sync \u2014 delete any test items first, since later syncs upload local changes.${state.bootMs ? ` Started in ${state.bootMs} ms.` : ""}</p>
   <div class="token-card"><label for="sync-token-input">Sync token</label>
   <input id="sync-token-input" type="text" style="-webkit-text-security: disc;" autocomplete="off" data-1p-ignore="true" data-lpignore="true" placeholder="SYNC_TOKEN">
@@ -5175,7 +5245,8 @@ function renderManagement() {
   <div class="mgmt-row"><div class="mgmt-rowtext"><span class="mgmt-label">App lock \u2014 <b>${appLockOn() ? "On" : "Off"}</b></span><span class="muted">Require fingerprint or device PIN to open DashBen. Locks again after a minute in the background.</span></div><button data-applock-toggle class="ghost-btn">${appLockOn() ? "Turn off" : "Turn on"}</button></div>`)}
   ${sec("appearance", "Appearance", esc(themeLabel), `
   <p class="muted">Current theme: <b>${esc(themeLabel)}</b></p>
-  <div class="theme-grid">${THEMES.map(([v, label]) => `<button data-theme-btn="${v}" ${v === currentTheme ? "disabled" : ""}>${label}</button>`).join("")}</div>`)}
+  <div class="theme-grid">${THEMES.map(([v, label]) => `<button data-theme-btn="${v}" ${v === currentTheme ? "disabled" : ""}>${label}</button>`).join("")}</div>
+  ${X.accentPickerHtml()}`)}
   ${sec("tabs", "Tabs", `${order.length} tabs \u00b7 ${prefs.groups.length} groups`, `
   <h4 class="mgmt-sub">Order</h4><p class="muted">Drag tabs to reorder them, then save.</p>
   <ul data-tab-order-list>${order.map((tid) => `<li draggable="true" data-tab-order-item="${tid}">\u2630 ${esc(tabLabel(tid))}</li>`).join("")}</ul>
@@ -5214,9 +5285,10 @@ function renderManagement() {
   <form data-create-custom-type class="form"><input name="name" placeholder="Type name (e.g. Book)" required>
     <div data-field-rows style="display:flex;gap:8px;flex-wrap:wrap"><span class="field-row"><input name="fname" placeholder="Field name"><select name="fkind"><option>Text</option><option>Long text</option><option>Date</option><option>Number</option><option>Yes-No</option></select></span></div>
     <button type="button" data-add-field-row>Add field</button><button>Create type</button></form>`)}
-  ${sec("recovery", "Recovery history & Trash", "Archived · previous versions", recoveryHtml())}
+  ${sec("recovery", "Trash & recovery history", "Archived · previous versions", recoveryHtml())}
   ${sec("backup", "Backup & export", "Database \u00b7 Markdown", `
   <div class="mgmt-row"><div class="mgmt-rowtext"><span class="mgmt-label">Database (.db)</span><span class="muted">A full copy of the local database \u2014 the same format the app loads. Keep it somewhere safe as offline insurance.</span></div><button data-export-db class="primary-btn">Export</button></div>
+  <p class="muted">DashBen build ${esc(document.body?.dataset?.build ?? "")} — your data lives on this device until it syncs. Going offline never blocks reading or writing.</p>
   <div class="mgmt-row"><div class="mgmt-rowtext"><span class="mgmt-label">Markdown (.zip)</span><span class="muted">Tasks, notes, people, projects, reading and inbox items as Markdown files, zipped. Archived items, custom objects and attachment files are not included.</span></div><button data-export-md class="primary-btn">Export</button></div>`)}`;
 }
 
@@ -5319,8 +5391,12 @@ function bindExtraForms() {
     if (!title) return;
     // Smart quick-add (stamp 2026-11-04w): a due date / priority in
     // the text ("Pay rent Fri P1") is parsed out of the title.
-    const parsed = parseQuickTaskRich(title, f._suppress);
-    state.store.createTask({ title: parsed.title, due: parsed.due ?? (f.dataset.dashTask || todayToronto()), priority: parsed.priority, project: (new FormData(f).get("project") || "General") });
+    const pre = X.preParseQuick(title, todayToronto());
+    const parsed = parseQuickTaskRich(pre.text, f._suppress);
+    if (!parsed.title) return;
+    const due = parsed.due ?? (f.dataset.dashTask || todayToronto());
+    const row = state.store.createTask({ title: parsed.title, due, priority: parsed.priority ?? pre.priority, project: pre.project ?? (new FormData(f).get("project") || "General") });
+    X.applyQuickAfterCreate(row?.id, pre, due);
     render(); saveBytes();
     // Rapid entry (stamp 2026-11-04l): render() rebuilt the dashboard,
     // so put the cursor straight back in the new quick-add box — Enter,

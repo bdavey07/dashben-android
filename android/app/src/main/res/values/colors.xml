@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Widget palette (stamp eu). These are the original Ember values;
+     values-v31/colors.xml swaps in the system (Material You) palette
+     on Android 12+, so the widgets follow the wallpaper colours. -->
+<resources>
+    <color name="widget_bg_top">#2e2a26</color>
+    <color name="widget_bg_bottom">#201b17</color>
+    <color name="widget_stroke">#48433f</color>
+    <color name="widget_btn">#3b352f</color>
+    <color name="widget_btn_stroke">#57504a</color>
+    <color name="widget_text">#f5efe6</color>
+    <color name="widget_muted">#8d857b</color>
+    <color name="widget_muted2">#a89e92</color>
+    <color name="widget_accent">#d98e4a</color>
+</resources>

@@ -13,7 +13,7 @@
             android:layout_height="wrap_content"
             android:layout_weight="1"
             android:text="DASHBEN"
-            android:textColor="#d98e4a"
+            android:textColor="@color/widget_accent"
             android:textSize="12sp"
             android:textStyle="bold"
             android:letterSpacing="0.14" />
@@ -21,30 +21,30 @@
             android:id="@+id/w_updated"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:textColor="#8d857b"
+            android:textColor="@color/widget_muted"
             android:textSize="10sp" />
     </LinearLayout>
 
     <LinearLayout android:id="@+id/w_wx" android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal" android:layout_marginTop="9dp" android:visibility="gone">
         <LinearLayout android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:orientation="vertical" android:gravity="center">
-            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="TEMP" android:textColor="#8d857b" android:textSize="9sp" android:letterSpacing="0.06" android:gravity="center" />
-            <TextView android:id="@+id/w_wx_temp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:textColor="#f5efe6" android:textSize="14sp" android:textStyle="bold" android:gravity="center" android:layout_marginTop="1dp" />
+            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="TEMP" android:textColor="@color/widget_muted" android:textSize="9sp" android:letterSpacing="0.06" android:gravity="center" />
+            <TextView android:id="@+id/w_wx_temp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:textColor="@color/widget_text" android:textSize="14sp" android:textStyle="bold" android:gravity="center" android:layout_marginTop="1dp" />
         </LinearLayout>
         <LinearLayout android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:orientation="vertical" android:gravity="center">
-            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="FEELS LIKE" android:textColor="#8d857b" android:textSize="9sp" android:letterSpacing="0.06" android:gravity="center" />
-            <TextView android:id="@+id/w_wx_feels" android:layout_width="wrap_content" android:layout_height="wrap_content" android:textColor="#f5efe6" android:textSize="14sp" android:textStyle="bold" android:gravity="center" android:layout_marginTop="1dp" />
+            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="FEELS LIKE" android:textColor="@color/widget_muted" android:textSize="9sp" android:letterSpacing="0.06" android:gravity="center" />
+            <TextView android:id="@+id/w_wx_feels" android:layout_width="wrap_content" android:layout_height="wrap_content" android:textColor="@color/widget_text" android:textSize="14sp" android:textStyle="bold" android:gravity="center" android:layout_marginTop="1dp" />
         </LinearLayout>
         <LinearLayout android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:orientation="vertical" android:gravity="center">
-            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="WIND" android:textColor="#8d857b" android:textSize="9sp" android:letterSpacing="0.06" android:gravity="center" />
-            <TextView android:id="@+id/w_wx_wind" android:layout_width="wrap_content" android:layout_height="wrap_content" android:textColor="#f5efe6" android:textSize="14sp" android:textStyle="bold" android:gravity="center" android:layout_marginTop="1dp" />
+            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="WIND" android:textColor="@color/widget_muted" android:textSize="9sp" android:letterSpacing="0.06" android:gravity="center" />
+            <TextView android:id="@+id/w_wx_wind" android:layout_width="wrap_content" android:layout_height="wrap_content" android:textColor="@color/widget_text" android:textSize="14sp" android:textStyle="bold" android:gravity="center" android:layout_marginTop="1dp" />
         </LinearLayout>
         <LinearLayout android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:orientation="vertical" android:gravity="center">
-            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="RAIN" android:textColor="#8d857b" android:textSize="9sp" android:letterSpacing="0.06" android:gravity="center" />
-            <TextView android:id="@+id/w_wx_pop" android:layout_width="wrap_content" android:layout_height="wrap_content" android:textColor="#f5efe6" android:textSize="14sp" android:textStyle="bold" android:gravity="center" android:layout_marginTop="1dp" />
+            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="RAIN" android:textColor="@color/widget_muted" android:textSize="9sp" android:letterSpacing="0.06" android:gravity="center" />
+            <TextView android:id="@+id/w_wx_pop" android:layout_width="wrap_content" android:layout_height="wrap_content" android:textColor="@color/widget_text" android:textSize="14sp" android:textStyle="bold" android:gravity="center" android:layout_marginTop="1dp" />
         </LinearLayout>
         <LinearLayout android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:orientation="vertical" android:gravity="center">
-            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="PRECIP" android:textColor="#8d857b" android:textSize="9sp" android:letterSpacing="0.06" android:gravity="center" />
-            <TextView android:id="@+id/w_wx_psum" android:layout_width="wrap_content" android:layout_height="wrap_content" android:textColor="#f5efe6" android:textSize="14sp" android:textStyle="bold" android:gravity="center" android:layout_marginTop="1dp" />
+            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="PRECIP" android:textColor="@color/widget_muted" android:textSize="9sp" android:letterSpacing="0.06" android:gravity="center" />
+            <TextView android:id="@+id/w_wx_psum" android:layout_width="wrap_content" android:layout_height="wrap_content" android:textColor="@color/widget_text" android:textSize="14sp" android:textStyle="bold" android:gravity="center" android:layout_marginTop="1dp" />
         </LinearLayout>
     </LinearLayout>
 
@@ -53,7 +53,7 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:text="Open DashBen to sync"
-        android:textColor="#f5efe6"
+        android:textColor="@color/widget_text"
         android:textSize="13sp"
         android:textStyle="bold"
         android:layout_marginTop="7dp" />
@@ -80,13 +80,13 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:text="All clear — nothing due, nothing scheduled."
-        android:textColor="#a89e92"
+        android:textColor="@color/widget_muted2"
         android:textSize="12sp"
         android:visibility="gone" />
 
     <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal" android:layout_marginTop="10dp">
-        <TextView android:id="@+id/w_btn_capture" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="＋ Capture" android:textColor="#f5efe6" android:textSize="13sp" android:textStyle="bold" android:gravity="center" android:paddingTop="9dp" android:paddingBottom="9dp" android:background="@drawable/widget_btn_bg" android:layout_marginEnd="6dp" />
-        <TextView android:id="@+id/w_btn_task" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="✓ New task" android:textColor="#f5efe6" android:textSize="13sp" android:textStyle="bold" android:gravity="center" android:paddingTop="9dp" android:paddingBottom="9dp" android:background="@drawable/widget_btn_bg" android:layout_marginEnd="6dp" />
-        <TextView android:id="@+id/w_btn_note" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="✎ Quick note" android:textColor="#f5efe6" android:textSize="13sp" android:textStyle="bold" android:gravity="center" android:paddingTop="9dp" android:paddingBottom="9dp" android:background="@drawable/widget_btn_bg" />
+        <TextView android:id="@+id/w_btn_capture" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="＋ Capture" android:textColor="@color/widget_text" android:textSize="13sp" android:textStyle="bold" android:gravity="center" android:paddingTop="9dp" android:paddingBottom="9dp" android:background="@drawable/widget_btn_bg" android:layout_marginEnd="6dp" />
+        <TextView android:id="@+id/w_btn_task" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="✓ New task" android:textColor="@color/widget_text" android:textSize="13sp" android:textStyle="bold" android:gravity="center" android:paddingTop="9dp" android:paddingBottom="9dp" android:background="@drawable/widget_btn_bg" android:layout_marginEnd="6dp" />
+        <TextView android:id="@+id/w_btn_note" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="✎ Quick note" android:textColor="@color/widget_text" android:textSize="13sp" android:textStyle="bold" android:gravity="center" android:paddingTop="9dp" android:paddingBottom="9dp" android:background="@drawable/widget_btn_bg" />
     </LinearLayout>
 </LinearLayout>
