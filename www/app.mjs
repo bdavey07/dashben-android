@@ -613,18 +613,45 @@ function mainFormActive() {
   const m = document.querySelector("#main");
   return !!(m && m.contains(a));
 }
+// Dirty-form tracking (reviews 5/6, item 3): focus alone does not
+// protect a draft — moving focus to the Save button fires focusout,
+// and the deferred render used to paint over unsaved text. A field
+// in the main region that has seen 'input' without a committing
+// 'change' is DIRTY; background renders defer while any dirty field
+// is still connected, focused or not. render() clears the set (the
+// DOM it paints is by definition in sync with the data).
+function mainFormDirty() {
+  if (!state.dirtyEls) return false;
+  for (const el of state.dirtyEls) if (el.isConnected) return true;
+  return false;
+}
+document.addEventListener("input", (e) => {
+  const m = document.querySelector("#main");
+  if (m && e.target && m.contains(e.target)) { (state.dirtyEls ??= new Set()).add(e.target); }
+}, true);
+document.addEventListener("change", (e) => {
+  if (state.dirtyEls && e.target) state.dirtyEls.delete(e.target);
+}, true);
 // Background sync must not clobber main-page forms (review 3, item
 // 5b): skip the re-render when the cycle changed nothing, defer it
-// while a main-region form is being edited (the focusout listener
-// below paints once the field is left). The boot sync always paints.
+// while a main-region form is focused OR dirty (the focusout
+// listener below paints once it is safe). Even the boot sync now
+// yields to a dirty form (review 6, item 3).
 function renderAfterSync(changed, wasBooted) {
-  if (!wasBooted) { render(); return; }
+  if (!wasBooted) { if (mainFormDirty()) { state.renderDeferred = true; return; } render(); return; }
   if (!changed) { paintSyncStatus(); return; }
-  if (mainFormActive()) { state.renderDeferred = true; return; }
+  if (mainFormActive() || mainFormDirty()) { state.renderDeferred = true; return; }
+  render();
+}
+// Background completions (family calendar, feed, metadata fetches)
+// repaint through the same deferral (reviews 5/6): never over a
+// focused or dirty main-region form.
+function renderBackground() {
+  if (mainFormActive() || mainFormDirty()) { state.renderDeferred = true; return; }
   render();
 }
 document.addEventListener("focusout", () => {
-  if (state.renderDeferred && !mainFormActive()) { state.renderDeferred = false; render(); }
+  if (state.renderDeferred && !mainFormActive() && !mainFormDirty()) { state.renderDeferred = false; render(); }
 });
 
 async function doSync() {
@@ -752,65 +779,97 @@ async function runHealthCheck() {
   render();
 }
 
-// Shell: collect one pending share-sheet send (if any) into the
-// inbox. The native side clears after one read, so repeated calls
-// are safe — boot + every return to the foreground.
+// Processed share ids (review 5, item 5): if a capture saved
+// durably but its native acknowledgement was lost, the share is
+// delivered again on the next drain — the id set makes that a
+// re-acknowledgement instead of a duplicate Inbox item.
+function shareIdSeen(id) {
+  if (!id) return false;
+  try { return (JSON.parse(localStorage.getItem("pkm-processed-share-ids") || "[]")).includes(id); } catch { return false; }
+}
+function markShareIdSeen(id) {
+  if (!id) return;
+  try {
+    const arr = JSON.parse(localStorage.getItem("pkm-processed-share-ids") || "[]");
+    if (!arr.includes(id)) { arr.push(id); while (arr.length > 200) arr.shift(); localStorage.setItem("pkm-processed-share-ids", JSON.stringify(arr)); }
+  } catch { /* idempotence is best-effort */ }
+}
+
+// Shell: drain pending share-sheet sends into the inbox. The
+// native side keeps a durable queue (review 5, item 5): each share
+// carries an id, getSharedText PEEKS the oldest, and it is
+// acknowledged by id only after the capture is durably saved — a
+// share that arrives while another is being saved is never cleared
+// by the wrong acknowledgement, and a failed save leaves its entry
+// queued for the next foreground with a visible toast.
 async function captureSharedText() {
   if (!NativeShare || !state.store) return;
-  let text = "";
-  try {
-    const r = await withTimeout(NativeShare.getSharedText(), 5000, "share.get");
-    text = (r && r.text ? String(r.text) : "").trim();
-  } catch { /* bridge unavailable — nothing to collect */ }
-  if (text) {
-    // Durable ack protocol (review 3, item 14): getSharedText only
-    // PEEKS — the share stays queued natively until the capture is
-    // saved here and explicitly acknowledged. A failed save leaves
-    // it queued for the next foreground and says so, instead of the
-    // old consume-at-read behaviour that lost shares silently.
+  for (let n = 0; n < 10; n++) {
+    let id = "", text = "";
+    try {
+      const r = await withTimeout(NativeShare.getSharedText(), 5000, "share.get");
+      id = r && r.id ? String(r.id) : "";
+      text = (r && r.text ? String(r.text) : "").trim();
+    } catch { break; /* bridge unavailable — nothing to collect */ }
+    if (!text) break;
+    if (shareIdSeen(id)) {
+      await withTimeout(NativeShare.clearSharedText({ id }), 3000, "share.clearText").catch(() => null);
+      continue;
+    }
     try {
       if (routeCapture(text) === "inbox") state.store.captureInbox({ title: "", body: text });
       render();
       await saveBytes(true);
       if (state.persistError) throw new Error(state.persistError);
-      await withTimeout(NativeShare.clearSharedText(), 3000, "share.clearText").catch(() => null);
+      markShareIdSeen(id);
+      await withTimeout(NativeShare.clearSharedText({ id }), 3000, "share.clearText").catch(() => null);
     } catch {
       showToast("<span>Couldn't save the shared text — it stays queued and will retry.</span>");
+      break;
     }
   }
   await captureSharedImage();
 }
 
 // Shared photos (stamp 2026-11-04s, shell only): the Java plugin
-// copies a shared image into the app files dir; read it back through
-// the Filesystem bridge, downscale it, and file it in the Inbox with
-// the photo attached. The temp file is removed afterwards.
+// copies a shared image into the app files dir; read it back
+// through the Filesystem bridge, downscale it, and file it in the
+// Inbox with the photo attached. Same id'd queue + peek/ack
+// protocol as shared text (review 5, item 5); the temp file is
+// removed once its entry is acknowledged.
 async function captureSharedImage() {
   if (!NativeShare || !NativeFS || !state.store) return;
-  let file = "";
-  try {
-    const r = await withTimeout(NativeShare.getSharedImage(), 5000, "share.image");
-    file = (r && r.file) ? String(r.file) : "";
-  } catch { /* bridge unavailable */ }
-  if (!file) return;
-  // Same peek + ack protocol as shared text (review 3, item 14):
-  // acknowledge (and delete the temp copy) only after the photo is
-  // captured in the Inbox AND the database write has landed.
-  try {
-    const rd = await withTimeout(NativeFS.readFile({ path: file, directory: "DATA" }), 20000, "fs.readShared");
-    const b64 = rd && typeof rd.data === "string" ? rd.data : "";
-    if (!b64) throw new Error("shared image unreadable");
-    const att = await dataToAttachment(b64, "image/jpeg");
-    const item = state.store.captureInbox({ title: "", body: "Photo" });
-    state.store.addAttachment("inbox_items", item.id, att.mime, att.data, att.name ?? null);
-    state.searchDirty = true;
-    render();
-    await saveBytes(true);
-    if (state.persistError) throw new Error(state.persistError);
-    await withTimeout(NativeShare.clearSharedImage(), 3000, "share.clearImage").catch(() => null);
-    try { await NativeFS.deleteFile({ path: file, directory: "DATA" }); } catch {}
-  } catch {
-    showToast("<span>Couldn't save the shared photo — it stays queued and will retry.</span>");
+  for (let n = 0; n < 10; n++) {
+    let id = "", file = "";
+    try {
+      const r = await withTimeout(NativeShare.getSharedImage(), 5000, "share.image");
+      id = r && r.id ? String(r.id) : "";
+      file = (r && r.file) ? String(r.file) : "";
+    } catch { break; /* bridge unavailable */ }
+    if (!file) break;
+    if (shareIdSeen(id)) {
+      await withTimeout(NativeShare.clearSharedImage({ id }), 3000, "share.clearImage").catch(() => null);
+      try { await NativeFS.deleteFile({ path: file, directory: "DATA" }); } catch {}
+      continue;
+    }
+    try {
+      const rd = await withTimeout(NativeFS.readFile({ path: file, directory: "DATA" }), 20000, "fs.readShared");
+      const b64 = rd && typeof rd.data === "string" ? rd.data : "";
+      if (!b64) throw new Error("shared image unreadable");
+      const att = await dataToAttachment(b64, "image/jpeg");
+      const item = state.store.captureInbox({ title: "", body: "Photo" });
+      state.store.addAttachment("inbox_items", item.id, att.mime, att.data, att.name ?? null);
+      state.searchDirty = true;
+      render();
+      await saveBytes(true);
+      if (state.persistError) throw new Error(state.persistError);
+      markShareIdSeen(id);
+      await withTimeout(NativeShare.clearSharedImage({ id }), 3000, "share.clearImage").catch(() => null);
+      try { await NativeFS.deleteFile({ path: file, directory: "DATA" }); } catch {}
+    } catch {
+      showToast("<span>Couldn't save the shared photo — it stays queued and will retry.</span>");
+      break;
+    }
   }
 }
 
@@ -1641,6 +1700,7 @@ function tokenScreenHtml() {
 }
 
 function render() {
+  if (state.dirtyEls) state.dirtyEls.clear();
   if (state.searchDirty) { rebuildSearchIndex(); state.searchDirty = false; }
   if (document.body?.classList.contains("boot-preview")) { document.body.classList.remove("boot-preview"); document.body.classList.add("boot-faded"); }
   writeWidgetSnapshotThrottled();
@@ -1724,7 +1784,7 @@ async function loadFamilyCalendar(force = false) {
     else state.family = { status: "error", events: [], fetchedAt: 0 };
   }
   state.family.loading = false;
-  if (state.tab === "dashboard" && !state.itemView) render();
+  if (state.tab === "dashboard" && !state.itemView) renderBackground();
 }
 // --- News feed (stamp dh) ---
 // The river itself is assembled server-side (GET /api/sync/feed on
@@ -1795,7 +1855,7 @@ async function loadFeed(force = false) {
     f.loading = false;
     f.status = f.items.length ? "stale" : "error";
   }
-  if (state.tab === "feed" && !state.itemView) render();
+  if (state.tab === "feed" && !state.itemView) renderBackground();
 }
 
 function renderFeed() {
@@ -2137,12 +2197,19 @@ function wireSmartInput(form) {
   refresh();
 }
 
+// The Toronto calendar day an ISO timestamp falls on. Comparing
+// updated_at.slice(0, 10) (a UTC date) against a Toronto day made
+// tasks completed after 19:00 EST vanish from that day's completed
+// list and surface under tomorrow's (found Nov 6, 2026, when the
+// page tests rolled past midnight UTC).
+const torontoDayOf = (iso) => { try { return new Intl.DateTimeFormat("en-CA", { timeZone: "America/Toronto", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(iso)); } catch { return (iso ?? "").slice(0, 10); } };
+
 // Completed items on demand (stamp dv): replaces the always-on day
 // progress bar + done-today titles. The button reveals the day's
 // completed tasks (by completion date); rows are live — unticking
 // one puts it back.
 function completedDayHtml(day, bare = false) {
-  const done = allRows("tasks").filter((t) => t.done && !t.archived && (t.updated_at ?? "").slice(0, 10) === day);
+  const done = allRows("tasks").filter((t) => t.done && !t.archived && (t.updated_at ? torontoDayOf(t.updated_at) : "") === day);
   if (!done.length) return "";
   const openNow = state.showDoneDay === day;
   const rows = openNow ? done.map((t) => taskRow(t)).join("") : "";
@@ -2545,7 +2612,7 @@ function routeCapture(text) {
     fetchLinkTitle(t).then((title) => {
       if (!title) return;
       const cur = state.store.getRow("reading_items", item.id);
-      if (cur && cur.title === t) { state.store.updateProps("reading_items", item.id, { title }); render(); saveBytes(); }
+      if (cur && cur.title === t) { state.store.updateProps("reading_items", item.id, { title }); renderBackground(); saveBytes(); }
     });
     return "reading";
   }

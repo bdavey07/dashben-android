@@ -198,14 +198,16 @@ export class SyncEngine {
   // on its stale base next cycle. `excludeIds` names outbox entries
   // already accounted for by an in-flight push (their rows SHOULD
   // adopt the server stamps the re-pull delivers); any OTHER queued
-  // entry guards its row. When the guarded row is one of this push's
-  // applied rows (appliedKeys), the incoming change is our own edit
-  // coming back: rebase the queued entries onto its server stamp and
-  // re-assert the queued snapshot, so the newer edit stays visible
-  // and pushes cleanly next cycle.
+  // entry guards its row. When the guarded row's incoming change is
+  // EXACTLY this push's acknowledged server row for it (appliedRows,
+  // review 5 item 2), it is our own edit coming back: rebase the
+  // queued entries onto its server stamp and re-assert the queued
+  // snapshot, so the newer edit stays visible and pushes cleanly
+  // next cycle. A FOREIGN change to a guarded row is held entirely
+  // — same key is not proof of authorship.
   applyChanges(changes, opts = {}) {
     const exclude = opts.excludeIds ?? null;
-    const appliedKeys = opts.appliedKeys ?? null;
+    const appliedRows = opts.appliedRows ?? null;
     this.txn(() => {
       let guard = null;
       const guardSet = () => {
@@ -220,10 +222,13 @@ export class SyncEngine {
       for (const c of changes) {
         const key = c.table + "\0" + c.row_id;
         if (guardSet().has(key)) {
-          if (appliedKeys && appliedKeys.has(key) && c.op !== "delete" && c.row) {
-            this.db.prepare("UPDATE sync_outbox SET base_updated_at=? WHERE table_name=? AND row_id=?")
-              .run(c.row.updated_at ?? null, c.table, c.row_id);
-            this.reassertPending(c.table, c.row_id);
+          if (appliedRows && c.op !== "delete" && c.row) {
+            const acked = appliedRows.get(key);
+            if (acked !== undefined && acked === JSON.stringify(cleanRow(c.table, c.row))) {
+              this.db.prepare("UPDATE sync_outbox SET base_updated_at=? WHERE table_name=? AND row_id=?")
+                .run(c.row.updated_at ?? null, c.table, c.row_id);
+              this.reassertPending(c.table, c.row_id);
+            }
           }
           continue;
         }
@@ -457,11 +462,15 @@ export class SyncEngine {
     // adopting it when nothing applied (every change errored or
     // conflicted, so the re-pull below is skipped) would jump past
     // server changes this client has never seen.
-    const appliedKeySet = new Set(
-      [...groups.values()]
-        .filter((g) => (res.applied ?? []).includes(g.last.client_change_id))
-        .map((g) => g.last.table_name + "\0" + g.last.row_id),
-    );
+    // Exact acknowledgements for the re-pull (review 5, item 2):
+    // row key -> the acknowledged server row (cleaned JSON). Older
+    // servers return no applied_rows; the map is then empty and NO
+    // rebasing happens — queued edits conflict honestly next cycle
+    // instead of risking a silent overwrite.
+    const appliedRows = new Map();
+    for (const ar of res.applied_rows ?? []) {
+      if (ar?.server_row) appliedRows.set(ar.table + "\0" + ar.row_id, JSON.stringify(cleanRow(ar.table, ar.server_row)));
+    }
     let deliveredMark = cur;
     if ((res.applied ?? []).length > 0) {
       try {
@@ -470,7 +479,7 @@ export class SyncEngine {
         let more = true;
         while (more) {
           const page = await transport.pull(cur2, 200);
-          this.applyChanges(page.changes, { excludeIds: pushedIds, appliedKeys: appliedKeySet });
+          this.applyChanges(page.changes, { excludeIds: pushedIds, appliedRows });
           report.pulled += page.changes.length;
           cur2 = page.next_seq;
           more = page.has_more && cur2 < target;
@@ -487,6 +496,29 @@ export class SyncEngine {
         const del = this.db.prepare("DELETE FROM sync_outbox WHERE client_change_id=?");
         if (appliedSet.has(o.client_change_id)) {
           for (const m of g.members) { del.run(m.client_change_id); report.applied.push(m.client_change_id); }
+          // Adopt the acknowledged server row (review 6, item 5):
+          // when a push response is lost, the retry's receipt
+          // replay reports "applied" but the change's seq is
+          // already behind the watermark, so no pull will ever
+          // deliver the server stamp — without adopting the ack
+          // here, the local row keeps its stale timestamp and the
+          // next edit conflicts against this device's own earlier
+          // write. If newer edits queued during the push, rebase
+          // them onto the ack and re-assert their snapshot instead
+          // (the re-pull's ack path remains as a fallback).
+          const ackJson = appliedRows.get(o.table_name + "\0" + o.row_id);
+          if (ackJson !== undefined) {
+            try {
+              const ackRow = JSON.parse(ackJson);
+              const remaining = this.db.prepare("SELECT COUNT(*) AS n FROM sync_outbox WHERE table_name=? AND row_id=?").get(o.table_name, o.row_id).n;
+              if (remaining === 0) {
+                this.upsertLocal(o.table_name, ackRow);
+              } else {
+                this.db.prepare("UPDATE sync_outbox SET base_updated_at=? WHERE table_name=? AND row_id=?").run(ackRow.updated_at ?? null, o.table_name, o.row_id);
+                this.reassertPending(o.table_name, o.row_id);
+              }
+            } catch { /* keep the local row; the next cycle heals */ }
+          }
         } else if (conflictById.has(o.client_change_id)) {
           const c = conflictById.get(o.client_change_id);
           if (c.server_row) this.upsertLocal(o.table_name, cleanRow(o.table_name, c.server_row));
@@ -494,6 +526,13 @@ export class SyncEngine {
             "INSERT INTO sync_conflicts (client_change_id, table_name, row_id, server_row_json, local_row_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
           ).run(o.client_change_id, o.table_name, o.row_id, c.server_row ? JSON.stringify(c.server_row) : null, g.last.row_json ?? null, nowIso());
           for (const m of g.members) { del.run(m.client_change_id); report.conflicts.push(m.client_change_id); }
+          // A newer edit queued DURING the push is not a group
+          // member and survives in the outbox; re-assert its
+          // snapshot so the visible row stays the user's draft
+          // instead of reverting to the server copy (review 5,
+          // item 3). The conflict record above keeps the submitted
+          // version for the recovery UI.
+          this.reassertPending(o.table_name, o.row_id);
         } else if (errorById.has(o.client_change_id)) {
           report.errors.push({ client_change_id: o.client_change_id, error: errorById.get(o.client_change_id).error });
         } else {
@@ -566,6 +605,13 @@ export class SyncEngine {
         if (!cursor) break;
       }
       this.pruneStaleRows(table, seen);
+      // Re-assert this table's queued edits immediately (review 6,
+      // item 4): the whole-snapshot restoration at the end covers
+      // the happy path, but if a LATER table's download fails, the
+      // tables already processed must not be left showing server
+      // copies over the user's queued drafts.
+      const pendTables = this.db.prepare("SELECT DISTINCT row_id FROM sync_outbox WHERE table_name=?").all(table);
+      for (const p2 of pendTables) this.reassertPending(table, String(p2.row_id));
     }
     // A snapshot rebuild must not bury queued local edits (review 3,
     // item 2): re-assert every pending row over the snapshot state.

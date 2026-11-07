@@ -14,11 +14,16 @@ import java.io.InputStream;
 
 // Receives Android share-sheet sends (text/plain and image/*) and
 // holds them until the web client collects each exactly once. Shares
-// are ALSO persisted to SharedPreferences at capture time and the
-// getters only PEEK (review 3, item 14): the web client acknowledges
-// with clearSharedText/clearSharedImage only after the capture is
-// durably saved, so a process death or a failed save no longer loses
-// a share, and failures surface instead of being swallowed. Images
+// are persisted to SharedPreferences at capture time as a durable
+// QUEUE with unique ids (review 5, item 5): the old single-slot
+// design let an acknowledgement for share A delete a share B that
+// had arrived while A was being saved. The getters PEEK the oldest
+// entry and return its id; the web client acknowledges THAT ID
+// (clearSharedText/clearSharedImage) only after the capture is
+// durably saved, so a process death or a failed save loses nothing,
+// a late ack can only ever remove its own entry, and the client can
+// make capture idempotent per id. Legacy single-slot values from
+// earlier builds are adopted into the queue on first read. Images
 // are copied into the app files dir (the same DATA directory the web
 // client's Filesystem bridge reads); only the file name crosses to
 // JS, which reads, downscales, and files the photo in the Inbox.
@@ -26,8 +31,6 @@ import java.io.InputStream;
 // (singleTask): handleOnNewIntent fires.
 @CapacitorPlugin(name = "ShareIntent")
 public class ShareIntentPlugin extends Plugin {
-    private String pendingText = null;
-    private String pendingImage = null;
     private String pendingWidgetAction = null;
     private String pendingWidgetTask = null;
 
@@ -67,8 +70,89 @@ public class ShareIntentPlugin extends Plugin {
         String text = intent.getStringExtra(Intent.EXTRA_TEXT);
         if (text == null || text.isEmpty()) return;
         String subject = intent.getStringExtra(Intent.EXTRA_SUBJECT);
-        pendingText = (subject != null && !subject.isEmpty()) ? subject + "\n" + text : text;
-        try { prefs().edit().putString("share_text", pendingText).apply(); } catch (Exception e) { /* in-memory copy still held */ }
+        String full = (subject != null && !subject.isEmpty()) ? subject + "\n" + text : text;
+        enqueueText(full);
+    }
+
+    // --- Durable share queues (review 5, item 5) ---
+    // Each queue is a JSON array in SharedPreferences of
+    // {"id": ..., "text"|"file": ..., "ts": ...}, oldest first.
+    private synchronized org.json.JSONArray readQueue(String key) {
+        try {
+            String raw = prefs().getString(key, "");
+            if (raw != null && !raw.isEmpty()) return new org.json.JSONArray(raw);
+        } catch (Exception e) { /* fall through to empty */ }
+        return new org.json.JSONArray();
+    }
+
+    private synchronized void writeQueue(String key, org.json.JSONArray q) {
+        try { prefs().edit().putString(key, q.toString()).apply(); } catch (Exception e) { /* best effort */ }
+    }
+
+    private void enqueueText(String text) {
+        org.json.JSONArray q = readQueue("share_text_queue");
+        try {
+            org.json.JSONObject e = new org.json.JSONObject();
+            e.put("id", java.util.UUID.randomUUID().toString());
+            e.put("text", text);
+            e.put("ts", System.currentTimeMillis());
+            q.put(e);
+        } catch (Exception ex) { return; }
+        writeQueue("share_text_queue", q);
+    }
+
+    private void enqueueImage(String file) {
+        org.json.JSONArray q = readQueue("share_image_queue");
+        try {
+            org.json.JSONObject e = new org.json.JSONObject();
+            e.put("id", java.util.UUID.randomUUID().toString());
+            e.put("file", file);
+            e.put("ts", System.currentTimeMillis());
+            q.put(e);
+        } catch (Exception ex) { return; }
+        writeQueue("share_image_queue", q);
+    }
+
+    // Adopt a legacy single-slot value (pre-queue builds) as a queue
+    // entry with a stable legacy id, so an unacknowledged share from
+    // before the upgrade is still delivered — exactly once.
+    private synchronized org.json.JSONArray queueWithLegacy(String queueKey, String legacyKey, String field) {
+        org.json.JSONArray q = readQueue(queueKey);
+        try {
+            String legacy = prefs().getString(legacyKey, "");
+            if (legacy != null && !legacy.isEmpty()) {
+                org.json.JSONObject e = new org.json.JSONObject();
+                e.put("id", "legacy-" + legacyKey);
+                e.put(field, legacy);
+                e.put("ts", 0);
+                org.json.JSONArray merged = new org.json.JSONArray();
+                merged.put(e);
+                for (int i = 0; i < q.length(); i++) merged.put(q.get(i));
+                q = merged;
+                prefs().edit().remove(legacyKey).apply();
+                writeQueue(queueKey, q);
+            }
+        } catch (Exception e) { /* queue as-is */ }
+        return q;
+    }
+
+    private synchronized org.json.JSONObject peekQueue(String queueKey, String legacyKey, String field) {
+        org.json.JSONArray q = queueWithLegacy(queueKey, legacyKey, field);
+        if (q.length() == 0) return null;
+        try { return q.getJSONObject(0); } catch (Exception e) { return null; }
+    }
+
+    private synchronized void ackQueue(String queueKey, String id) {
+        if (id == null || id.isEmpty()) return;
+        org.json.JSONArray q = readQueue(queueKey);
+        org.json.JSONArray kept = new org.json.JSONArray();
+        try {
+            for (int i = 0; i < q.length(); i++) {
+                org.json.JSONObject e = q.getJSONObject(i);
+                if (!id.equals(e.optString("id"))) kept.put(e);
+            }
+        } catch (Exception e) { return; }
+        writeQueue(queueKey, kept);
     }
 
     private android.content.SharedPreferences prefs() {
@@ -86,8 +170,7 @@ public class ShareIntentPlugin extends Plugin {
             while ((n = in.read(buf)) > 0) fos.write(buf, 0, n);
             fos.close();
             in.close();
-            pendingImage = out.getName();
-            try { prefs().edit().putString("share_image", pendingImage).apply(); } catch (Exception e) { /* in-memory copy still held */ }
+            enqueueImage(out.getName());
         } catch (Exception e) {
             // Share capture is best-effort; a failed copy drops the share.
         }
@@ -134,39 +217,36 @@ public class ShareIntentPlugin extends Plugin {
         call.resolve();
     }
 
-    // Peek only (review 3, item 14): the value survives until the
-    // web client acknowledges a durable capture via the clear*
-    // methods below. Falls back to the persisted copy so a share
-    // that arrived before a process restart is still delivered.
+    // Peek the OLDEST queued share and return it WITH its id
+    // (review 5, item 5): the entry survives until the web client
+    // acknowledges that exact id after a durable capture.
     @PluginMethod
     public void getSharedText(PluginCall call) {
-        String v = pendingText;
-        if (v == null) { try { v = prefs().getString("share_text", ""); } catch (Exception e) { v = ""; } }
+        org.json.JSONObject e = peekQueue("share_text_queue", "share_text", "text");
         JSObject ret = new JSObject();
-        ret.put("text", v != null ? v : "");
+        ret.put("id", e != null ? e.optString("id") : "");
+        ret.put("text", e != null ? e.optString("text") : "");
         call.resolve(ret);
     }
 
     @PluginMethod
     public void clearSharedText(PluginCall call) {
-        pendingText = null;
-        try { prefs().edit().remove("share_text").apply(); } catch (Exception e) { /* ignore */ }
+        ackQueue("share_text_queue", call.getString("id", ""));
         call.resolve();
     }
 
     @PluginMethod
     public void getSharedImage(PluginCall call) {
-        String v = pendingImage;
-        if (v == null) { try { v = prefs().getString("share_image", ""); } catch (Exception e) { v = ""; } }
+        org.json.JSONObject e = peekQueue("share_image_queue", "share_image", "file");
         JSObject ret = new JSObject();
-        ret.put("file", v != null ? v : "");
+        ret.put("id", e != null ? e.optString("id") : "");
+        ret.put("file", e != null ? e.optString("file") : "");
         call.resolve(ret);
     }
 
     @PluginMethod
     public void clearSharedImage(PluginCall call) {
-        pendingImage = null;
-        try { prefs().edit().remove("share_image").apply(); } catch (Exception e) { /* ignore */ }
+        ackQueue("share_image_queue", call.getString("id", ""));
         call.resolve();
     }
 
