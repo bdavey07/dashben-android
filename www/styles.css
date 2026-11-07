@@ -390,14 +390,13 @@ main h2 { letter-spacing: -0.015em; font-weight: 600; }
 
 /* Phone slimming (stamp au, shell only): presence cuts Ben approved —
    badges off, done-list off, row action buttons and metadata off,
-   Daily "On this day" panel off; one-line weather styling. */
+   one-line weather styling. (The day-context hide was removed at stamp et - Ben wants the Daily weather panel on the phone.) */
 .wx-line { padding: 10px 14px; font-size: 15px; margin-bottom: 16px; }
 @media (max-width: 768px) {
   .topbar .badge { display: none; }
   .day-progress .done-today { display: none; }
   .row [data-snooze-days], .row [data-carry-today] { display: none; }
   .row .project-pill { display: none; } /* subtask indicators restored (stamp be) */
-  .day-context { display: none; }
 }
 
 /* Boot finish (stamp aw, shell only): one soft fade as the first
