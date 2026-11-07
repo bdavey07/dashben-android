@@ -530,17 +530,42 @@ export class SyncEngine {
   // seq from the FIRST snapshot call as the watermark. A change that
   // lands mid-bootstrap is then picked up by the next pull (re-apply
   // is idempotent), while a later seq could skip it forever.
+  // Snapshot replacement (review 4, item 9a): applySnapshot only
+  // upserts, so without pruning, a row deleted server-side survived
+  // every Re-download / pruning resync in the hard-deletable tables
+  // (tags, relations, field values, vocab). Delete local rows the
+  // snapshot does not contain — except rows with queued local
+  // edits, which the push phase still has to resolve.
+  pruneStaleRows(table, seenIds) {
+    this.txn(() => {
+      const pending = new Set(this.db.prepare("SELECT row_id FROM sync_outbox WHERE table_name=?").all(table).map((r) => String(r.row_id)));
+      let localIds;
+      if (COMPOSITE.has(table)) {
+        localIds = this.db.prepare(`SELECT * FROM ${table}`).all().map((r) => rowIdFor(table, r));
+      } else {
+        const col = idColumn(table);
+        localIds = this.db.prepare(`SELECT ${col} AS id FROM ${table}`).all().map((r) => String(r.id));
+      }
+      for (const id of localIds) {
+        if (!seenIds.has(id) && !pending.has(id)) this.deleteLocal(table, id);
+      }
+    });
+  }
+
   async firstSync(transport) {
     let seq = null;
     for (const table of SYNC_TABLES) {
       let cursor = null;
+      const seen = new Set();
       for (;;) {
         const page = await transport.snapshot(table, cursor);
         this.applySnapshot(table, page.rows);
+        for (const r of page.rows) seen.add(rowIdFor(table, r));
         if (seq === null) seq = page.seq;
         cursor = page.next_cursor;
         if (!cursor) break;
       }
+      this.pruneStaleRows(table, seen);
     }
     // A snapshot rebuild must not bury queued local edits (review 3,
     // item 2): re-assert every pending row over the snapshot state.

@@ -1040,8 +1040,23 @@ function mdContinueList(ta) {
 function mdInline(escaped) {
   const codes = [];
   let t = escaped.replace(/`([^`]+)`/g, (m, c) => { codes.push(c); return `\u0000${codes.length - 1}\u0000`; });
-  t = t.replace(/!\[([^\]]*)\]\((https?:[^)\s]+)\)/g, `<img src="$2" alt="$1">`);
-  t = t.replace(/\[([^\]]+)\]\((https?:[^)\s]+|mailto:[^)\s]+)\)/g, `<a href="$2" target="_blank" rel="noopener">$1</a>`);
+  // Attribute safety (review 4, item 1): the input is escaped for
+  // & < > before this runs, but quotes were never escaped — a quote
+  // in a link destination or image alt used to break out of the
+  // quoted attribute and inject an event handler into the app's
+  // origin. Sanitize in the replacer: a destination containing
+  // quotes, angle brackets or control characters is not linkified
+  // at all (it stays as plain text); alt text is attribute-escaped.
+  const safeUrl = (u) => (/["'<>\u0000-\u001f]/.test(u) ? null : u);
+  const attrEsc = (s) => s.replace(/"/g, "&quot;");
+  t = t.replace(/!\[([^\]]*)\]\((https?:[^)\s]+)\)/g, (m, alt, url) => {
+    const u = safeUrl(url);
+    return u === null ? m : `<img src="${u}" alt="${attrEsc(alt)}">`;
+  });
+  t = t.replace(/\[([^\]]+)\]\((https?:[^)\s]+|mailto:[^)\s]+)\)/g, (m, text, url) => {
+    const u = safeUrl(url);
+    return u === null ? m : `<a href="${u}" target="_blank" rel="noopener">${text}</a>`;
+  });
   t = t.replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
   t = t.replace(/(^|\W)\*([^*\n]+)\*/g, "$1<i>$2</i>");
   t = t.replace(/~~([^~]+)~~/g, "<s>$1</s>");
