@@ -6,6 +6,7 @@ import { SqlJsDb } from "./db-adapter.mjs";
 import { SyncEngine, SYNC_TABLES, localTableCounts } from "./sync-engine.mjs";
 import { LocalStore, recurrenceSummary, parseRecurrence } from "./local-store.mjs";
 import { HttpTransport } from "./transport.mjs";
+import { workspaceTheme, mountWorkspace, decorateWorkspace, decorateWorkspaceEditor, restoreWorkspaceEditor } from "./adaptive-workspace.mjs";
 
 const $ = (sel, el = document) => el.querySelector(sel);
 const $$ = (sel, el = document) => [...el.querySelectorAll(sel)];
@@ -945,7 +946,7 @@ function openPopup(title, inner, openRef) {
   // popup's form from outside via the form= attribute.
   const formTag = /<form[^>]*popup-form[^>]*>/.exec(inner)?.[0] ?? "";
   const formId = /id="([^"]+)"/.exec(formTag)?.[1] ?? "";
-  const saveBtn = formId ? `<button type="submit" form="${formId}" class="primary-btn">Close</button>` : "";
+  const saveBtn = formId ? `<button type="submit" form="${formId}" class="primary-btn">Save & close</button>` : "";
   $("#popup-root").innerHTML = `<div class="popup-backdrop">
     <div class="popup-card" role="dialog" aria-label="${esc(title)}">
       <div class="popup-head"><h3>${esc(title)}</h3><div class="popup-head-actions">${saveBtn}${openRef ? `<button data-pin-toggle="${openRef}" class="ghost-btn">${isPinned(openRef) ? "Unpin" : "Pin"}</button><button data-open-page="${openRef}" class="ghost-btn">Open</button>` : ""}</div></div>
@@ -954,6 +955,7 @@ function openPopup(title, inner, openRef) {
   </div>`;
   bindPopupForms();
   bindExtraPopupForms();
+  decorateWorkspaceEditor($("#popup-root"), { ref: openRef, close: savePopupAndClose });
   focusPopup();
 }
 // Clicking the backdrop saves (stamp 2026-11-04aj): an editor
@@ -973,6 +975,7 @@ function savePopupAndClose() {
 }
 function closePopup() {
   $("#popup-root").innerHTML = "";
+  restoreWorkspaceEditor();
   restorePopupFocus();
 }
 // --- Accessibility (feature batch): popup focus trap + restore and
@@ -1275,7 +1278,7 @@ function bindMdEditors(root) {
 }
 
 function bodyFieldHtml(table, id, body, version) {
-  return `${mdEditorHtml(body, 5)}<span class="muted"> v${version}</span>`;
+  return `${mdEditorHtml(body, 5)}<span class="workspace-body-version" title="Document revision"> v${version}</span>`;
 }
 function subtaskBlock(table, id, subtasksJson) {
   let subs = [];
@@ -1411,7 +1414,7 @@ function taskEditorHtml(id, forPage) {
       <h4>Tags</h4>${tagsForm("tasks", id)}
     </form>
     ${linksBlock("tasks", id)}
-    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Close</button><button data-send-tony="tasks:${t.id}" class="ghost-btn">Send to Tony</button><button data-duplicate-task="${t.id}" class="ghost-btn">Duplicate</button><button data-archive-task="${t.id}" class="danger-btn">Archive task</button></p>`}`;
+    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Save & close</button><button data-send-tony="tasks:${t.id}" class="ghost-btn">Send to Tony</button><button data-duplicate-task="${t.id}" class="ghost-btn">Duplicate</button><button data-archive-task="${t.id}" class="danger-btn">Archive task</button></p>`}`;
 }
 
 function openTaskPopup(id) {
@@ -1433,7 +1436,7 @@ function noteEditorHtml(id, forPage) {
       <h4>Body</h4>${bodyFieldHtml("notes", id, n.body_markdown, n.body_version)}
     </form>
     ${linksBlock("notes", id)}
-    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Close</button><button data-share-tony="notes:${n.id}" class="ghost-btn">Share with Tony</button><button data-duplicate-note="${n.id}" class="ghost-btn">Duplicate</button><button data-archive-note="${n.id}" class="danger-btn">Archive note</button></p>`}`;
+    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Save & close</button><button data-share-tony="notes:${n.id}" class="ghost-btn">Share with Tony</button><button data-duplicate-note="${n.id}" class="ghost-btn">Duplicate</button><button data-archive-note="${n.id}" class="danger-btn">Archive note</button></p>`}`;
 }
 
 function openNotePopup(id) {
@@ -1455,7 +1458,7 @@ function personEditorHtml(id, forPage) {
     </form>
     ${items.length ? `<h4>Linked items</h4>${items.map((x) => `<div class="row"><span class="badge">${esc(x.type)}</span><span class="row-title" data-open="${x.type}:${x.row.id}">${esc(x.row.title)}</span></div>`).join("")}` : ""}
     ${linksBlock("people", id)}
-    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Close</button><button data-archive-person="${p.id}" class="danger-btn">Archive person</button></p>`}`;
+    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Save & close</button><button data-archive-person="${p.id}" class="danger-btn">Archive person</button></p>`}`;
 }
 
 function openPersonPopup(id) {
@@ -1484,7 +1487,7 @@ function projectEditorHtml(id, forPage) {
       <div data-todo-selected>${[...related].map((tid) => { const t = tasks.find((x) => x.id === tid); return t ? `<div class="row"><span class="row-title">${esc(t.title)}</span><input type="hidden" name="todo" value="${t.id}"><button type="button" data-todo-remove>✕</button></div>` : ""; }).join("")}</div>
     </form>
     ${linksBlock("projects", id)}
-    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Close</button><button data-archive-project="${p.id}" class="danger-btn">Archive project</button></p>`}`;
+    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Save & close</button><button data-archive-project="${p.id}" class="danger-btn">Archive project</button></p>`}`;
 }
 
 function openProjectPopup(id) {
@@ -1505,7 +1508,7 @@ function readingEditorHtml(id, forPage) {
       <h4>Notes</h4>${bodyFieldHtml("reading_items", id, r.body_markdown, r.body_version)}
     </form>
     ${linksBlock("reading_items", id)}
-    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Close</button><button data-send-tony="reading_items:${r.id}" class="ghost-btn">Send to Tony</button><button data-archive-reading="${r.id}" class="danger-btn">Archive item</button></p>`}`;
+    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Save & close</button><button data-send-tony="reading_items:${r.id}" class="ghost-btn">Send to Tony</button><button data-archive-reading="${r.id}" class="danger-btn">Archive item</button></p>`}`;
 }
 
 function openReadingPopup(id) {
@@ -1523,7 +1526,7 @@ function inboxEditorHtml(id, forPage) {
       <div class="cf-field"><label class="cf-label">Title</label><input name="title" value="${esc(item.title)}"></div>
       <h4>Body</h4>${bodyFieldHtml("inbox_items", id, item.body_markdown, item.body_version)}
     </form>
-    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Close</button><button data-move-personal="${id}">Move to Personal Notes</button><button data-send-tony="inbox:${id}" class="ghost-btn">Send to Tony</button> <button data-archive-inbox="${id}" class="danger-btn">Archive</button> </p>`}`;
+    ${forPage ? `<p class="page-savebar"><button type="submit" form="${fid}" class="primary-btn">Save</button></p>` : `<p class="popup-actions"><button type="submit" form="${fid}" class="primary-btn">Save & close</button><button data-move-personal="${id}">Move to Personal Notes</button><button data-send-tony="inbox:${id}" class="ghost-btn">Send to Tony</button> <button data-archive-inbox="${id}" class="danger-btn">Archive</button> </p>`}`;
 }
 
 function openInboxPopup(id) {
@@ -1748,6 +1751,21 @@ function render() {
   if (state.booted && !state.itemView && state.tab === "daily") cacheBootHtml(JSON.stringify({ tab: state.tab, html: main.innerHTML }));
   pushNav();
   enhanceRows();
+  mountWorkspace({
+    navigate: (tab) => { state.tab = tab; state.itemView = null; saveTab(); render(); },
+    capture: () => { $("#fab-capture").click(); $("#fab-menu [data-fab-menu='capture']")?.click(); },
+    theme: (value) => { try { localStorage.setItem("workspace-theme", value); } catch {} state.store.setTheme(value); applyTheme(); render(); saveBytes(); },
+  });
+  const workspaceDate = state.dailyDate || todayToronto();
+  const workspaceNote = dailyNoteFor(workspaceDate);
+  decorateWorkspace({ tab: state.tab, label: tabLabel(state.tab), item: !!state.itemView,
+    date: workspaceDate, today: todayToronto(),
+    due: openTasks().filter(t => t.due_date === workspaceDate).length,
+    focus: focusIdsFor(workspaceDate).filter(id => { const t = state.store.getRow("tasks", id); return t && !t.done && !t.archived; }).length,
+    commitments: workspaceNote ? splitSchedule(workspaceNote.body_markdown || "").schedule.length : 0,
+    inbox: inboxItems().length,
+  });
+  if (state.itemView) decorateWorkspaceEditor($("#main"), { fullPage: true });
 }
 
 // --- Family calendar (stamp 2026-11-04ai) ---
@@ -2470,15 +2488,15 @@ function taskRow(t, opts = {}) {
   const subDone = subs.filter((s) => s.done).length;
   const linkedCount = linkedTitles("tasks", t.id, "sub_tasks", "tasks").length;
   const subInd = `${subs.length ? `<span class="sub-ind" title="Checklist subtasks: ${subDone} of ${subs.length} done">${SUB_CHECKLIST_ICON}${subDone}/${subs.length}</span>` : ""}${linkedCount ? `<span class="sub-ind" title="${linkedCount} linked subtask${linkedCount === 1 ? "" : "s"}">${SUB_LINK_ICON}${linkedCount}</span>` : ""}`;
-  return `<div class="row${justDone.has(t.id) ? " row-justdone" : ""}" data-task="${t.id}">
-    ${opts.bulk ? `<input type="checkbox" data-bulk-select="${t.id}" ${state.bulkSelected && state.bulkSelected.has(t.id) ? "checked" : ""}>` : `<input type="checkbox" data-tick="${t.id}" ${t.done || justDone.has(t.id) ? "checked" : ""}>`}
+  return `<div class="row workspace-task${t.done ? " is-complete" : ""}${justDone.has(t.id) ? " row-justdone" : ""}" data-task="${t.id}" data-priority="${esc(t.priority || '')}">
+    ${opts.bulk ? `<input type="checkbox" data-bulk-select="${t.id}" ${state.bulkSelected && state.bulkSelected.has(t.id) ? "checked" : ""}>` : `<input type="checkbox" data-tick="${t.id}" aria-label="${esc((t.done ? 'Reopen ' : 'Complete ') + t.title)}" ${t.done || justDone.has(t.id) ? "checked" : ""}>`}
     <span class="row-title">${esc(t.title)}</span>
     ${subInd}${rec ? `<span class="recur" title="Recurring task">↻</span>` : ""}
     ${t.priority ? `<span class="prio">${esc(t.priority)}</span>` : ""}
     ${t.project ? `<span class="project-pill"${pillStyle("projects", t.project)}>${esc(t.project)}</span>` : ""}
     ${opts.carry ? `<button data-carry-today="${t.id}" class="ghost-btn">→ Today</button>` : ""}
     ${opts.snooze ? `<button data-snooze-days="1" data-snooze-task="${t.id}" class="pill-btn snooze-pill">+ 1d</button><button data-snooze-days="7" data-snooze-task="${t.id}" class="pill-btn snooze-pill">+ 1 wk</button><button data-snooze-mon data-snooze-task="${t.id}" class="pill-btn mon-pill">→ Mon</button>` : ""}
-    <span class="due${overdue ? " overdue" : ""}">${t.due_date ? t.due_date : "No due date"}</span>
+    <span class="due${overdue ? " overdue" : ""}">${t.due_date ? `<time datetime="${esc(t.due_date)}" title="${esc(t.due_date)}">${t.due_date === today ? 'Today' : new Date(t.due_date + 'T12:00:00').toLocaleDateString('en-CA', { month: 'short', day: 'numeric' })}</time>` : ""}</span>
   </div>`;
 }
 
@@ -4304,7 +4322,7 @@ function attachPersistentListeners() {
     }
   });
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") closePopup();
+    if (e.key === "Escape" && !paletteState && !lbState && $("#popup-root .popup-card")) { e.preventDefault(); savePopupAndClose(); }
   });
 }
 
@@ -4578,7 +4596,7 @@ const MANAGED_FIELD_LIST = [
   ["tasks", "priority"], ["tasks", "project"], ["notes", "type"], ["people", "role"],
   ["reading_items", "status"], ["projects", "status"], ["projects", "category"],
 ];
-const THEMES = [["auto", "Auto (system)"], ["blueprint", "Blueprint dark"], ["linear-light", "Linear light"], ["paper", "Paper light"], ["civic", "Civic"], ["minimal", "Minimal light"], ["notebook", "Field notebook"], ["ember", "Ember dark"]];
+const THEMES = [["adaptive-light", "Adaptive · warm light"], ["adaptive-dark", "Adaptive · soft dark"], ["auto", "Auto (system)"], ["blueprint", "Blueprint dark"], ["linear-light", "Linear light"], ["paper", "Paper light"], ["civic", "Civic"], ["minimal", "Minimal light"], ["notebook", "Field notebook"], ["ember", "Ember dark"]];
 
 // Default sidebar groups (feature batch): applied only when the
 // user has never saved tab prefs — any stored prefs (including an
@@ -4588,7 +4606,7 @@ const DEFAULT_TAB_GROUPS = [
   { id: "work", label: "Work", tabs: ["dashboard", "daily", "tasks", "projects", "calendar"], collapsed: false },
   { id: "knowledge", label: "Knowledge", tabs: ["notes", "reading", "people"], collapsed: false },
   { id: "review", label: "Review", tabs: ["inbox", "review"], collapsed: false },
-  { id: "system", label: "System", tabs: ["feed", "search", "management"], collapsed: false },
+  { id: "system", label: "Tools", tabs: ["search", "feed", "management"], collapsed: false },
 ];
 function getTabPrefs() {
   try {
@@ -4649,7 +4667,9 @@ function renderSidebar() {
       if (!built.has(g.id)) {
         const wrap = document.createElement("div");
         wrap.className = "menu-group" + (g.collapsed ? " collapsed" : "");
-        const lab = document.createElement("div");
+        const lab = document.createElement("button");
+        lab.type = "button";
+        lab.setAttribute("aria-expanded", String(!g.collapsed));
         lab.className = "menu-group-label";
         lab.textContent = (g.collapsed ? "▸ " : "▾ ") + g.label;
         lab.addEventListener("click", async () => {
@@ -4669,14 +4689,10 @@ function renderSidebar() {
 }
 
 function applyTheme() {
-  let theme = state.store.getRow("ui_prefs", "theme")?.value ?? "ember";
-  if (theme === "auto") theme = window.matchMedia("(prefers-color-scheme: light)").matches ? "paper" : "blueprint";
-  if (theme === "blueprint") document.documentElement.removeAttribute("data-theme");
-  else document.documentElement.setAttribute("data-theme", theme);
-  // Mirror the resolved theme to localStorage (stamp cc): an inline
-  // script in index.html applies it before first paint, so the app
-  // no longer flashes the default theme while the database loads.
-  try { localStorage.setItem("dashben-theme", theme); } catch { /* private mode */ }
+  const theme = workspaceTheme(state.store.getRow("ui_prefs", "theme")?.value);
+  const resolved = theme === "auto" ? (window.matchMedia("(prefers-color-scheme: light)").matches ? "adaptive-light" : "adaptive-dark") : theme;
+  document.documentElement.setAttribute("data-theme", resolved);
+  try { localStorage.setItem("dashben-theme", resolved); } catch {}
 }
 
 function dailyNoteFor(date) {
@@ -4817,8 +4833,8 @@ function renderDaily() {
   <form data-dash-task="${date}" class="form"><input name="title" placeholder="New task" required style="flex:1"><button class="primary-btn">+ New task</button></form></div>
   ${scheduleNotes}
   ${collapsible("daily-overdue", `Overdue (${overdue.length})`, overdueHtml, false)}
-  ${collapsible("daily-context", "Daily weather", dayContextPanel(date))}
-  ${collapsible("daily-family", "Family calendar", familyPanel())}
+  ${collapsible("daily-context", "Daily weather", dayContextPanel(date), false)}
+  ${collapsible("daily-family", "Family calendar", familyPanel(), false)}
   ${completedDayHtml(date)}`;
 }
 function weatherIcon(code) {
@@ -5153,7 +5169,7 @@ function renderManagement() {
   const prefs = getTabPrefs();
   const allTags = state.db.prepare("SELECT DISTINCT tag FROM object_tags ORDER BY tag").all().map((r) => r.tag);
   const types = state.db.prepare("SELECT * FROM custom_object_types ORDER BY name").all();
-  const currentTheme = state.store.getRow("ui_prefs", "theme")?.value ?? "ember";
+  const currentTheme = workspaceTheme(state.store.getRow("ui_prefs", "theme")?.value);
   const themeLabel = THEMES.find(([v]) => v === currentTheme)?.[1] ?? currentTheme;
   const ungrouped = allTabIds().filter((id) => !prefs.groups.some((g) => (g.tabs ?? []).includes(id)));
   const knownTabs = allTabIds();
@@ -5994,6 +6010,7 @@ function attachExtraListeners() {
     }
     const themeBtn = e.target.closest("[data-theme-btn]");
     if (themeBtn) {
+      try { localStorage.setItem("workspace-theme", themeBtn.dataset.themeBtn); } catch {}
       state.store.setTheme(themeBtn.dataset.themeBtn);
       applyTheme();
       render(); saveBytes();
@@ -6046,3 +6063,4 @@ function attachExtraListeners() {
     }
   });
 }
+
