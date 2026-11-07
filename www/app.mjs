@@ -874,19 +874,22 @@ async function captureSharedImage() {
 }
 
 function statusLine() {
+  // Three-state lead label (product batch): the persistence detail
+  // follows as muted specifics, but the first words answer "am I safe?"
   const out = state.engine ? state.engine.outboxCount() : 0;
   const conf = state.engine ? state.engine.listConflicts().length : 0;
-  let s = `outbox ${out} · conflicts ${conf}`;
-  const notes = [];
-  if (out) notes.push(`${out} change${out === 1 ? "" : "s"} waiting to sync`);
-  if (conf) notes.push(`${conf} edit${conf === 1 ? "" : "s"} need${conf === 1 ? "s" : ""} review`);
-  if (notes.length) s += ` · ${notes.join(" · ")}`;
-  if (state.persistError) s += ` · ERROR: not saved on this device (${state.persistError})`;
-  if (state.dbSource === "native-backup") s += " · recovered from the backup DB copy";
-  if (state.dbSourceNote) s += " · " + state.dbSourceNote;
-  if (state.lastSync) s += ` · last sync ${state.lastSync}`;
-  if (state.lastError) s += ` · ERROR: ${state.lastError}`;
-  return s;
+  let head = "Saved locally";
+  if (state.persistError || conf || state.lastError) head = "Needs attention";
+  else if (out) head = "Waiting to sync";
+  const bits = [];
+  if (out) bits.push(`${out} change${out === 1 ? "" : "s"} waiting to sync`);
+  if (conf) bits.push(`${conf} edit${conf === 1 ? "" : "s"} need${conf === 1 ? "s" : ""} review`);
+  if (state.persistError) bits.push(`not saved on this device (${state.persistError})`);
+  if (state.dbSource === "native-backup") bits.push("recovered from the backup DB copy");
+  if (state.dbSourceNote) bits.push(state.dbSourceNote);
+  if (state.lastSync) bits.push(`last sync ${state.lastSync}`);
+  if (state.lastError) bits.push(`ERROR: ${state.lastError}`);
+  return bits.length ? `${head} · ${bits.join(" · ")}` : head;
 }
 
 // --- Queries (local only) ---
@@ -1614,7 +1617,10 @@ function renderItemPage(view) {
     if (!p) return `<div class="page-actions"><button data-page-back class="ghost-btn">Back</button></div><p class="muted">This item no longer exists.</p>`;
     const related = state.store.listRelatedTodos(id);
     const meta = [p.category ? `Category ${esc(p.category)}` : "", p.status ? `Status ${esc(p.status)}` : ""].filter(Boolean).join(" · ");
+    const na = projectNextAction(id);
+    const naHtml = na ? `<div class="panel"><strong>Next action:</strong> <button data-open="tasks:${na.id}" class="ghost-btn">${esc(na.title)}</button>${na.due_date ? ` <span class="muted">due ${esc(na.due_date)}</span>` : ""}</div>` : `<div class="panel"><strong>No next action yet.</strong> <button data-project-add-action="${id}" class="ghost-btn">+ Add next action</button></div>`;
     return `${pageActions(view)}
+      ${naHtml}
       <div class="notebook">${projectEditorHtml(id, true)}</div>`;
   }
   if (type === "reading_items") {
@@ -2179,6 +2185,7 @@ function wireSmartInput(form) {
     back.style.transform = `translateX(${-input.scrollLeft}px)`;
     if (chips) {
       const bits = [];
+      if (r.due || r.priority) bits.push(`<span class="pchip">Task${r.due ? " · " + esc(dueChipLabel(r.due)) : ""}${r.priority ? " · " + esc(r.priority) : ""}</span>`);
       if (r.due) bits.push(`<span class="pchip">\u{1F4C5} ${esc(dueChipLabel(r.due))}<button type="button" data-chip-x="due" aria-label="Cancel scheduling">\u00d7</button></span>`);
       if (r.priority) bits.push(`<span class="pchip">\u2691 ${esc(r.priority)}<button type="button" data-chip-x="priority" aria-label="Cancel priority">\u00d7</button></span>`);
       chips.innerHTML = bits.join("");
@@ -2667,7 +2674,8 @@ function renderReview() {
     const evs = revEvents.filter((e) => famEventDays(e).includes(d));
     if (evs.length) famDays.push(`<h4>${esc(new Date(d + "T12:00:00").toLocaleDateString("en-CA", { weekday: "long", month: "short", day: "numeric" }))}</h4>` + evs.map((e) => `<p class="cal-ev">${e.allDay ? `<span class="fam-time">All day</span>` : `<span class="fam-time">${esc(famTimeLabel(e))}</span>`} ${esc(e.title)}</p>`).join(""));
   }
-  return `<div class="panel"><h3>Review</h3><p class="muted">This week ${esc(tw.start)} to ${esc(tw.end)} · next week ${esc(nw.start)} to ${esc(nw.end)}</p></div>
+  return `${guidedReviewHtml(tw, overdue, dueNext)}
+  <div class="panel"><h3>Review</h3><p class="muted">This week ${esc(tw.start)} to ${esc(tw.end)} · next week ${esc(nw.start)} to ${esc(nw.end)}</p></div>
   <div class="panel"><h3>Completed this week (${doneThis.length})</h3>${doneThis.length ? doneThis.map((t) => taskRow(t)).join("") : "<p class='muted'>Nothing completed yet this week.</p>"}</div>
   <div class="panel"><h3>Overdue (${overdue.length})</h3>${overdue.length ? overdue.slice(0, 10).map((t) => taskRow(t, { carry: true, snooze: true })).join("") : "<p class='muted'>Nothing overdue.</p>"}</div>
   <div class="panel"><h3>Due next week (${dueNext.length})</h3>${dueNext.length ? dueNext.map((t) => taskRow(t)).join("") : "<p class='muted'>Nothing due next week.</p>"}</div>
@@ -2771,9 +2779,11 @@ function renderInbox() {
   const photoCounts = attachmentCounts("inbox_items");
   const bulk = !!state.inboxBulk;
   const sel = state.inboxSel ?? new Set();
+  const proc = inboxProcessState();
+  if (proc) return inboxProcessHtml(proc);
   return `<div class="panel"><h3>Capture</h3><form data-capture class="form"><input name="title" placeholder="Title (optional)"><textarea name="body" rows="3" placeholder="Capture… a pasted link files to Reading; start with task: to make a task"></textarea><input type="file" name="photo" accept="image/*,.pdf,.txt,.md,.csv,.doc,.docx,.rtf" multiple><button class="primary-btn">Capture</button></form></div>
   ${bulk ? `<div class="panel bulk-bar"><strong>${sel.size} selected</strong> <button data-inbox-bulk-move class="primary-btn">Move to notes</button> <button data-inbox-bulk-archive class="danger-btn">Archive</button> <button data-inbox-bulk-clear class="ghost-btn">Clear</button></div>` : ""}
-  <div class="panel"><div class="sel-head"><h3>Inbox (${items.length})</h3><button data-inbox-bulk-toggle class="toggle-btn${bulk ? " active" : ""}">${bulk ? "Done selecting" : "Select"}</button></div>
+  <div class="panel"><div class="sel-head"><h3>Inbox (${items.length})</h3><button data-inbox-bulk-toggle class="toggle-btn${bulk ? " active" : ""}">${bulk ? "Done selecting" : "Select"}</button>${items.length ? `<button data-inbox-process-start class="toggle-btn">Process ▶</button>` : ""}</div>
   ${items.map((i) => `<div class="row" data-inbox="${i.id}">${bulk ? `<input type="checkbox" data-inbox-sel="${i.id}"${sel.has(i.id) ? " checked" : ""}> ` : ""}<span class="row-title">${esc(i.title)}${photoInd(photoCounts, i.id)}</span><span class="muted">${esc((i.body_markdown ?? "").slice(0, 80))}</span><button data-inbox-to-note="${i.id}">→ Note</button><button data-inbox-to-task="${i.id}">→ Task</button><button data-archive-inbox="${i.id}">Archive</button></div>`).join("") || "<p class='muted'>Inbox empty.</p>"}</div>`;
 }
 
@@ -3678,6 +3688,18 @@ function bindPopupForms(root = $("#popup-root")) {
     if (!time || !text) return;
     try { await appendDailyLine(todayToronto(), `${time} — ${text}`); } catch (err) { alert(err.message); return; }
     closePopup(); render(); saveBytes(); showToast("Added to today's schedule");
+  }));
+  $$("[data-project-action-form]", root).forEach((f) => f.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const d = new FormData(f);
+    const projectId = d.get("project");
+    const title = (d.get("title") || "").trim();
+    if (!projectId || !title) return;
+    try {
+      const task = state.store.createTask({ title, due: todayToronto() });
+      if (task) state.store.setRelatedTodos(projectId, [...state.store.listRelatedTodos(projectId), task.id]);
+    } catch (err) { alert(err.message); return; }
+    closePopup(); render(); saveBytes();
   }));
   $$("[data-move-category]", root).forEach((f) => f.addEventListener("submit", (e) => {
     e.preventDefault();
@@ -4633,36 +4655,136 @@ function splitSchedule(body) {
   }
   return { schedule, notes };
 }
+
+// --- Product batch (review fixes 1-6): focus picks, project next
+// actions, inbox processing, guided review. Prefs ride ui_prefs, so
+// focus picks / process queue / review progress sync like everything
+// else and survive reloads.
+function focusIdsFor(date) {
+  try { const v = JSON.parse(state.store.getPref(`focus:${date}`) ?? "[]"); return Array.isArray(v) ? v.filter((x) => typeof x === "string") : []; } catch { return []; }
+}
+function setFocusIds(date, ids) { state.store.setPref(`focus:${date}`, JSON.stringify(ids.slice(0, 3))); }
+function focusPanelHtml(date, todos, overdue) {
+  if (date !== todayToronto()) return "";
+  const chosen = focusIdsFor(date).map((id) => state.store.getRow("tasks", id)).filter((t) => t && !t.done && !t.archived);
+  const chosenIds = new Set(chosen.map((t) => t.id));
+  const candidates = [...overdue, ...todos].filter((t) => !chosenIds.has(t.id));
+  return `<div class="panel"><h3>Focus today (${chosen.length}/3)</h3>
+  ${chosen.length ? chosen.map((t) => `<div>${taskRow(t)}<p style="margin:2px 0 8px"><button data-focus-remove="${t.id}" class="ghost-btn">Remove from focus</button></p></div>`).join("") : "<p class='muted'>Pick up to three tasks that matter most today.</p>"}
+  ${chosen.length < 3 && candidates.length ? `<form data-focus-add class="form"><select name="task" style="flex:1">${candidates.map((t) => `<option value="${t.id}">${esc(t.title)}${t.due_date && t.due_date < date ? " (overdue)" : ""}</option>`).join("")}</select><button class="primary-btn">+ Focus</button></form>` : ""}</div>`;
+}
+
+function projectNextAction(projectId) {
+  const rank = (t) => { const p = /^P([1-3])$/.exec(t.priority ?? ""); return p ? Number(p[1]) : 4; };
+  const open = state.store.listRelatedTodos(projectId).map((id) => state.store.getRow("tasks", id)).filter((t) => t && !t.done && !t.archived);
+  open.sort((a, b) => String(a.due_date ?? "9999").localeCompare(String(b.due_date ?? "9999")) || rank(a) - rank(b) || String(a.created_at ?? "").localeCompare(String(b.created_at ?? "")));
+  return open[0] ?? null;
+}
+function projectsWithoutNextAction() {
+  return allRows("projects").filter((p) => !/done|complete|archiv/i.test(p.status ?? "") && !projectNextAction(p.id));
+}
+
+function inboxProcessState() {
+  if (state.inboxProcess !== undefined) return state.inboxProcess;
+  try { state.inboxProcess = JSON.parse(state.store.getPref("inbox_process") ?? "null"); } catch { state.inboxProcess = null; }
+  if (state.inboxProcess && !Array.isArray(state.inboxProcess.queue)) state.inboxProcess = null;
+  return state.inboxProcess;
+}
+function saveInboxProcess() { state.store.setPref("inbox_process", state.inboxProcess ? JSON.stringify(state.inboxProcess) : ""); }
+function convertInboxItem(item, kind) {
+  let created = null;
+  state.engine.txn(() => {
+    if (kind === "task") {
+      const task = state.store.createTask({ title: item.title || (item.body_markdown ?? "").split("\n")[0].slice(0, 60), body: item.body_markdown ?? "", due: todayToronto() });
+      if (task) state.store.reassignAttachments("inbox_items", item.id, "tasks", task.id);
+      created = task ? { createdType: "tasks", createdId: task.id } : null;
+    } else if (kind === "note") {
+      const title = item.title || (item.body_markdown ?? "").split("\n")[0].slice(0, 60);
+      const type = /^\d{4}-\d{2}-\d{2}$/.test(String(title).trim()) ? "Daily Notes" : "General Notes";
+      const note = state.store.createNote({ title, body: item.body_markdown ?? "", type });
+      if (note && note.type !== type) state.store.updateProps("notes", note.id, { type });
+      if (note) state.store.reassignAttachments("inbox_items", item.id, "notes", note.id);
+      created = note ? { createdType: "notes", createdId: note.id } : null;
+    } else if (kind === "reading") {
+      const m = /https?:\/\/\S+/.exec(`${item.title ?? ""}\n${item.body_markdown ?? ""}`);
+      if (!m) throw new Error("No link in this item.");
+      const url = m[0].replace(/[)\].,;]+$/, "");
+      const title = item.title && !/^https?:\/\//.test(item.title) ? item.title : url;
+      const r = state.store.createReading({ title, url, note: item.body_markdown ?? "" });
+      if (r) state.store.reassignAttachments("inbox_items", item.id, "reading_items", r.id);
+      created = r ? { createdType: "reading_items", createdId: r.id } : null;
+    }
+    state.store.archiveObject("inbox_items", item.id);
+  });
+  state.searchDirty = true;
+  return created;
+}
+function inboxProcessHtml(proc) {
+  proc.queue = proc.queue.filter((id) => { const i = state.store.getRow("inbox_items", id); return i && !i.archived; });
+  const head = `<div class="panel"><h3>Process inbox</h3><p class="muted">${proc.queue.length ? `Item ${proc.total - proc.queue.length + 1} of ${proc.total}` : "Done"} · <button data-inbox-process-exit class="ghost-btn">Exit processing</button>${proc.last ? ` <button data-inbox-process-undo class="ghost-btn">Undo last</button>` : ""}</p></div>`;
+  if (!proc.queue.length) return `${head}<div class="panel"><p>Inbox processed — nothing left in the queue.</p></div>`;
+  const item = state.store.getRow("inbox_items", proc.queue[0]);
+  const hasUrl = /https?:\/\/\S+/.test(`${item.title ?? ""}\n${item.body_markdown ?? ""}`);
+  return `${head}<div class="panel"><h3>${esc(item.title || "(untitled)")}</h3>
+  <div style="white-space:pre-wrap">${esc(item.body_markdown ?? "")}</div>
+  <p class="popup-actions"><button data-inbox-process-act="note" class="primary-btn">→ Note</button><button data-inbox-process-act="task">→ Task</button>${hasUrl ? `<button data-inbox-process-act="reading">→ Reading</button>` : ""}<button data-inbox-process-act="archive">Archive</button><button data-inbox-process-act="skip" class="ghost-btn">Skip</button></p></div>`;
+}
+
+function reviewStateFor(weekStart) {
+  try { const v = JSON.parse(state.store.getPref(`review:${weekStart}`) ?? "null"); if (v && typeof v === "object") return { steps: v.steps ?? {}, prios: v.prios ?? [], done: !!v.done, noteId: v.noteId ?? null }; } catch { /* fall through */ }
+  return { steps: {}, prios: [], done: false, noteId: null };
+}
+function saveReviewState(weekStart, rs) { state.store.setPref(`review:${weekStart}`, JSON.stringify(rs)); }
+function guidedReviewHtml(tw, overdue, dueNext) {
+  state.reviewWeek = tw.start;
+  const rs = reviewStateFor(tw.start);
+  if (rs.done && rs.noteId) return `<div class="panel"><h3>Guided review ✓</h3><p class="muted">This week's review is finished.</p><p><button data-open="notes:${rs.noteId}" class="ghost-btn">Open review note</button></p></div>`;
+  const inboxCount = inboxItems().length;
+  const noAction = projectsWithoutNextAction();
+  const step = (key, label, extra = "") => `<p><label><input type="checkbox" data-review-step="${key}"${rs.steps[key] ? " checked" : ""}> ${label}</label> ${extra}</p>`;
+  return `<div class="panel"><h3>Guided review</h3>
+  ${step("inbox", `Process inbox (${inboxCount} waiting)`, `<button data-review-goto="inbox" class="ghost-btn">Open inbox</button>`)}
+  ${step("overdue", `Review overdue tasks (${overdue.length})`)}
+  ${step("projects", `Check projects without a next action (${noAction.length})`, noAction.length ? noAction.slice(0, 5).map((p) => `<button data-open="projects:${p.id}" class="ghost-btn">${esc(p.title)}</button>`).join(" ") : "")}
+  <p><label><input type="checkbox" data-review-step="prios"${rs.steps.prios ? " checked" : ""}> Choose next week's priorities</label></p>
+  ${dueNext.length ? dueNext.slice(0, 10).map((t) => `<p style="margin-left:24px"><label><input type="checkbox" data-review-prio="${t.id}"${rs.prios.includes(t.id) ? " checked" : ""}> ${esc(t.title)} <span class="muted">${esc(t.due_date ?? "")}</span></label></p>`).join("") : "<p class='muted' style='margin-left:24px'>Nothing due next week to pick from.</p>"}
+  <p><button data-review-finish class="primary-btn">Finish — create review note</button></p></div>`;
+}
+
 function renderDaily() {
   const date = state.dailyDate || todayToronto();
   const note = dailyNoteFor(date);
   const todos = sortByPrio(openTasks().filter((t) => t.due_date === date));
   const overdue = sortByPrio(openTasks().filter((t) => t.due_date && t.due_date < date));
-  let body = "";
+  let scheduleNotes = "";
   if (note) {
     const { schedule, notes } = splitSchedule(note.body_markdown ?? "");
-    body = `<div class="panel"><h3>Schedule</h3>${schedule.length ? schedule.map((l) => `<p>${esc(l)}</p>`).join("") : "<p class='muted'>No schedule entries yet (lines starting with a time, like 9:00 — Meeting).</p>"}</div>
-    <div class="panel"><h3>Notes</h3>${notes.join("\n").trim() ? notes.map((l) => `<p>${esc(l)}</p>`).join("") : "<p class='muted'>No notes yet.</p>"}</div>
-    ${collapsible("daily-family", "Family calendar", familyPanel())}
+    scheduleNotes = `<div class="panel"><h3>Schedule</h3>${schedule.length ? schedule.map((l) => `<p>${esc(l)}</p>`).join("") : "<p class='muted'>No schedule entries yet (lines starting with a time, like 9:00 — Meeting).</p>"}
+    <form data-daily-schedule="${date}" class="form"><input type="time" name="time" required><input name="text" placeholder="Schedule entry, e.g. Meeting with…" style="flex:1" required><button>Add to schedule</button></form></div>
+    <div class="panel"><h3>Notes</h3>${notes.join("\n").trim() ? notes.map((l) => `<p>${esc(l)}</p>`).join("") : "<p class='muted'>No notes yet.</p>"}
+    <form data-daily-jot="${date}" class="form"><textarea name="jot" rows="3" placeholder="Jot a note…" style="flex:1"></textarea><button>Jot it down</button></form></div>
     <p><button data-open="notes:${note.id}">Edit daily note</button></p>`;
   } else {
-    body = `<p class="muted">No daily note for this date yet.</p>
-    ${collapsible("daily-family", "Family calendar", familyPanel())}<p><button data-create-daily="${date}" class="primary-btn">Create daily note for ${date}</button></p>`;
+    scheduleNotes = `<p class="muted">No daily note for this date yet.</p>
+    <p><button data-create-daily="${date}" class="primary-btn">Create daily note for ${date}</button></p>`;
   }
+  const overdueHtml = `${date === todayToronto() && overdue.length ? `<p><button data-carry-all class="ghost-btn">All → today</button></p>` : ""}${overdue.length ? overdue.map((t) => taskRow(t, { carry: date === todayToronto() })).join("") : "<p class='muted'>Nothing overdue.</p>"}`;
   return `<form data-daily-nav class="form">
-    <button type="button" data-daily-shift="-1"><span class="nav-arrow">← </span>Prev</button>
+    <button type="button" data-daily-shift="-1">← Prev</button>
     <input type="date" name="date" value="${date}" data-daily-date>
     <button type="button" data-daily-go>Go</button>
-    <button type="button" data-daily-shift="1">Next <span class="nav-arrow">→</span></button>
+    <button type="button" data-daily-shift="1">Next →</button>
     <button type="button" data-daily-shift="0">Today</button>
   </form>
+  ${focusPanelHtml(date, todos, overdue)}
+  <div class="panel"><h3>Due Today (${todos.length})</h3>${date === todayToronto() && todos.length ? `<p><button data-push-all class="ghost-btn">All → tomorrow</button></p>` : ""}${todos.length ? todos.map(taskRow).join("") : "<p class='muted'>Nothing due this day.</p>"}
+  <form data-dash-task="${date}" class="form"><input name="title" placeholder="New task" required style="flex:1"><button class="primary-btn">+ New task</button></form></div>
+  ${scheduleNotes}
+  ${collapsible("daily-overdue", `Overdue (${overdue.length})`, overdueHtml, false)}
   ${collapsible("daily-context", "On this day", dayContextPanel(date))}
-  <div class="panel"><h3>Overdue (${overdue.length})</h3>${date === todayToronto() && overdue.length ? ` <button data-carry-all class="ghost-btn">All → today</button>` : ""}${overdue.length ? overdue.map((t) => taskRow(t, { carry: date === todayToronto() })).join("") : "<p class='muted'>Nothing overdue.</p>"}</div>
-  <div class="panel"><h3>Due Today (${todos.length})</h3>${date === todayToronto() && todos.length ? `<p><button data-push-all class="ghost-btn">All → tomorrow</button></p>` : ""}${todos.length ? todos.map(taskRow).join("") : "<p class='muted'>Nothing due this day.</p>"}</div>
-  ${completedDayHtml(date)}
-  ${body}`;
+  ${collapsible("daily-family", "Family calendar", familyPanel())}
+  ${completedDayHtml(date)}`;
 }
-
 function weatherIcon(code) {
   if (code === 0) return { icon: "☀️", condition: "Clear" };
   if (code === 1) return { icon: "🌤️", condition: "Mainly clear" };
@@ -5169,6 +5291,96 @@ function bindExtraForms() {
     // type, Enter chains without touching the mouse.
     document.querySelector("[data-dash-task] input[name=title]")?.focus();
   }); });
+  // --- Product batch bindings: focus picks, inbox processing,
+  // guided review, project next action.
+  $$("[data-focus-add]", main).forEach((f) => f.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const id = new FormData(f).get("task");
+    const date = state.dailyDate || todayToronto();
+    const ids = focusIdsFor(date);
+    if (id && !ids.includes(id) && ids.length < 3) { ids.push(id); setFocusIds(date, ids); }
+    render(); saveBytes();
+  }));
+  $$("[data-focus-remove]", main).forEach((b) => b.addEventListener("click", () => {
+    const date = state.dailyDate || todayToronto();
+    setFocusIds(date, focusIdsFor(date).filter((x) => x !== b.dataset.focusRemove));
+    render(); saveBytes();
+  }));
+  const procStart = $("[data-inbox-process-start]", main);
+  if (procStart) procStart.addEventListener("click", () => {
+    const ids = inboxItems().map((i) => i.id);
+    if (!ids.length) return;
+    state.inboxProcess = { total: ids.length, queue: ids, last: null };
+    saveInboxProcess(); render();
+  });
+  const procExit = $("[data-inbox-process-exit]", main);
+  if (procExit) procExit.addEventListener("click", () => { state.inboxProcess = null; saveInboxProcess(); render(); });
+  const procUndo = $("[data-inbox-process-undo]", main);
+  if (procUndo) procUndo.addEventListener("click", () => {
+    const proc = inboxProcessState();
+    if (!proc?.last) return;
+    const L = proc.last;
+    try {
+      state.engine.txn(() => {
+        if (L.createdType && L.createdId) state.store.archiveObject(L.createdType, L.createdId);
+        state.store.unarchiveObject("inbox_items", L.inboxId);
+      });
+    } catch (err) { toast(String(err?.message ?? err)); return; }
+    proc.queue.unshift(L.inboxId);
+    proc.last = null;
+    saveInboxProcess(); render(); saveBytes();
+  });
+  $$("[data-inbox-process-act]", main).forEach((b) => b.addEventListener("click", () => {
+    const proc = inboxProcessState();
+    if (!proc?.queue.length) return;
+    const item = state.store.getRow("inbox_items", proc.queue[0]);
+    if (!item) { proc.queue.shift(); saveInboxProcess(); render(); return; }
+    const kind = b.dataset.inboxProcessAct;
+    try {
+      if (kind === "skip") { proc.queue = proc.queue.filter((x) => x !== item.id); proc.last = null; }
+      else {
+        const created = convertInboxItem(item, kind);
+        proc.queue = proc.queue.filter((x) => x !== item.id);
+        proc.last = { inboxId: item.id, kind, createdType: created?.createdType ?? null, createdId: created?.createdId ?? null };
+        toast(kind === "archive" ? "Archived" : `Moved to ${kind === "note" ? "Notes" : kind === "task" ? "Tasks" : "Reading"}`);
+      }
+      saveInboxProcess();
+    } catch (err) { toast(String(err?.message ?? err)); }
+    render(); saveBytes();
+  }));
+  $$("[data-review-step]", main).forEach((c) => c.addEventListener("change", () => {
+    const rs = reviewStateFor(state.reviewWeek);
+    rs.steps[c.dataset.reviewStep] = c.checked;
+    saveReviewState(state.reviewWeek, rs);
+    render(); saveBytes();
+  }));
+  $$("[data-review-prio]", main).forEach((c) => c.addEventListener("change", () => {
+    const rs = reviewStateFor(state.reviewWeek);
+    const id = c.dataset.reviewPrio;
+    rs.prios = c.checked ? [...new Set([...rs.prios, id])] : rs.prios.filter((x) => x !== id);
+    saveReviewState(state.reviewWeek, rs);
+    saveBytes();
+  }));
+  $$("[data-review-goto]", main).forEach((b) => b.addEventListener("click", () => {
+    state.itemView = null; state.tab = b.dataset.reviewGoto; saveTab(); render();
+  }));
+  const revFinish = $("[data-review-finish]", main);
+  if (revFinish) revFinish.addEventListener("click", () => {
+    const rs = reviewStateFor(state.reviewWeek);
+    const prioTitles = rs.prios.map((id) => state.store.getRow("tasks", id)).filter(Boolean).map((t) => `- ${t.title}${t.due_date ? ` (due ${t.due_date})` : ""}`);
+    const body = [`## Priorities for next week`, ...(prioTitles.length ? prioTitles : ["- (none chosen)"]), ``, `## Decisions`, `- `, ``, `## Notes`, `- Review finished ${todayToronto()}.`].join("\n");
+    try {
+      const note = state.store.createNote({ title: `Weekly review — ${state.reviewWeek}`, body, type: "General Notes" });
+      rs.done = true; rs.noteId = note?.id ?? null;
+      saveReviewState(state.reviewWeek, rs);
+      toast("Review note created");
+    } catch (err) { toast(String(err?.message ?? err)); }
+    render(); saveBytes();
+  });
+  $$("[data-project-add-action]", main).forEach((b) => b.addEventListener("click", () => {
+    openPopup("Add next action", `<form data-project-action-form class="form"><input type="hidden" name="project" value="${b.dataset.projectAddAction}"><input name="title" placeholder="Next action…" required style="flex:1"><button class="primary-btn">Add</button></form>`);
+  }));
+
   $$("[data-daily-nav]", main).forEach((f) => f.addEventListener("submit", (e) => e.preventDefault()));
   $$("[data-fv-add]", main).forEach((f) => f.addEventListener("submit", async (e) => {
     e.preventDefault();
