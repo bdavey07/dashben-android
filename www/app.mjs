@@ -402,23 +402,49 @@ function idb() {
     req.onerror = () => reject(req.error);
   });
 }
-async function loadBytes() {
+function isSqliteBytes(b) {
+  // SQLite files open with the 16-byte magic "SQLite format 3\0".
+  // A nonempty file that fails this check is corrupt, not a
+  // database (review 5): never commit to it as the boot source.
+  if (!b || b.length < 16) return false;
+  const magic = "SQLite format 3";
+  for (let k = 0; k < 15; k++) if (b[k] !== magic.charCodeAt(k)) return false;
+  return b[15] === 0;
+}
+function dbSeqOf(SQL, bytes) {
+  try {
+    const probe = new SqlJsDb(SQL, bytes);
+    const row = probe.prepare("SELECT value FROM sync_meta WHERE key='seq'").get();
+    return row ? Number(row.value ?? 0) : -1;
+  } catch { return -1; }
+}
+async function loadBytes(SQL) {
   // Shell: the native DB file is the durable store (and the file M6
   // widgets will read). Fallback order (review 3, item 13): the live
   // file, then the last-known-good .bak the atomic replace keeps,
   // then IndexedDB (databases created by the proof build, which had
   // no file yet). state.dbSource records which source won, so a
   // recovery is visible in the status line, never silent.
+  // Review 5: every candidate is validated against the SQLite magic
+  // before it can win (a corrupt live file used to block fallback),
+  // and when the native and IndexedDB copies DIVERGE, the one with
+  // the higher sync watermark wins — the renameFile bug froze the
+  // native file while IndexedDB kept saving, and preferring native
+  // unconditionally would have reopened the stale database.
+  let native = null, nativeSource = "native";
   if (NativeFS) {
     try {
       const r = await withTimeout(NativeFS.readFile({ path: DB_FILE, directory: "DATA" }), 5000, "fs.readFile");
-      if (r && r.data) { state.dbSource = "native"; return b64ToBytes(r.data); }
+      if (r && r.data) { const b = b64ToBytes(r.data); if (isSqliteBytes(b)) native = b; }
     } catch { /* unreadable — try the backup copy */ }
-    try {
-      const r = await withTimeout(NativeFS.readFile({ path: DB_FILE + ".bak", directory: "DATA" }), 5000, "fs.readBak");
-      if (r && r.data) { state.dbSource = "native-backup"; return b64ToBytes(r.data); }
-    } catch { /* no backup — fall through to IndexedDB */ }
+    if (!native) {
+      try {
+        const r = await withTimeout(NativeFS.readFile({ path: DB_FILE + ".bak", directory: "DATA" }), 5000, "fs.readBak");
+        if (r && r.data) { const b = b64ToBytes(r.data); if (isSqliteBytes(b)) { native = b; nativeSource = "native-backup"; } }
+      } catch { /* no backup — fall through to IndexedDB */ }
+    }
   }
+  let idbBytes = null;
   try {
     const db = await idb();
     const bytes = await new Promise((resolve) => {
@@ -426,9 +452,18 @@ async function loadBytes() {
       tx.onsuccess = () => resolve(tx.result ?? null);
       tx.onerror = () => resolve(null);
     });
-    if (bytes) state.dbSource = "indexeddb";
-    return bytes;
-  } catch { return null; }
+    if (bytes && isSqliteBytes(bytes)) idbBytes = bytes;
+  } catch { /* no IndexedDB copy */ }
+  if (native && idbBytes && bytesHash(native) !== bytesHash(idbBytes) && SQL) {
+    if (dbSeqOf(SQL, idbBytes) > dbSeqOf(SQL, native)) {
+      state.dbSource = "indexeddb";
+      state.dbSourceNote = "IndexedDB copy was newer — recovered from it";
+      return idbBytes;
+    }
+  }
+  if (native) { state.dbSource = nativeSource; return native; }
+  if (idbBytes) { state.dbSource = "indexeddb"; return idbBytes; }
+  return null;
 }
 // Persistence coalescing (stamp bz): every edit used to serialize
 // and write the whole database immediately; bursts (bulk actions,
@@ -478,8 +513,8 @@ async function persistBytesNow() {
       // copy; loadBytes now falls back to the .bak before IndexedDB.
       await withTimeout(NativeFS.writeFile({ path: DB_FILE + ".tmp", data: bytesToB64(bytes), directory: "DATA" }), 5000, "fs.writeTmp");
       try { await withTimeout(NativeFS.deleteFile({ path: DB_FILE + ".bak", directory: "DATA" }), 3000, "fs.delBak"); } catch { /* no previous backup */ }
-      try { await withTimeout(NativeFS.renameFile({ path: DB_FILE, to: DB_FILE + ".bak", directory: "DATA", toDirectory: "DATA" }), 3000, "fs.rotate"); } catch { /* first write: no live file yet */ }
-      await withTimeout(NativeFS.renameFile({ path: DB_FILE + ".tmp", to: DB_FILE, directory: "DATA", toDirectory: "DATA" }), 3000, "fs.rename");
+      try { await withTimeout(NativeFS.rename({ path: DB_FILE, to: DB_FILE + ".bak", directory: "DATA", toDirectory: "DATA" }), 3000, "fs.rotate"); } catch { /* first write: no live file yet */ }
+      await withTimeout(NativeFS.rename({ path: DB_FILE + ".tmp", to: DB_FILE, directory: "DATA", toDirectory: "DATA" }), 3000, "fs.rename");
       fileOk = true;
     } catch (e) { firstErr = e; }
   }
@@ -789,6 +824,7 @@ function statusLine() {
   if (notes.length) s += ` · ${notes.join(" · ")}`;
   if (state.persistError) s += ` · ERROR: not saved on this device (${state.persistError})`;
   if (state.dbSource === "native-backup") s += " · recovered from the backup DB copy";
+  if (state.dbSourceNote) s += " · " + state.dbSourceNote;
   if (state.lastSync) s += ` · last sync ${state.lastSync}`;
   if (state.lastError) s += ` · ERROR: ${state.lastError}`;
   return s;
@@ -4200,7 +4236,7 @@ async function boot() {
   // to sql.js directly — same self-hosted bytes, no CDN.
   const SQL = await initSqlJs({ wasmBinary: await loadWasmBinary() });
   const schema = await (await fetch(SCHEMA_URL)).text();
-  const bytes = await loadBytes();
+  const bytes = await loadBytes(SQL);
   let fresh = false;
   if (bytes) {
     state.db = new SqlJsDb(SQL, bytes);
